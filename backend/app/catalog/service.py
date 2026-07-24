@@ -10,6 +10,7 @@ from app.api.schemas import (
     SlotView,
 )
 from app.common.errors import ApiError
+from app.common.persistence import catalog_product
 from app.common.store import DemoStore, store
 
 
@@ -90,6 +91,20 @@ def get_product(product_id: UUID, data: DemoStore = store) -> dict[str, Any]:
     product = data.products.get(product_id)
     if not product or product["status"] != "PUBLISHED":
         raise ApiError(404, "Experience not found", "The experience does not exist", "not-found")
+    return product
+
+
+async def get_product_async(
+    product_id: UUID, data: DemoStore = store
+) -> dict[str, Any]:
+    product = await catalog_product(product_id, data)
+    if not product or product["status"] != "PUBLISHED":
+        raise ApiError(
+            404,
+            "Experience not found",
+            "The experience does not exist",
+            "not-found",
+        )
     return product
 
 

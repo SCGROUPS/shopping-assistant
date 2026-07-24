@@ -14,6 +14,9 @@ param postgresLocation string = 'centralus'
 @description('Resource group to create.')
 param resourceGroupName string = 'rg-${prefix}-poc'
 
+@description('Globally unique Azure AI Services account name.')
+param aiAccountName string = take('ai${uniqueString(subscription().id, prefix)}', 24)
+
 @description('Container image to deploy after it has been pushed to the new registry.')
 param containerImage string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
 
@@ -24,23 +27,18 @@ param buildRevision string = 'bootstrap'
 @description('Initial PostgreSQL administrator password.')
 param postgresAdminPassword string
 
-@description('Existing Azure AI Services subscription.')
-param aiSubscriptionId string = '840b5c5c-3f4a-459a-94fc-6bad2a969f9d'
-
-@description('Existing Azure AI Services resource group.')
-param aiResourceGroupName string = 'ml'
-
-@description('Existing Azure AI Services account with low-cost deployments.')
-param aiAccountName string = 'ai-eastus2508770413322'
-
 param chatDeployment string = 'gpt-5.4-mini'
 param intentDeployment string = 'gpt-5-nano'
 param embeddingDeployment string = 'text-embedding-3-small'
 param imageDeployment string = 'gpt-image-1-mini'
 
-resource aiAccount 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
-  scope: resourceGroup(aiSubscriptionId, aiResourceGroupName)
-  name: aiAccountName
+module aiAccount 'ai-account.bicep' = {
+  name: 'vietra-ai-account'
+  scope: rg
+  params: {
+    aiAccountName: aiAccountName
+    location: location
+  }
 }
 
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
@@ -67,20 +65,20 @@ module resources 'resources.bicep' = {
     intentDeployment: intentDeployment
     embeddingDeployment: embeddingDeployment
     imageDeployment: imageDeployment
-    aiEndpoint: aiAccount.properties.endpoints['OpenAI Language Model Instance API']
+    aiEndpoint: aiAccount.outputs.endpoint
+    aiApiKey: aiAccount.outputs.apiKey
   }
 }
 
 module aiIntegration 'ai-integration.bicep' = {
   name: 'vietra-ai-integration'
-  scope: resourceGroup(aiSubscriptionId, aiResourceGroupName)
+  scope: rg
   params: {
-    aiAccountName: aiAccountName
+    aiAccountName: aiAccount.outputs.accountName
     chatDeployment: chatDeployment
     intentDeployment: intentDeployment
     embeddingDeployment: embeddingDeployment
     imageDeployment: imageDeployment
-    identityPrincipalId: resources.outputs.identityPrincipalId
   }
 }
 
@@ -90,4 +88,4 @@ output registryLoginServer string = resources.outputs.registryLoginServer
 output containerAppName string = resources.outputs.containerAppName
 output containerAppUrl string = resources.outputs.containerAppUrl
 output postgresServerName string = resources.outputs.postgresServerName
-output keyVaultName string = resources.outputs.keyVaultName
+output aiAccountName string = aiAccount.outputs.accountName

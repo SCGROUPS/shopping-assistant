@@ -19,7 +19,7 @@ validation, generated-data, cost, security, and teardown guidance.
   - `gpt-5-nano` for intent extraction.
   - `text-embedding-3-small` with 512 dimensions.
   - `gpt-image-1-mini` for a small reusable demo image set.
-- Azure Container Apps, Container Apps Jobs, Key Vault, ACR, and Application
+- Azure Container Apps, Container Apps Jobs, ACR, and Application
   Insights.
 - Browser speech recognition for search and assistant prompts, plus
   speech-synthesis playback for assistant responses.
@@ -85,10 +85,10 @@ application API at <http://localhost:8000>.
 
 ## Azure deployment
 
-The Bicep deployment uses the existing East US 2 Foundry AI Services account,
-creates the four low-cost model deployments when absent, and creates the
-remaining POC infrastructure. It initially deploys Microsoft's Container Apps
-sample image, builds Vietra in ACR, updates the app, and starts the catalog job.
+The Bicep deployment creates an East US 2 Foundry AI Services account with four
+low-cost model deployments and the remaining POC infrastructure. It initially
+deploys Microsoft's Container Apps sample image, builds Vietra in ACR, updates
+the app, and starts the catalog job.
 
 ```bash
 export AZURE_SUBSCRIPTION_ID="<target-subscription-id>"
@@ -97,16 +97,23 @@ export VIETRA_PREFIX="vietrapoc"
 ./scripts/deploy.sh
 ```
 
-The target identity needs permission to create resources and role assignments.
+The target identity needs Contributor permission to create resources.
 The PostgreSQL firewall's `AllowAzureServices` rule is a low-cost POC choice;
 replace it with private networking for production. The full environment and
 model override list is documented in the deployment guide.
 
 Application and AI resources use East US 2. PostgreSQL defaults to Central US
-because this demo subscription currently blocks PostgreSQL provisioning in
-East US and East US 2.
+for the validated low-cost deployment and can be overridden when needed.
 
-The POC app is capped at one active replica because cart and conversation state
-remain process-local while PostgreSQL owns catalog retrieval. This is deliberate
-for the low-cost demo. Move commerce/session state to PostgreSQL before raising
-the replica limit.
+The POC app is deliberately capped at one active replica for low-cost
+operation. Catalog, session, conversation, cart, booking, voucher, event, and
+idempotency state are PostgreSQL-backed outside explicit demo mode.
+
+## Branch and deployment workflow
+
+- Develop and integrate changes on `dev`.
+- Open a pull request from `dev` to `main`.
+- Code changes pushed to `main` run backend/frontend validation, deploy to
+  Azure with GitHub OIDC, wait for catalog seeding and readiness, then execute
+  the desktop and mobile Playwright journeys against the live application.
+- Documentation-only and demo-data-only changes do not trigger deployment.

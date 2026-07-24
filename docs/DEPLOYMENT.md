@@ -1,15 +1,14 @@
 # Deployment and operations guide
 
-This guide deploys Vietra as a low-cost Azure proof of concept. Application
-resources are isolated in one resource group; the Foundry AI Services account
-can live in a separate, shared resource group.
+This guide deploys Vietra as a low-cost Azure proof of concept. All application
+and Foundry AI Services resources are isolated in one resource group.
 
 ## Prerequisites
 
 - Azure CLI with the Container Apps extension and Bicep support.
 - Docker is not required locally; Azure Container Registry builds the image.
-- An Azure subscription where you can create resources and role assignments.
-- An existing Azure AI Services account that supports the model versions in
+- An Azure subscription where you can create resources.
+- Azure AI Services availability and quota for the model versions in
   `infra/bicep/ai-integration.bicep`.
 - Python `uv`, Node.js 22+, and Corepack for local validation.
 
@@ -22,8 +21,8 @@ az account set --subscription "<subscription-id>"
 
 ## Models
 
-The deployment manages these low-cost Foundry deployments in the existing AI
-Services account:
+The deployment creates an AI Services account and manages these low-cost
+Foundry deployments:
 
 | Purpose | Deployment |
 | --- | --- |
@@ -45,14 +44,12 @@ export POSTGRES_ADMIN_PASSWORD="<strong-random-bootstrap-password>"
 export VIETRA_PREFIX="vietrapoc"
 ```
 
-Override these defaults when the Foundry account or regions differ:
+Override these defaults when the regions or generated AI account name differ:
 
 ```bash
 export AZURE_LOCATION="eastus2"
 export AZURE_POSTGRES_LOCATION="centralus"
-export AZURE_AI_SUBSCRIPTION_ID="$AZURE_SUBSCRIPTION_ID"
-export AZURE_AI_RESOURCE_GROUP="ml"
-export AZURE_AI_ACCOUNT_NAME="<existing-ai-services-account>"
+export AZURE_AI_ACCOUNT_NAME="<globally-unique-ai-account-name>"
 ```
 
 Run:
@@ -63,18 +60,20 @@ Run:
 
 The script:
 
-1. Provisions PostgreSQL 17, pgvector extensions, ACR, Key Vault, monitoring,
-   managed identity, Container Apps, and the catalog seed job.
-2. Applies Foundry model deployments and grants the app identity the
-   `Cognitive Services OpenAI User` role.
+1. Provisions PostgreSQL 17, pgvector extensions, ACR, monitoring, Container
+   Apps, and the catalog seed job.
+2. Applies the Foundry model deployments.
 3. Builds the combined React/FastAPI image in ACR.
 4. Re-applies Bicep with the built image and a unique revision marker.
 5. Runs Alembic and seeds 360 products and their embeddings.
 6. Prints the public Container App hostname.
 
-The default PostgreSQL region is Central US because the original demo
-subscription restricted PostgreSQL creation in East US and East US 2. Set
-`AZURE_POSTGRES_LOCATION` to the nearest region available to your subscription.
+The same script runs from `.github/workflows/deploy.yml` after validated code
+changes reach `main`. GitHub authenticates with an environment-scoped OIDC
+federated identity; no Azure client secret is stored in the repository.
+
+The validated default PostgreSQL region is Central US. Set
+`AZURE_POSTGRES_LOCATION` to the nearest supported region for your subscription.
 
 ## Validate
 
@@ -134,14 +133,14 @@ Cognitive Services token from the active Azure CLI login.
 - The image generator uses `gpt-image-1-mini` at low quality and only creates
   the small reusable image set.
 
-Cart and conversation state are process-local for this POC, which is why the
-app must remain at one replica. Persist those domains before scaling out.
+The deployment remains capped at one replica for predictable POC cost.
+Application state is PostgreSQL-backed outside explicit demo mode.
 
 ## Security boundaries
 
 - The PostgreSQL `AllowAzureServices` firewall rule is a POC compromise.
-- The database URL is held in Key Vault and referenced with managed identity.
-- The application uses managed identity for Foundry and ACR.
+- Database, ACR, and Foundry credentials are held as Container Apps secrets for
+  this POC.
 - No real payment details are collected.
 - Use private endpoints, network isolation, persistent commerce state, and
   stricter origin controls before production use.
@@ -156,6 +155,5 @@ export VIETRA_PREFIX="vietrapoc"
 ./scripts/destroy.sh
 ```
 
-The destroy script deliberately preserves the existing shared Foundry account
-and its model deployments. Remove those deployments separately only when you
-know they are not used by another project.
+The destroy script removes the application resource group, including the
+dedicated Foundry account and model deployments.

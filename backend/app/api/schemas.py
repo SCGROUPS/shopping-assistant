@@ -29,6 +29,7 @@ class SearchFilters(BaseModel):
     instant_confirmation: bool | None = None
     free_cancellation: bool | None = None
     family_friendly: bool | None = None
+    exclusions: list[str] = Field(default_factory=list)
 
 
 class SearchRequest(BaseModel):
@@ -214,6 +215,7 @@ class ConversationCreate(BaseModel):
     query: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
     result_ids: list[UUID] = Field(default_factory=list)
+    party: list[Participant] = Field(default_factory=list)
 
 
 class MessageRequest(BaseModel):

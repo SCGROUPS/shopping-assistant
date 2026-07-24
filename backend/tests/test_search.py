@@ -1,8 +1,9 @@
 from httpx import AsyncClient
 
-from app.api.schemas import IntentValue, SearchIntent, SearchRequest
+from app.api.schemas import IntentValue, SearchFilters, SearchIntent, SearchRequest
+from app.assistant.provider import deterministic_intent
 from app.common.ranking import deterministic_embedding
-from app.search.service import SearchService
+from app.search.service import SearchService, merge_filters, sanitize_intent
 
 
 class HallucinatedCountryProvider:
@@ -115,3 +116,102 @@ async def test_unsupported_inferred_country_does_not_eliminate_results():
     assert result.items
     assert result.intent.destination.name is None
     assert result.effective_filters.destination is None
+
+
+def test_intent_constraints_map_without_silent_relaxation():
+    intent = deterministic_intent(
+        "English indoor activity on 2026-08-15 under VND 1000000 "
+        "with free cancellation and no nightlife"
+    )
+    filters, unresolved = merge_filters(SearchFilters(), intent)
+
+    assert unresolved == []
+    assert filters.visit_start is not None
+    assert filters.visit_start.date().isoformat() == "2026-08-15"
+    assert filters.max_total_price == 1_000_000
+    assert filters.currency == "VND"
+    assert filters.language == "English"
+    assert filters.indoor_outdoor == "indoor"
+    assert filters.free_cancellation is True
+    assert filters.exclusions == ["nightlife"]
+
+
+def test_hallucinated_dates_do_not_override_explicit_visit_date():
+    intent = SearchIntent(
+        search_text="family food and culture",
+        hard_constraints=[
+            {"field": "visit_start", "operator": ">=", "value": "2026-07-24"},
+            {"field": "visit_end", "operator": "<=", "value": "2026-07-24"},
+        ],
+    )
+    sanitized = sanitize_intent("family food and culture", intent)
+    filters, unresolved = merge_filters(
+        SearchFilters(visit_start="2026-08-15T00:00:00Z"),
+        sanitized,
+    )
+
+    assert unresolved == []
+    assert filters.visit_start is not None
+    assert filters.visit_end == filters.visit_start
+
+
+def test_conflicting_inferred_end_is_discarded():
+    intent = SearchIntent(
+        search_text="family food and culture",
+        hard_constraints=[
+            {"field": "visit_end", "operator": "<=", "value": "2026-07-24"},
+        ],
+    )
+    filters, unresolved = merge_filters(
+        SearchFilters(visit_start="2026-08-15T00:00:00Z"),
+        sanitize_intent("Family day on 2026-08-15", intent),
+    )
+
+    assert unresolved == []
+    assert filters.visit_end == filters.visit_start
+
+
+def test_invalid_explicit_date_range_is_normalized_for_clarification():
+    filters, unresolved = merge_filters(
+        SearchFilters(
+            visit_start="2026-08-15T00:00:00Z",
+            visit_end="2026-07-24T00:00:00Z",
+        ),
+        SearchIntent(search_text="family food and culture"),
+    )
+
+    assert unresolved == ["visit_end"]
+    assert filters.visit_end == filters.visit_start
+
+
+def test_optional_filters_and_multi_category_interests_do_not_block_search():
+    intent = SearchIntent(
+        search_text="A relaxed family day with food and culture",
+        hard_constraints=[
+            {
+                "field": "category",
+                "operator": "in",
+                "value": ["family_friendly", "cultural", "food_and_drink"],
+            },
+            {"field": "indoor_outdoor", "operator": "unspecified", "value": ""},
+        ],
+        soft_preferences=[
+            {"field": "family_friendly", "value": True, "weight": 1.0},
+        ],
+        needs_clarification=True,
+        clarification_question="Please specify optional filters.",
+    )
+
+    sanitized = sanitize_intent(
+        "A relaxed family day with food and culture",
+        intent,
+    )
+    filters, unresolved = merge_filters(SearchFilters(), sanitized)
+
+    assert sanitized.needs_clarification is False
+    assert sanitized.clarification_question is None
+    assert sanitized.hard_constraints == []
+    assert unresolved == []
+    assert filters.category is None
+    assert filters.indoor_outdoor is None
+    assert filters.family_friendly is True

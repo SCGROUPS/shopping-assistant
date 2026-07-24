@@ -5,7 +5,6 @@ param chatDeployment string
 param intentDeployment string
 param embeddingDeployment string
 param imageDeployment string
-param identityPrincipalId string
 
 resource aiAccount 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
   name: aiAccountName
@@ -90,19 +89,6 @@ resource imageModelDeployment 'Microsoft.CognitiveServices/accounts/deployments@
   dependsOn: [
     embeddingModelDeployment
   ]
-}
-
-resource aiUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(aiAccount.id, identityPrincipalId, 'openai-user')
-  scope: aiAccount
-  properties: {
-    principalId: identityPrincipalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
-    )
-  }
 }
 
 output imageDeploymentName string = imageModelDeployment.name

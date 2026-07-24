@@ -252,6 +252,25 @@ class Voucher(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class IdempotencyRecord(Base):
+    __tablename__ = "idempotency_records"
+    __table_args__ = (
+        UniqueConstraint("session_id", "operation", "idempotency_key"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("shopping_sessions.id")
+    )
+    operation: Mapped[str] = mapped_column(String(50))
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    response: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class EmbeddingWorkItem(Base, TimestampMixin):
     __tablename__ = "embedding_work_items"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

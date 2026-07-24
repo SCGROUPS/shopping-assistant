@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
@@ -40,7 +41,78 @@ def deterministic_intent(text: str) -> SearchIntent:
         hard.append({"field": "accessibility", "operator": "contains", "value": "wheelchair"})
     if any(word in lowered for word in ("family", "child", "children", "kids")):
         soft.append({"field": "family_friendly", "value": True, "weight": 0.9})
-    exclusions = [word[3:] for word in re.findall(r"\bno\s+([a-z-]+)", lowered)]
+    if "free cancellation" in lowered:
+        hard.append(
+            {
+                "field": "free_cancellation",
+                "operator": "eq",
+                "value": True,
+            }
+        )
+    if "instant confirmation" in lowered:
+        hard.append(
+            {
+                "field": "instant_confirmation",
+                "operator": "eq",
+                "value": True,
+            }
+        )
+    language = next(
+        (
+            language
+            for language in ("English", "Vietnamese", "French", "Korean", "Japanese")
+            if re.search(rf"\b{language.casefold()}\b", lowered)
+        ),
+        None,
+    )
+    if language:
+        hard.append({"field": "language", "operator": "eq", "value": language})
+    budget_match = re.search(
+        r"\b(?:under|below|max(?:imum)?|up to)\s*"
+        r"(?:(vnd|usd|\$|₫)\s*)?([0-9][0-9,]*(?:\.[0-9]+)?)",
+        lowered,
+    )
+    if budget_match:
+        currency_token, amount = budget_match.groups()
+        hard.append(
+            {
+                "field": "max_total_price",
+                "operator": "lte",
+                "value": float(amount.replace(",", "")),
+            }
+        )
+        if currency_token:
+            hard.append(
+                {
+                    "field": "currency",
+                    "operator": "eq",
+                    "value": "USD" if currency_token in {"usd", "$"} else "VND",
+                }
+            )
+    date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", lowered)
+    if date_match:
+        hard.append(
+            {
+                "field": "visit_start",
+                "operator": "eq",
+                "value": date_match.group(1),
+            }
+        )
+    duration_match = re.search(
+        r"\b(?:under|below|max(?:imum)?|up to)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\b",
+        lowered,
+    )
+    if duration_match:
+        amount = float(duration_match.group(1))
+        unit = duration_match.group(2)
+        hard.append(
+            {
+                "field": "max_duration_minutes",
+                "operator": "lte",
+                "value": int(amount * 60 if unit.startswith(("h", "hr")) else amount),
+            }
+        )
+    exclusions = re.findall(r"\bno\s+([a-z-]+)", lowered)
     search_text = re.sub(
         r"\b(hoi an|da nang|hue|under|below|family-friendly|family|indoor|outdoor)\b",
         " ",
@@ -180,11 +252,25 @@ class AzureOpenAIProvider:
                     "role": "system",
                     "content": (
                         "Extract tourism search intent. Never invent unknown values. "
+                        f"Today is {datetime.now(UTC):%Y-%m-%d}. "
+                        "Only emit visit_start or visit_end when the user explicitly states a "
+                        "calendar date or relative date phrase such as today, tomorrow, next "
+                        "week, or this weekend. The current date is provided only to resolve "
+                        "those explicit relative phrases; never infer a visit date from the "
+                        "destination, interests, party, or general request. If there is no date "
+                        "phrase, omit both date constraints. For one date, emit visit_start only, "
+                        "and never emit visit_end earlier than visit_start. "
                         "Treat explicit indoor/outdoor, accessibility, date, budget, language, "
-                        "and exclusion statements as hard constraints. Treat interests and "
-                        "general family suitability as soft preferences unless the user says "
-                        "must, only, or required. Preserve destination names. Return only JSON "
-                        "matching the supplied schema."
+                        "and exclusion statements as hard constraints. Categories, interests, "
+                        "and general family suitability are soft preferences unless the user says "
+                        "must, only, or required. Do not request clarification merely because an "
+                        "optional destination, date, budget, language, or accessibility filter was "
+                        "omitted. Preserve destination names. Use ISO 8601 for "
+                        "visit_start and visit_end. Use only these hard-constraint field names: "
+                        "visit_start, visit_end, max_total_price, currency, category, rating, "
+                        "max_duration_minutes, accessibility, indoor_outdoor, language, "
+                        "instant_confirmation, free_cancellation, family_friendly. Return only "
+                        "JSON matching the supplied schema."
                     ),
                 },
                 {"role": "user", "content": text},

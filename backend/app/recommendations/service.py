@@ -3,8 +3,9 @@ from typing import Any
 from uuid import UUID
 
 from app.api.schemas import RecommendationResponse
-from app.catalog.service import get_product, product_card
+from app.catalog.service import get_product_async, product_card
 from app.common.config import get_settings
+from app.common.persistence import catalog_products, event_history
 from app.common.ranking import bayesian_rating, cosine_similarity, mmr_diversify
 from app.common.store import DemoStore, store
 
@@ -22,7 +23,7 @@ class RecommendationService:
         self.data = data
         self.settings = get_settings()
 
-    def recommend(
+    async def recommend(
         self,
         *,
         session_id: str,
@@ -31,10 +32,16 @@ class RecommendationService:
         destination: str | None = None,
         limit: int = 6,
     ) -> RecommendationResponse:
-        current = get_product(experience_id, self.data) if experience_id else None
+        products = await catalog_products(self.data)
+        products_by_id = {product["id"]: product for product in products}
+        current = (
+            await get_product_async(experience_id, self.data)
+            if experience_id
+            else None
+        )
         if current and not destination:
             destination = current["destination"]
-        history = self.data.event_experiences.get(session_id, [])[-20:]
+        history = await event_history(session_id, data=self.data)
         weights = {
             "experience_impression": 0.1,
             "experience_viewed": 1.0,
@@ -44,9 +51,9 @@ class RecommendationService:
             "booking_completed": 8.0,
         }
         positive = [
-            (weights.get(event, 0), self.data.products[product_id])
+            (weights.get(event, 0), products_by_id[product_id])
             for event, product_id in history
-            if weights.get(event, 0) > 0 and product_id in self.data.products
+            if weights.get(event, 0) > 0 and product_id in products_by_id
         ]
         total_weight = sum(weight for weight, _ in positive)
         session_vector = None
@@ -58,7 +65,7 @@ class RecommendationService:
             ]
 
         candidates: list[tuple[dict[str, Any], float, str, str]] = []
-        for product in self.data.products.values():
+        for product in products:
             if product["status"] != "PUBLISHED" or (current and product["id"] == current["id"]):
                 continue
             if destination and product["destination"].casefold() != destination.casefold():
@@ -107,7 +114,7 @@ class RecommendationService:
             candidates.append((product, score, reason_code, reason))
 
         if not candidates:
-            for product in self.data.products.values():
+            for product in products:
                 if not current or product["id"] != current["id"]:
                     candidates.append(
                         (
@@ -134,10 +141,15 @@ class RecommendationService:
         return RecommendationResponse(items=items)
 
 
-def session_interest_tags(session_id: str, data: DemoStore = store) -> list[str]:
+async def session_interest_tags(
+    session_id: str, data: DemoStore = store
+) -> list[str]:
+    products = {
+        product["id"]: product for product in await catalog_products(data)
+    }
     tags = Counter(
         tag
-        for _, product_id in data.event_experiences.get(session_id, [])[-20:]
-        for tag in data.products.get(product_id, {}).get("interest_tags", [])
+        for _, product_id in await event_history(session_id, data=data)
+        for tag in products.get(product_id, {}).get("interest_tags", [])
     )
     return [tag for tag, _ in tags.most_common(5)]

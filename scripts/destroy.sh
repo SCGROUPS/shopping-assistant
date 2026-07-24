@@ -9,4 +9,4 @@ az account set --subscription "$subscription"
 az group delete --name "$resource_group" --yes
 
 echo "Deleted application resource group: $resource_group"
-echo "The existing shared Foundry account and its model deployments were preserved."
+echo "Deleted the Vietra AI account and model deployments with the application resource group."

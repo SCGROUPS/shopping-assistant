@@ -8,6 +8,8 @@ param buildRevision string
 param postgresAdminPassword string
 
 param aiEndpoint string
+@secure()
+param aiApiKey string
 param chatDeployment string
 param intentDeployment string
 param embeddingDeployment string
@@ -16,19 +18,12 @@ param imageDeployment string
 var normalizedPrefix = toLower(replace(prefix, '-', ''))
 var postgresAdmin = 'vietraadmin'
 var databaseName = 'vietra'
-var identityName = 'id-${prefix}-app'
 var registryName = take('${normalizedPrefix}vietra', 50)
 var postgresName = take('${normalizedPrefix}-${replace(postgresLocation, ' ', '')}-pg', 63)
-var vaultName = take('${normalizedPrefix}-kv', 24)
 var logsName = 'log-${prefix}'
 var appInsightsName = 'appi-${prefix}'
 var environmentName = 'cae-${prefix}'
 var appName = 'ca-${prefix}-web'
-
-resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
-  name: identityName
-  location: location
-}
 
 resource registry 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
   name: registryName
@@ -37,7 +32,7 @@ resource registry 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = 
     name: 'Basic'
   }
   properties: {
-    adminUserEnabled: false
+    adminUserEnabled: true
     publicNetworkAccess: 'Enabled'
   }
 }
@@ -100,29 +95,7 @@ resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2024-08-0
   ]
 }
 
-resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
-  name: vaultName
-  location: location
-  properties: {
-    enableRbacAuthorization: true
-    enableSoftDelete: true
-    softDeleteRetentionInDays: 7
-    publicNetworkAccess: 'Enabled'
-    sku: {
-      family: 'A'
-      name: 'standard'
-    }
-    tenantId: tenant().tenantId
-  }
-}
-
-resource databaseUrl 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: vault
-  name: 'database-url'
-  properties: {
-    value: 'postgresql+psycopg://${postgresAdmin}:${uriComponent(postgresAdminPassword)}@${postgres.properties.fullyQualifiedDomainName}:5432/${databaseName}?sslmode=require'
-  }
-}
+var databaseUrl = 'postgresql+psycopg://${postgresAdmin}:${uriComponent(postgresAdminPassword)}@${postgres.properties.fullyQualifiedDomainName}:5432/${databaseName}?sslmode=require'
 
 resource logs 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: logsName
@@ -167,41 +140,9 @@ resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   }
 }
 
-resource registryPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(registry.id, identity.id, 'acrpull')
-  scope: registry
-  properties: {
-    principalId: identity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-    )
-  }
-}
-
-resource vaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(vault.id, identity.id, 'secrets-user')
-  scope: vault
-  properties: {
-    principalId: identity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      '4633458b-17de-408a-b874-0445c86b69e6'
-    )
-  }
-}
-
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: appName
   location: location
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${identity.id}': {}
-    }
-  }
   properties: {
     environmentId: environment.id
     configuration: {
@@ -216,15 +157,23 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         ? [
             {
               server: registry.properties.loginServer
-              identity: identity.id
+              username: registry.listCredentials().username
+              passwordSecretRef: 'registry-password'
             }
           ]
         : []
       secrets: [
         {
           name: 'database-url'
-          keyVaultUrl: databaseUrl.properties.secretUriWithVersion
-          identity: identity.id
+          value: databaseUrl
+        }
+        {
+          name: 'registry-password'
+          value: registry.listCredentials().passwords[0].value
+        }
+        {
+          name: 'azure-openai-api-key'
+          value: aiApiKey
         }
       ]
     }
@@ -251,12 +200,12 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               secretRef: 'database-url'
             }
             {
-              name: 'AZURE_CLIENT_ID'
-              value: identity.properties.clientId
-            }
-            {
               name: 'AZURE_OPENAI_ENDPOINT'
               value: aiEndpoint
+            }
+            {
+              name: 'AZURE_OPENAI_API_KEY'
+              secretRef: 'azure-openai-api-key'
             }
             {
               name: 'AZURE_OPENAI_CHAT_DEPLOYMENT'
@@ -332,20 +281,12 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   }
   dependsOn: [
     database
-    registryPull
-    vaultSecretsUser
   ]
 }
 
 resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
   name: 'job-${prefix}-catalog'
   location: location
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${identity.id}': {}
-    }
-  }
   properties: {
     environmentId: environment.id
     configuration: {
@@ -360,15 +301,23 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
         ? [
             {
               server: registry.properties.loginServer
-              identity: identity.id
+              username: registry.listCredentials().username
+              passwordSecretRef: 'registry-password'
             }
           ]
         : []
       secrets: [
         {
           name: 'database-url'
-          keyVaultUrl: databaseUrl.properties.secretUriWithVersion
-          identity: identity.id
+          value: databaseUrl
+        }
+        {
+          name: 'registry-password'
+          value: registry.listCredentials().passwords[0].value
+        }
+        {
+          name: 'azure-openai-api-key'
+          value: aiApiKey
         }
       ]
     }
@@ -398,12 +347,12 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
               secretRef: 'database-url'
             }
             {
-              name: 'AZURE_CLIENT_ID'
-              value: identity.properties.clientId
-            }
-            {
               name: 'AZURE_OPENAI_ENDPOINT'
               value: aiEndpoint
+            }
+            {
+              name: 'AZURE_OPENAI_API_KEY'
+              secretRef: 'azure-openai-api-key'
             }
             {
               name: 'AZURE_OPENAI_EMBEDDING_DEPLOYMENT'
@@ -430,5 +379,3 @@ output registryLoginServer string = registry.properties.loginServer
 output containerAppName string = containerApp.name
 output containerAppUrl string = 'https://${containerApp.properties.configuration.ingress.fqdn}'
 output postgresServerName string = postgres.name
-output keyVaultName string = vault.name
-output identityPrincipalId string = identity.properties.principalId

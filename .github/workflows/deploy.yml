@@ -1,0 +1,109 @@
+name: Validate and deploy
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "frontend/src/data/**"
+      - "frontend/public/assets/catalog/**"
+      - "**/*.csv"
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "frontend/src/data/**"
+      - "frontend/public/assets/catalog/**"
+      - "**/*.csv"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Validate backend
+        working-directory: backend
+        run: |
+          uv sync --dev --locked
+          uv run pytest -q
+          uv run ruff check .
+          uv run pyright
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Validate frontend
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm lint
+
+      - name: Validate Bicep
+        run: az bicep build --file infra/bicep/main.bicep --stdout >/dev/null
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Vietra
+        id: deploy
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+          VIETRA_PREFIX: ${{ vars.VIETRA_PREFIX }}
+          AZURE_LOCATION: eastus2
+          AZURE_POSTGRES_LOCATION: centralus
+        run: ./scripts/deploy.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Run live browser journeys
+        working-directory: frontend
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ steps.deploy.outputs.app_url }}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+          pnpm test:e2e

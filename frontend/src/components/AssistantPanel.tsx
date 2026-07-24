@@ -29,7 +29,6 @@ type AssistantPanelProps = {
   onSend: (message: string) => void
   onAction: (action: AssistantAction, products?: Experience[]) => void
   onView: (product: Experience) => void
-  onAdd: (product: Experience) => void
 }
 
 const prompts = [
@@ -55,7 +54,6 @@ export function AssistantPanel({
   onSend,
   onAction,
   onView,
-  onAdd,
 }: AssistantPanelProps) {
   const [value, setValue] = useState('')
   const [speakingMessageId, setSpeakingMessageId] = useState<string>()
@@ -178,73 +176,122 @@ export function AssistantPanel({
               </div>
               {message.products && message.products.length > 0 && (
                 <div className="assistant-product-stack">
-                  {message.products.slice(0, 3).map((product) => (
-                    <article className="assistant-product" key={product.id}>
-                      <button
-                        className="assistant-product-main"
-                        onClick={() => onView(product)}
-                      >
-                        <span className="assistant-product-image">
-                          <img
-                            src={product.image_url}
-                            alt=""
-                            onError={(event) => {
-                              if (product.fallback_image_url) {
-                                event.currentTarget.src =
-                                  product.fallback_image_url
-                              }
-                            }}
-                          />
-                          {product.badges[0] && <i>{product.badges[0]}</i>}
-                        </span>
-                        <span className="assistant-product-copy">
-                          <strong>{product.title}</strong>
-                          <small>
-                            <Star size={11} fill="currentColor" />
-                            {product.rating.toFixed(1)} ·{' '}
-                            {money(product.currency, product.price)}
-                          </small>
-                          <em>
-                            {product.reason ?? 'Recommended for this trip'}
-                          </em>
-                        </span>
-                        <ArrowRight size={17} />
-                      </button>
-                      <div className="assistant-product-footer">
-                        <span>
-                          <i />
-                          Available on your date
-                        </span>
-                        <button onClick={() => onAdd(product)}>
-                          <ShoppingBag size={13} />
-                          Add to trip
+                  {message.products.slice(0, 3).map((product) => {
+                    const messageActions = (message.actions ?? []).filter(
+                      (action) => action.experience_id === product.id,
+                    )
+                    const productActions =
+                      product.actions?.length
+                        ? product.actions
+                        : messageActions.length
+                          ? messageActions
+                          : [
+                              {
+                                type: 'ADD_TO_CART' as const,
+                                label: 'Add to trip',
+                                experience_id: product.id,
+                              },
+                            ]
+                    return (
+                      <article className="assistant-product" key={product.id}>
+                        <button
+                          className="assistant-product-main"
+                          onClick={() => onView(product)}
+                        >
+                          <span className="assistant-product-image">
+                            <img
+                              src={product.image_url}
+                              alt=""
+                              onError={(event) => {
+                                if (product.fallback_image_url) {
+                                  event.currentTarget.src =
+                                    product.fallback_image_url
+                                }
+                              }}
+                            />
+                            {product.badges[0] && <i>{product.badges[0]}</i>}
+                          </span>
+                          <span className="assistant-product-copy">
+                            <strong>{product.title}</strong>
+                            <small>
+                              <Star size={11} fill="currentColor" />
+                              {product.rating.toFixed(1)} ·{' '}
+                              {money(product.currency, product.price)}
+                            </small>
+                            <em>
+                              {product.reason ?? 'Recommended for this trip'}
+                            </em>
+                          </span>
+                          <ArrowRight size={17} />
                         </button>
-                      </div>
-                    </article>
-                  ))}
+                        <div className="assistant-product-footer">
+                          <span>
+                            <i />
+                            Available on your date
+                          </span>
+                          <div className="assistant-product-actions">
+                            {productActions.slice(0, 3).map((action, index) => (
+                              <button
+                                key={`${action.type}-${action.slot_id ?? index}`}
+                                className={
+                                  action.type === 'ADD_TO_CART'
+                                    ? 'primary'
+                                    : 'secondary'
+                                }
+                                data-product-id={product.id}
+                                aria-label={`${action.label} for ${product.title}`}
+                                onClick={() => onAction(action, [product])}
+                              >
+                                {action.type === 'ADD_TO_CART' ? (
+                                  <ShoppingBag size={13} />
+                                ) : (
+                                  <Check size={13} />
+                                )}
+                                {action.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </article>
+                    )
+                  })}
                 </div>
               )}
-              {message.actions && message.actions.length > 0 && (
+              {message.actions?.some(
+                (action) =>
+                  !action.experience_id ||
+                  !message.products?.some(
+                    (product) => product.id === action.experience_id,
+                  ),
+              ) && (
                 <div className="assistant-actions">
-                  {message.actions.map((action, index) => (
-                    <button
-                      key={`${action.type}-${index}`}
-                      className={
-                        action.type === 'ADD_TO_CART' ||
-                        action.type === 'START_CHECKOUT'
-                          ? 'primary-action-card'
-                          : 'secondary-action-card'
-                      }
-                      onClick={() => onAction(action, message.products)}
-                    >
-                      {action.type === 'ADD_TO_CART' ? (
-                        <ShoppingBag size={16} />
-                      ) : (
-                        <Check size={16} />
-                      )}
-                      {action.label}
-                    </button>
-                  ))}
+                  {message.actions
+                    .filter(
+                      (action) =>
+                        !action.experience_id ||
+                        !message.products?.some(
+                          (product) => product.id === action.experience_id,
+                        ),
+                    )
+                    .map((action, index) => (
+                      <button
+                        key={`${action.type}-${index}`}
+                        className={
+                          action.type === 'ADD_TO_CART' ||
+                          action.type === 'START_CHECKOUT'
+                            ? 'primary-action-card'
+                            : 'secondary-action-card'
+                        }
+                        onClick={() => onAction(action, message.products)}
+                      >
+                        {action.type === 'ADD_TO_CART' ? (
+                          <ShoppingBag size={16} />
+                        ) : (
+                          <Check size={16} />
+                        )}
+                        {action.label}
+                      </button>
+                    ))}
                 </div>
               )}
             </div>
