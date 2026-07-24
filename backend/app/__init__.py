@@ -1,0 +1,1 @@
+"""Tourism shopping assistant backend."""

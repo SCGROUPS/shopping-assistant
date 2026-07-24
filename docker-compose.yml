@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: vietra
+      POSTGRES_USER: vietra
+      POSTGRES_PASSWORD: vietra
+    ports:
+      - "5432:5432"
+    volumes:
+      - vietra-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vietra -d vietra"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      APP_ENV: development
+      DEMO_MODE: "false"
+      DATABASE_URL: postgresql+psycopg://vietra:vietra@postgres:5432/vietra
+      FRONTEND_ORIGIN: http://localhost:5173
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    image: node:22-alpine
+    working_dir: /web
+    command: sh -c "corepack enable && pnpm install --frozen-lockfile && pnpm dev --host 0.0.0.0"
+    volumes:
+      - ./frontend:/web
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/api/v1
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
+volumes:
+  vietra-postgres:

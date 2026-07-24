@@ -1,0 +1,434 @@
+param prefix string
+param location string
+param postgresLocation string
+param containerImage string
+param buildRevision string
+
+@secure()
+param postgresAdminPassword string
+
+param aiEndpoint string
+param chatDeployment string
+param intentDeployment string
+param embeddingDeployment string
+param imageDeployment string
+
+var normalizedPrefix = toLower(replace(prefix, '-', ''))
+var postgresAdmin = 'vietraadmin'
+var databaseName = 'vietra'
+var identityName = 'id-${prefix}-app'
+var registryName = take('${normalizedPrefix}vietra', 50)
+var postgresName = take('${normalizedPrefix}-${replace(postgresLocation, ' ', '')}-pg', 63)
+var vaultName = take('${normalizedPrefix}-kv', 24)
+var logsName = 'log-${prefix}'
+var appInsightsName = 'appi-${prefix}'
+var environmentName = 'cae-${prefix}'
+var appName = 'ca-${prefix}-web'
+
+resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: identityName
+  location: location
+}
+
+resource registry 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
+  name: registryName
+  location: location
+  sku: {
+    name: 'Basic'
+  }
+  properties: {
+    adminUserEnabled: false
+    publicNetworkAccess: 'Enabled'
+  }
+}
+
+resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
+  name: postgresName
+  location: postgresLocation
+  sku: {
+    name: 'Standard_B1ms'
+    tier: 'Burstable'
+  }
+  properties: {
+    version: '17'
+    administratorLogin: postgresAdmin
+    administratorLoginPassword: postgresAdminPassword
+    backup: {
+      backupRetentionDays: 7
+      geoRedundantBackup: 'Disabled'
+    }
+    highAvailability: {
+      mode: 'Disabled'
+    }
+    network: {
+      publicNetworkAccess: 'Enabled'
+    }
+    storage: {
+      storageSizeGB: 32
+      autoGrow: 'Enabled'
+    }
+  }
+}
+
+resource allowAzure 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2024-08-01' = {
+  parent: postgres
+  name: 'AllowAzureServices'
+  properties: {
+    startIpAddress: '0.0.0.0'
+    endIpAddress: '0.0.0.0'
+  }
+}
+
+resource extensions 'Microsoft.DBforPostgreSQL/flexibleServers/configurations@2024-08-01' = {
+  parent: postgres
+  name: 'azure.extensions'
+  properties: {
+    source: 'user-override'
+    value: 'VECTOR,PG_TRGM,UNACCENT'
+  }
+}
+
+resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2024-08-01' = {
+  parent: postgres
+  name: databaseName
+  properties: {
+    charset: 'UTF8'
+    collation: 'en_US.utf8'
+  }
+  dependsOn: [
+    extensions
+  ]
+}
+
+resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
+  name: vaultName
+  location: location
+  properties: {
+    enableRbacAuthorization: true
+    enableSoftDelete: true
+    softDeleteRetentionInDays: 7
+    publicNetworkAccess: 'Enabled'
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
+    tenantId: tenant().tenantId
+  }
+}
+
+resource databaseUrl 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  parent: vault
+  name: 'database-url'
+  properties: {
+    value: 'postgresql+psycopg://${postgresAdmin}:${uriComponent(postgresAdminPassword)}@${postgres.properties.fullyQualifiedDomainName}:5432/${databaseName}?sslmode=require'
+  }
+}
+
+resource logs 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
+  name: logsName
+  location: location
+  properties: {
+    retentionInDays: 30
+    sku: {
+      name: 'PerGB2018'
+    }
+  }
+}
+
+resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
+  name: appInsightsName
+  location: location
+  kind: 'web'
+  properties: {
+    Application_Type: 'web'
+    Flow_Type: 'Bluefield'
+    IngestionMode: 'LogAnalytics'
+    WorkspaceResourceId: logs.id
+  }
+}
+
+resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
+  name: environmentName
+  location: location
+  properties: {
+    appLogsConfiguration: {
+      destination: 'log-analytics'
+      logAnalyticsConfiguration: {
+        customerId: logs.properties.customerId
+        sharedKey: logs.listKeys().primarySharedKey
+      }
+    }
+    workloadProfiles: [
+      {
+        name: 'Consumption'
+        workloadProfileType: 'Consumption'
+      }
+    ]
+  }
+}
+
+resource registryPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(registry.id, identity.id, 'acrpull')
+  scope: registry
+  properties: {
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+    )
+  }
+}
+
+resource vaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(vault.id, identity.id, 'secrets-user')
+  scope: vault
+  properties: {
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '4633458b-17de-408a-b874-0445c86b69e6'
+    )
+  }
+}
+
+resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
+  name: appName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: environment.id
+    configuration: {
+      activeRevisionsMode: 'Single'
+      ingress: {
+        allowInsecure: false
+        external: true
+        targetPort: 8000
+        transport: 'auto'
+      }
+      registries: contains(containerImage, registry.properties.loginServer)
+        ? [
+            {
+              server: registry.properties.loginServer
+              identity: identity.id
+            }
+          ]
+        : []
+      secrets: [
+        {
+          name: 'database-url'
+          keyVaultUrl: databaseUrl.properties.secretUriWithVersion
+          identity: identity.id
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'vietra'
+          image: containerImage
+          env: [
+            {
+              name: 'APP_ENV'
+              value: 'azure'
+            }
+            {
+              name: 'BUILD_REVISION'
+              value: buildRevision
+            }
+            {
+              name: 'DEMO_MODE'
+              value: 'false'
+            }
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+            {
+              name: 'AZURE_CLIENT_ID'
+              value: identity.properties.clientId
+            }
+            {
+              name: 'AZURE_OPENAI_ENDPOINT'
+              value: aiEndpoint
+            }
+            {
+              name: 'AZURE_OPENAI_CHAT_DEPLOYMENT'
+              value: chatDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_INTENT_DEPLOYMENT'
+              value: intentDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_EMBEDDING_DEPLOYMENT'
+              value: embeddingDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_IMAGE_DEPLOYMENT'
+              value: imageDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_API_VERSION'
+              value: '2025-04-01-preview'
+            }
+            {
+              name: 'OPENAI_EMBEDDING_DIMENSIONS'
+              value: '512'
+            }
+            {
+              name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+              value: appInsights.properties.ConnectionString
+            }
+          ]
+          probes: [
+            {
+              type: 'Liveness'
+              httpGet: {
+                path: '/health/live'
+                port: 8000
+              }
+              initialDelaySeconds: 10
+              periodSeconds: 30
+            }
+            {
+              type: 'Readiness'
+              httpGet: {
+                path: '/health/ready'
+                port: 8000
+              }
+              initialDelaySeconds: 5
+              periodSeconds: 10
+            }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+      scale: {
+        minReplicas: 0
+        maxReplicas: 1
+        rules: [
+          {
+            name: 'http'
+            http: {
+              metadata: {
+                concurrentRequests: '20'
+              }
+            }
+          }
+        ]
+      }
+    }
+    workloadProfileName: 'Consumption'
+  }
+  dependsOn: [
+    database
+    registryPull
+    vaultSecretsUser
+  ]
+}
+
+resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: 'job-${prefix}-catalog'
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: environment.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaTimeout: 1800
+      replicaRetryLimit: 1
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: contains(containerImage, registry.properties.loginServer)
+        ? [
+            {
+              server: registry.properties.loginServer
+              identity: identity.id
+            }
+          ]
+        : []
+      secrets: [
+        {
+          name: 'database-url'
+          keyVaultUrl: databaseUrl.properties.secretUriWithVersion
+          identity: identity.id
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'catalog'
+          image: containerImage
+          command: [
+            'sh'
+            '-c'
+          ]
+          args: [
+            'uv run --no-sync alembic upgrade head && uv run --no-sync python -m app.catalog.cli seed-db'
+          ]
+          env: [
+            {
+              name: 'APP_ENV'
+              value: 'azure'
+            }
+            {
+              name: 'DEMO_MODE'
+              value: 'false'
+            }
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+            {
+              name: 'AZURE_CLIENT_ID'
+              value: identity.properties.clientId
+            }
+            {
+              name: 'AZURE_OPENAI_ENDPOINT'
+              value: aiEndpoint
+            }
+            {
+              name: 'AZURE_OPENAI_EMBEDDING_DEPLOYMENT'
+              value: embeddingDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_API_VERSION'
+              value: '2025-04-01-preview'
+            }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+    }
+    workloadProfileName: 'Consumption'
+  }
+}
+
+output registryName string = registry.name
+output registryLoginServer string = registry.properties.loginServer
+output containerAppName string = containerApp.name
+output containerAppUrl string = 'https://${containerApp.properties.configuration.ingress.fqdn}'
+output postgresServerName string = postgres.name
+output keyVaultName string = vault.name
+output identityPrincipalId string = identity.properties.principalId

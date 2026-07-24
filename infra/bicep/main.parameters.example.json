@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "prefix": {
+      "value": "vietrapoc"
+    },
+    "location": {
+      "value": "eastus2"
+    },
+    "postgresAdminPassword": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.KeyVault/vaults/<vault>"
+        },
+        "secretName": "postgres-bootstrap-password"
+      }
+    },
+    "containerImage": {
+      "value": "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
+    }
+  }
+}

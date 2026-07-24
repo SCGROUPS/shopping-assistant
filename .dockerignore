@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.venv
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/node_modules
+frontend/dist
+frontend/playwright-report
+frontend/test-results
+backend/htmlcov
+infra
+POC_SPEC.md
