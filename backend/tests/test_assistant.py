@@ -34,6 +34,7 @@ async def test_assistant_requires_explicit_confirmation(client: AsyncClient):
     }.issubset(product)
     action_types = {action["type"] for action in product["actions"]}
     assert {"CHECK_AVAILABILITY", "ADD_TO_CART"}.issubset(action_types)
+    assert search.json()["actions"] == []
 
     added = await client.post(
         f"/api/v1/conversations/{conversation_id}/messages?stream=false",
@@ -91,6 +92,27 @@ async def test_assistant_defaults_to_json_contract(client: AsyncClient):
     assert {"message", "products", "actions", "citations"}.issubset(response.json())
 
 
+async def test_assistant_adds_the_persisted_party(client: AsyncClient):
+    created = await client.post(
+        "/api/v1/conversations",
+        json={"party": [{"type": "adult", "count": 3}]},
+    )
+    conversation_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages?stream=false",
+        json={"message": "Find a cruise in Da Nang"},
+    )
+    added = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages?stream=false",
+        json={"message": "Add the first one to cart"},
+    )
+    cart = await client.get("/api/v1/cart")
+
+    assert added.status_code == 200
+    assert "3 adults" in added.json()["message"]
+    assert cart.json()["items"][0]["quantity"] == 3
+
+
 class AzureLikeProvider:
     async def embed(self, text: str) -> list[float]:
         return deterministic_embedding(text)
@@ -107,7 +129,7 @@ class AzureLikeProvider:
 
 async def test_azure_enhancement_path_keeps_structured_commerce_payload():
     service = AssistantService(store, AzureLikeProvider())
-    conversation = service.create("azure-test", ConversationCreate())
+    conversation = await service.create("azure-test", ConversationCreate())
     response = await service.respond(
         conversation["id"],
         "azure-test",

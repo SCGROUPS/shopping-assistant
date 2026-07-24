@@ -20,6 +20,16 @@ test('desktop voice discovery completes a real voucher purchase', async ({
   })
   await expect(assistant).toBeVisible({ timeout: 120_000 })
   await expect(assistant.locator('.assistant-product').first()).toBeVisible()
+  await expect(
+    assistant.locator('.assistant-actions button[data-product-id]'),
+  ).toHaveCount(0)
+  await expect(
+    assistant
+      .locator('.assistant-product-actions')
+      .first()
+      .getByRole('button')
+      .first(),
+  ).toBeVisible()
 
   await page.evaluate(() => {
     ;(window as Window & { __voiceTranscript?: string }).__voiceTranscript =

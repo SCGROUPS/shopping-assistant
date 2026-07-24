@@ -5,9 +5,7 @@ subscription="${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID}"
 prefix="${VIETRA_PREFIX:-vietrapoc}"
 location="${AZURE_LOCATION:-eastus2}"
 postgres_location="${AZURE_POSTGRES_LOCATION:-centralus}"
-ai_subscription="${AZURE_AI_SUBSCRIPTION_ID:-$subscription}"
-ai_resource_group="${AZURE_AI_RESOURCE_GROUP:-ml}"
-ai_account_name="${AZURE_AI_ACCOUNT_NAME:-ai-eastus2508770413322}"
+ai_account_name="${AZURE_AI_ACCOUNT_NAME:-}"
 deployment="vietra-${prefix}"
 resource_group="rg-${prefix}-poc"
 registry_name="$(printf '%s' "$prefix" | tr -d '-' | tr '[:upper:]' '[:lower:]')vietra"
@@ -28,21 +26,25 @@ if az acr show \
 fi
 
 bootstrap_revision="bootstrap-$(date -u +%Y%m%d%H%M%S)"
+deployment_parameters=(
+  prefix="$prefix"
+  location="$location"
+  postgresLocation="$postgres_location"
+  postgresAdminPassword="$POSTGRES_ADMIN_PASSWORD"
+)
+if [[ -n "$ai_account_name" ]]; then
+  deployment_parameters+=(aiAccountName="$ai_account_name")
+fi
 
 az deployment sub create \
   --name "$deployment" \
   --location "$location" \
   --template-file infra/bicep/main.bicep \
   --parameters \
-    prefix="$prefix" \
-    location="$location" \
-    postgresLocation="$postgres_location" \
+    "${deployment_parameters[@]}" \
     containerImage="$bootstrap_image" \
     buildRevision="$bootstrap_revision" \
-    postgresAdminPassword="$POSTGRES_ADMIN_PASSWORD" \
-    aiSubscriptionId="$ai_subscription" \
-    aiResourceGroupName="$ai_resource_group" \
-    aiAccountName="$ai_account_name"
+  --output none
 
 registry="$(az deployment sub show \
   --name "$deployment" \
@@ -76,22 +78,58 @@ az deployment sub create \
   --location "$location" \
   --template-file infra/bicep/main.bicep \
   --parameters \
-    prefix="$prefix" \
-    location="$location" \
-    postgresLocation="$postgres_location" \
-    postgresAdminPassword="$POSTGRES_ADMIN_PASSWORD" \
+    "${deployment_parameters[@]}" \
     buildRevision="$build_revision" \
-    aiSubscriptionId="$ai_subscription" \
-    aiResourceGroupName="$ai_resource_group" \
-    aiAccountName="$ai_account_name" \
-    containerImage="${login_server}/vietra:latest"
+    containerImage="${login_server}/vietra:latest" \
+  --output none
 
 az containerapp job start \
   --resource-group "$resource_group" \
-  --name "job-${prefix}-catalog"
+  --name "job-${prefix}-catalog" \
+  --output none
 
-az containerapp show \
+job_status=""
+for _ in {1..120}; do
+  job_status="$(az containerapp job execution list \
+    --resource-group "$resource_group" \
+    --name "job-${prefix}-catalog" \
+    --query "sort_by(@, &properties.startTime)[-1].properties.status" \
+    --output tsv)"
+  case "$job_status" in
+    Succeeded)
+      break
+      ;;
+    Failed)
+      echo "Catalog job failed." >&2
+      exit 1
+      ;;
+  esac
+  sleep 10
+done
+
+if [[ "$job_status" != "Succeeded" ]]; then
+  echo "Catalog job did not complete within 20 minutes." >&2
+  exit 1
+fi
+
+hostname="$(az containerapp show \
   --resource-group "$resource_group" \
   --name "$app_name" \
   --query properties.configuration.ingress.fqdn \
-  --output tsv
+  --output tsv)"
+app_url="https://${hostname}"
+
+for _ in {1..60}; do
+  if curl --fail --silent "${app_url}/health/ready" >/dev/null; then
+    break
+  fi
+  sleep 10
+done
+
+curl --fail --silent "${app_url}/health/ready" >/dev/null
+curl --fail --silent "${app_url}/api/v1/experiences?limit=1" >/dev/null
+
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  echo "app_url=${app_url}" >> "$GITHUB_OUTPUT"
+fi
+echo "$app_url"

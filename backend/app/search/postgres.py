@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 from sqlalchemy import text
@@ -10,21 +11,74 @@ HYBRID_SEARCH_SQL = text(
       FROM experiences e
       JOIN destinations destination ON destination.id = e.destination_id
       WHERE e.status = 'PUBLISHED'
-        AND (:destination_id IS NULL OR e.destination_id = CAST(:destination_id AS uuid))
-        AND (:destination IS NULL OR lower(destination.name) = lower(:destination))
-        AND (:category IS NULL OR lower(e.category) = lower(:category))
-        AND (:rating IS NULL OR e.rating >= :rating)
-        AND (:max_duration IS NULL OR e.duration_minutes <= :max_duration)
         AND (
-          :indoor_outdoor IS NULL
-          OR lower(e.indoor_outdoor) = lower(:indoor_outdoor)
-          OR (lower(:indoor_outdoor) = 'indoor' AND lower(e.indoor_outdoor) = 'mixed')
+          CAST(:destination_id AS uuid) IS NULL
+          OR e.destination_id = CAST(:destination_id AS uuid)
         )
-        AND (:family_friendly IS NULL OR e.family_friendly = :family_friendly)
-        AND (:instant_confirmation IS NULL OR e.instant_confirmation = :instant_confirmation)
         AND (
-          :accessibility IS NULL
-          OR array_to_string(e.accessibility_features, ' ') ILIKE ('%' || :accessibility || '%')
+          CAST(:destination AS text) IS NULL
+          OR lower(destination.name) = lower(CAST(:destination AS text))
+        )
+        AND (
+          CAST(:category AS text) IS NULL
+          OR lower(e.category) = lower(CAST(:category AS text))
+        )
+        AND (
+          CAST(:rating AS numeric) IS NULL
+          OR e.rating >= CAST(:rating AS numeric)
+        )
+        AND (
+          CAST(:max_duration AS integer) IS NULL
+          OR e.duration_minutes <= CAST(:max_duration AS integer)
+        )
+        AND (
+          CAST(:indoor_outdoor AS text) IS NULL
+          OR lower(e.indoor_outdoor) = lower(CAST(:indoor_outdoor AS text))
+          OR (
+            lower(CAST(:indoor_outdoor AS text)) = 'indoor'
+            AND lower(e.indoor_outdoor) = 'mixed'
+          )
+        )
+        AND (
+          CAST(:family_friendly AS boolean) IS NULL
+          OR e.family_friendly = CAST(:family_friendly AS boolean)
+        )
+        AND (
+          CAST(:instant_confirmation AS boolean) IS NULL
+          OR e.instant_confirmation = CAST(:instant_confirmation AS boolean)
+        )
+        AND (
+          coalesce(cardinality(CAST(:accessibility AS text[])), 0) = 0
+          OR NOT EXISTS (
+            SELECT 1
+            FROM unnest(CAST(:accessibility AS text[])) required_feature
+            WHERE array_to_string(e.accessibility_features, ' ')
+              NOT ILIKE ('%' || required_feature || '%')
+          )
+        )
+        AND (
+          CAST(:language AS text) IS NULL
+          OR EXISTS (
+            SELECT 1
+            FROM unnest(e.languages) supported_language
+            WHERE lower(supported_language) = lower(CAST(:language AS text))
+          )
+        )
+        AND (
+          coalesce(cardinality(CAST(:exclusions AS text[])), 0) = 0
+          OR NOT EXISTS (
+            SELECT 1
+            FROM unnest(CAST(:exclusions AS text[])) exclusion
+            WHERE concat_ws(
+              ' ',
+              e.title,
+              e.short_description,
+              e.description,
+              e.category,
+              array_to_string(e.subcategories, ' '),
+              array_to_string(e.interest_tags, ' ')
+            ) ILIKE ('%' || exclusion || '%')
+          )
         )
         AND (
           :free_cancellation = false
@@ -36,26 +90,42 @@ HYBRID_SEARCH_SQL = text(
           )
         )
         AND (
-          :currency IS NULL
+          CAST(:currency AS text) IS NULL
           OR EXISTS (
             SELECT 1
             FROM experience_options currency_option
             JOIN option_prices currency_price ON currency_price.option_id = currency_option.id
             WHERE currency_option.experience_id = e.id
               AND currency_option.active = true
-              AND currency_price.currency = :currency
+              AND currency_price.currency = CAST(:currency AS text)
           )
         )
         AND (
-          :max_total_price IS NULL
+          CAST(:max_total_price AS numeric) IS NULL
           OR EXISTS (
             SELECT 1
             FROM experience_options budget_option
-            JOIN option_prices budget_price ON budget_price.option_id = budget_option.id
             WHERE budget_option.experience_id = e.id
               AND budget_option.active = true
-              AND budget_price.participant_type = 'adult'
-              AND budget_price.amount <= :max_total_price
+              AND (
+                SELECT count(*)
+                FROM jsonb_to_recordset(CAST(:party AS jsonb))
+                  AS requested_participant(type text, count integer)
+                JOIN option_prices participant_price
+                  ON participant_price.option_id = budget_option.id
+                  AND participant_price.participant_type = requested_participant.type
+              ) = jsonb_array_length(CAST(:party AS jsonb))
+              AND (
+                SELECT coalesce(
+                  sum(participant_price.amount * requested_participant.count),
+                  0
+                )
+                FROM jsonb_to_recordset(CAST(:party AS jsonb))
+                  AS requested_participant(type text, count integer)
+                JOIN option_prices participant_price
+                  ON participant_price.option_id = budget_option.id
+                  AND participant_price.participant_type = requested_participant.type
+              ) <= CAST(:max_total_price AS numeric)
           )
         )
         AND (
@@ -67,8 +137,12 @@ HYBRID_SEARCH_SQL = text(
             WHERE slot_option.experience_id = e.id
               AND slot_option.active = true
               AND slot.status = 'AVAILABLE'
-              AND slot.capacity_remaining >= :party_size
-              AND slot.starts_at::date = CAST(:visit_start AS timestamptz)::date
+              AND slot.capacity_remaining >= CAST(:party_size AS integer)
+              AND slot.starts_at::date >= CAST(:visit_start AS timestamptz)::date
+              AND (
+                CAST(:visit_end AS timestamptz) IS NULL
+                OR slot.starts_at::date <= CAST(:visit_end AS timestamptz)::date
+              )
           )
         )
     ),
@@ -126,8 +200,12 @@ async def hybrid_search(
     free_cancellation: bool = False,
     currency: str | None = None,
     max_total_price: float | None = None,
-    accessibility: str | None = None,
+    accessibility: list[str] | None = None,
+    language: str | None = None,
+    exclusions: list[str] | None = None,
     visit_start: str | None = None,
+    visit_end: str | None = None,
+    party: list[dict[str, Any]] | None = None,
     party_size: int = 1,
     lexical_limit: int = 50,
     semantic_limit: int = 50,
@@ -151,7 +229,11 @@ async def hybrid_search(
             "currency": currency,
             "max_total_price": max_total_price,
             "accessibility": accessibility,
+            "language": language,
+            "exclusions": exclusions,
             "visit_start": visit_start,
+            "visit_end": visit_end,
+            "party": json.dumps(party or [{"type": "adult", "count": 1}]),
             "party_size": party_size,
             "lexical_limit": lexical_limit,
             "semantic_limit": semantic_limit,

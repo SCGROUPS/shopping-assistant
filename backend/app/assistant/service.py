@@ -1,6 +1,9 @@
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
+
+from sqlalchemy import select, update
 
 from app.api.schemas import (
     AssistantAction,
@@ -16,12 +19,24 @@ from app.api.schemas import (
 from app.assistant.provider import AIProvider, build_ai_provider
 from app.bookings.service import BookingService
 from app.cart.service import CartService
-from app.catalog.service import get_product, product_card, product_detail
+from app.catalog.service import get_product_async, product_card, product_detail
 from app.common.config import get_settings
 from app.common.errors import ApiError
+from app.common.models import (
+    Conversation,
+    ConversationMessage,
+    ShoppingSession,
+)
+from app.common.persistence import (
+    database_mode,
+    ensure_session,
+    require_session_factory,
+)
 from app.common.store import DemoStore, store
 from app.recommendations.service import RecommendationService
 from app.search.service import SearchService
+
+logger = logging.getLogger(__name__)
 
 
 class AssistantService:
@@ -34,18 +49,20 @@ class AssistantService:
         self.recommendations = RecommendationService(data)
         self.settings = get_settings()
 
-    def create(self, session_id: str, request: ConversationCreate) -> dict[str, Any]:
+    async def create(
+        self, session_id: str, request: ConversationCreate
+    ) -> dict[str, Any]:
         conversation_id = uuid4()
         state = {
             "filters": request.filters.model_dump(mode="json"),
             "last_result_ids": [str(item) for item in request.result_ids],
             "selected_experience_ids": [],
-            "party": [],
+            "party": [item.model_dump(mode="json") for item in request.party],
             "hard_constraints": [],
             "soft_preferences": [],
             "pending_action": None,
         }
-        conversation = {
+        conversation_data = {
             "id": conversation_id,
             "session_id": session_id,
             "status": "ACTIVE",
@@ -55,83 +72,220 @@ class AssistantService:
             "created_at": datetime.now(UTC),
             "updated_at": datetime.now(UTC),
         }
-        self.data.conversations[conversation_id] = conversation
-        return conversation
-
-    def get(self, conversation_id: UUID, session_id: str) -> dict[str, Any]:
-        conversation = self.data.conversations.get(conversation_id)
-        if not conversation or conversation["session_id"] != session_id:
-            raise ApiError(
-                404, "Conversation not found", "The conversation does not exist", "not-found"
+        if not database_mode():
+            self.data.conversations[conversation_id] = conversation_data
+            return conversation_data
+        factory = require_session_factory()
+        async with factory() as db, db.begin():
+            shopping_session = await ensure_session(db, session_id)
+            db.add(
+                Conversation(
+                    id=conversation_id,
+                    session_id=shopping_session.id,
+                    status="ACTIVE",
+                    state=state,
+                    summary=request.query or "",
+                )
             )
-        return conversation
+        return conversation_data
+
+    async def get(
+        self, conversation_id: UUID, session_id: str
+    ) -> dict[str, Any]:
+        if not database_mode():
+            conversation = self.data.conversations.get(conversation_id)
+            if conversation and conversation["session_id"] == session_id:
+                return conversation
+            raise ApiError(
+                404,
+                "Conversation not found",
+                "The conversation does not exist",
+                "not-found",
+            )
+        factory = require_session_factory()
+        async with factory() as db:
+            row = await db.execute(
+                select(Conversation, ShoppingSession.anonymous_id)
+                .join(ShoppingSession, ShoppingSession.id == Conversation.session_id)
+                .where(
+                    Conversation.id == conversation_id,
+                    ShoppingSession.anonymous_id == session_id,
+                )
+            )
+            result = row.one_or_none()
+            if result is None:
+                raise ApiError(
+                    404,
+                    "Conversation not found",
+                    "The conversation does not exist",
+                    "not-found",
+                )
+            conversation, _anonymous_id = result
+            messages = (
+                await db.scalars(
+                    select(ConversationMessage)
+                    .where(ConversationMessage.conversation_id == conversation.id)
+                    .order_by(ConversationMessage.id)
+                )
+            ).all()
+            return {
+                "id": conversation.id,
+                "session_id": session_id,
+                "status": conversation.status,
+                "state": dict(conversation.state),
+                "summary": conversation.summary,
+                "messages": [
+                    {
+                        "role": message.role,
+                        "content": message.content,
+                        "structured_payload": message.structured_payload,
+                    }
+                    for message in messages
+                ],
+                "created_at": conversation.created_at,
+                "updated_at": conversation.updated_at,
+            }
+
+    async def _save_turn(
+        self,
+        conversation: dict[str, Any],
+        *,
+        user_message: str,
+        response: AssistantResponse,
+    ) -> None:
+        if not database_mode():
+            conversation["messages"].append(
+                {"role": "user", "content": user_message}
+            )
+            conversation["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": response.message,
+                    "structured_payload": response.model_dump(mode="json"),
+                }
+            )
+            conversation["updated_at"] = datetime.now(UTC)
+            return
+        factory = require_session_factory()
+        async with factory() as db, db.begin():
+            db.add_all(
+                [
+                    ConversationMessage(
+                        conversation_id=conversation["id"],
+                        role="user",
+                        content=user_message,
+                        structured_payload=None,
+                    ),
+                    ConversationMessage(
+                        conversation_id=conversation["id"],
+                        role="assistant",
+                        content=response.message,
+                        structured_payload=response.model_dump(mode="json"),
+                    ),
+                ]
+            )
+            await db.execute(
+                update(Conversation)
+                .where(Conversation.id == conversation["id"])
+                .values(
+                    state=conversation["state"],
+                    updated_at=datetime.now(UTC),
+                )
+            )
+
+    async def _conversation_message_count(self, conversation_id: UUID) -> int:
+        if not database_mode():
+            conversation = self.data.conversations[conversation_id]
+            return len(conversation["messages"])
+        factory = require_session_factory()
+        async with factory() as db:
+            messages = (
+                await db.scalars(
+                    select(ConversationMessage.id).where(
+                        ConversationMessage.conversation_id == conversation_id
+                    )
+                )
+            ).all()
+            return len(messages)
 
     async def respond(
         self, conversation_id: UUID, session_id: str, request: MessageRequest
     ) -> AssistantResponse:
-        conversation = self.get(conversation_id, session_id)
-        if len(conversation["messages"]) // 2 >= self.settings.assistant_max_session_turns:
+        conversation = await self.get(conversation_id, session_id)
+        message_count = await self._conversation_message_count(conversation_id)
+        if message_count // 2 >= self.settings.assistant_max_session_turns:
             raise ApiError(
                 429,
                 "Conversation limit reached",
                 "Start a new conversation to continue.",
                 "assistant-turn-limit",
             )
-        conversation["messages"].append({"role": "user", "content": request.message})
         lowered = request.message.casefold().strip()
         planned_tool = None
         try:
             planned_tool = await self.ai.plan_action(request.message, conversation["state"])
         except Exception:
+            logger.exception("Assistant action planning failed")
             planned_tool = None
         response: AssistantResponse
 
-        if lowered in {"confirm", "confirm booking", "yes, confirm", "confirm checkout"}:
-            response = self._confirm_checkout(conversation, session_id)
+        if (
+            lowered in {"confirm", "confirm booking", "yes, confirm", "confirm checkout"}
+            or planned_tool == "confirm_simulated_checkout"
+        ):
+            response = await self._confirm_checkout(conversation, session_id)
         elif (
             any(term in lowered for term in ("checkout", "pay", "book now"))
             or planned_tool == "prepare_checkout"
         ):
-            response = self._prepare_checkout(conversation, session_id)
+            response = await self._prepare_checkout(conversation, session_id)
         elif ("add" in lowered and "cart" in lowered) or planned_tool == "add_to_cart":
-            response = self._add_first_result(conversation, session_id)
+            response = await self._add_first_result(conversation, session_id)
         elif (
             "availability" in lowered
             or "available" in lowered
             or planned_tool == "check_availability"
         ):
-            response = self._availability(conversation)
+            response = await self._availability(conversation)
         elif "compare" in lowered or planned_tool == "compare_experiences":
-            response = self._compare(conversation)
+            response = await self._compare(conversation)
         elif (
             any(term in lowered for term in ("similar", "also like", "complete my day"))
             or planned_tool == "get_recommendations"
         ):
-            response = self._recommend(conversation, session_id)
+            response = await self._recommend(conversation, session_id)
         else:
             response = await self._search(conversation, request.message)
 
-        conversation["messages"].append(
-            {
-                "role": "assistant",
-                "content": response.message,
-                "structured_payload": response.model_dump(mode="json"),
-            }
+        await self._save_turn(
+            conversation,
+            user_message=request.message,
+            response=response,
         )
-        conversation["updated_at"] = datetime.now(UTC)
         return response
 
     async def _search(self, conversation: dict[str, Any], message: str) -> AssistantResponse:
         filters = SearchFilters.model_validate(conversation["state"].get("filters", {}))
         result = await self.search.search(
-            SearchRequest(query=message, filters=filters, page_size=5)
+            SearchRequest(
+                query=message,
+                filters=filters,
+                party=conversation["state"].get("party", []),
+                page_size=5,
+            )
         )
+        if result.intent.needs_clarification:
+            question = (
+                result.intent.clarification_question
+                or "Please clarify the required date, budget, or accessibility constraint."
+            )
+            return AssistantResponse(message=question, clarification=question)
         ids = [str(product.id) for product in result.items]
         conversation["state"]["last_result_ids"] = ids
         conversation["state"]["filters"] = result.effective_filters.model_dump(mode="json")
         products = [
             self._commerce_product(
-                get_product(product.id, self.data),
+                await get_product_async(product.id, self.data),
                 product.reason or "Matches your request.",
             )
             for product in result.items
@@ -162,7 +316,7 @@ class AssistantService:
             if enhanced:
                 message_text = enhanced
         except Exception:
-            pass
+            logger.exception("Grounded assistant prose enhancement failed")
         return AssistantResponse(
             message=message_text,
             state_patch={"filters": conversation["state"]["filters"], "last_result_ids": ids},
@@ -172,7 +326,6 @@ class AssistantService:
                 for key, value in result.effective_filters.model_dump(mode="json").items()
                 if value not in (None, [], "")
             ],
-            actions=[action for product in products[:3] for action in product.actions],
             citations=[
                 {
                     "experience_id": str(product.experience_id),
@@ -187,26 +340,35 @@ class AssistantService:
             ],
         )
 
-    def _availability(self, conversation: dict[str, Any]) -> AssistantResponse:
-        product = self._selected_product(conversation)
+    async def _availability(
+        self, conversation: dict[str, Any]
+    ) -> AssistantResponse:
+        product = await self._selected_product(conversation)
         detail = product_detail(product)
         slots = detail.options[0].slots[:3]
         if not slots:
             return AssistantResponse(message=f"No upcoming slots are available for {detail.title}.")
         slot_text = ", ".join(slot.starts_at.strftime("%d %b %H:%M UTC") for slot in slots)
+        product_view = self._commerce_product(
+            product, "Live demo inventory was checked."
+        )
+        product_view = product_view.model_copy(
+            update={
+                "actions": [
+                    AssistantAction(
+                        type="ADD_TO_CART",
+                        experience_id=detail.id,
+                        option_id=detail.options[0].id,
+                        slot_id=slot.id,
+                        label=f"Add {slot.starts_at:%d %b %H:%M} to cart",
+                    )
+                    for slot in slots
+                ]
+            }
+        )
         return AssistantResponse(
             message=f"{detail.title} has availability at {slot_text}.",
-            products=[self._commerce_product(product, "Live demo inventory was checked.")],
-            actions=[
-                AssistantAction(
-                    type="ADD_TO_CART",
-                    experience_id=detail.id,
-                    option_id=detail.options[0].id,
-                    slot_id=slot.id,
-                    label=f"Add {slot.starts_at:%d %b %H:%M} to cart",
-                )
-                for slot in slots
-            ],
+            products=[product_view],
             citations=[
                 {
                     "experience_id": str(detail.id),
@@ -215,9 +377,13 @@ class AssistantService:
             ],
         )
 
-    def _compare(self, conversation: dict[str, Any]) -> AssistantResponse:
+    async def _compare(
+        self, conversation: dict[str, Any]
+    ) -> AssistantResponse:
         ids = conversation["state"].get("last_result_ids", [])[:3]
-        products = [get_product(UUID(item), self.data) for item in ids]
+        products = [
+            await get_product_async(UUID(item), self.data) for item in ids
+        ]
         if len(products) < 2:
             return AssistantResponse(
                 message="Please search for at least two experiences before asking me to compare."
@@ -256,9 +422,11 @@ class AssistantService:
             ],
         )
 
-    def _recommend(self, conversation: dict[str, Any], session_id: str) -> AssistantResponse:
-        current = self._selected_product(conversation)
-        result = self.recommendations.recommend(
+    async def _recommend(
+        self, conversation: dict[str, Any], session_id: str
+    ) -> AssistantResponse:
+        current = await self._selected_product(conversation)
+        result = await self.recommendations.recommend(
             session_id=session_id,
             placement="complete_your_day",
             experience_id=current["id"],
@@ -266,7 +434,7 @@ class AssistantService:
         )
         products = [
             self._commerce_product(
-                get_product(item.id, self.data),
+                await get_product_async(item.id, self.data),
                 item.reason or "Complements your current choice.",
                 item.reason_code,
             )
@@ -275,7 +443,6 @@ class AssistantService:
         return AssistantResponse(
             message="These diverse options complement your current choice.",
             products=products,
-            actions=[action for product in products for action in product.actions],
             citations=[
                 {
                     "experience_id": str(item.id),
@@ -285,31 +452,44 @@ class AssistantService:
             ],
         )
 
-    def _add_first_result(self, conversation: dict[str, Any], session_id: str) -> AssistantResponse:
-        product = self._selected_product(conversation)
+    async def _add_first_result(
+        self, conversation: dict[str, Any], session_id: str
+    ) -> AssistantResponse:
+        product = await self._selected_product(conversation)
         option = product["options"][0]
+        participants = [
+            Participant.model_validate(item)
+            for item in conversation["state"].get("party", [])
+        ] or [Participant(type="adult", count=1)]
         slot = next(
             (
                 item
                 for item in option["slots"]
-                if item["capacity_remaining"] > 0 and item["starts_at"] > datetime.now(UTC)
+                if item["capacity_remaining"]
+                >= sum(participant.count for participant in participants)
+                and item["starts_at"] > datetime.now(UTC)
             ),
             None,
         )
-        cart = self.carts.add_item(
+        cart = await self.carts.add_item(
             session_id,
             CartItemRequest(
                 experience_id=product["id"],
                 option_id=option["id"],
                 slot_id=slot["id"] if slot else None,
-                participants=[Participant(type="adult", count=1)],
+                participants=participants,
             ),
-            f"assistant-{conversation['id']}-{len(conversation['messages'])}",
+            f"assistant-{conversation['id']}-{await self._conversation_message_count(conversation['id'])}",
         )
         conversation["state"]["pending_action"] = None
+        party_label = ", ".join(
+            f"{participant.count} {participant.type}"
+            f"{'s' if participant.count != 1 else ''}"
+            for participant in participants
+        )
         return AssistantResponse(
             message=(
-                f"Added {product['title']} for one adult to the cart. "
+                f"Added {product['title']} for {party_label} to the cart. "
                 f"The simulated total is {cart.total:,.0f} {cart.currency}."
             ),
             actions=[AssistantAction(type="PREPARE_CHECKOUT", label="Review checkout")],
@@ -321,8 +501,10 @@ class AssistantService:
             ],
         )
 
-    def _prepare_checkout(self, conversation: dict[str, Any], session_id: str) -> AssistantResponse:
-        cart = self.carts.validate(session_id)
+    async def _prepare_checkout(
+        self, conversation: dict[str, Any], session_id: str
+    ) -> AssistantResponse:
+        cart = await self.carts.validate(session_id)
         conversation["state"]["pending_action"] = "CONFIRM_CHECKOUT"
         return AssistantResponse(
             message=(
@@ -340,12 +522,14 @@ class AssistantService:
             ],
         )
 
-    def _confirm_checkout(self, conversation: dict[str, Any], session_id: str) -> AssistantResponse:
+    async def _confirm_checkout(
+        self, conversation: dict[str, Any], session_id: str
+    ) -> AssistantResponse:
         if conversation["state"].get("pending_action") != "CONFIRM_CHECKOUT":
             return AssistantResponse(
                 message="I cannot book yet. Ask me to prepare checkout first so you can review the total."
             )
-        booking = self.bookings.confirm(
+        booking = await self.bookings.confirm(
             session_id,
             idempotency_key=f"assistant-checkout-{conversation['id']}",
         )
@@ -359,7 +543,9 @@ class AssistantService:
             actions=[AssistantAction(type="VIEW_VOUCHER")],
         )
 
-    def _selected_product(self, conversation: dict[str, Any]) -> dict[str, Any]:
+    async def _selected_product(
+        self, conversation: dict[str, Any]
+    ) -> dict[str, Any]:
         ids = conversation["state"].get("last_result_ids", [])
         if not ids:
             raise ApiError(
@@ -368,7 +554,7 @@ class AssistantService:
                 "Search for an experience before this action.",
                 "no-selection",
             )
-        return get_product(UUID(ids[0]), self.data)
+        return await get_product_async(UUID(ids[0]), self.data)
 
     def _commerce_product(
         self,

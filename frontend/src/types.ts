@@ -38,15 +38,25 @@ export type Experience = {
   family_friendly?: boolean
   accessibility_features?: string[]
   options?: ExperienceOption[]
+  actions?: AssistantAction[]
 }
 
 export type SearchFilters = {
   destination?: string
   category?: string
-  date?: string
-  max_price?: number
+  visit_start?: string
+  visit_end?: string
+  currency?: string
+  max_total_price?: number
+  rating?: number
+  max_duration_minutes?: number
+  accessibility?: string[]
+  indoor_outdoor?: string
+  language?: string
+  instant_confirmation?: boolean
   family_friendly?: boolean
   free_cancellation?: boolean
+  exclusions?: string[]
 }
 
 export type AssistantAction = {

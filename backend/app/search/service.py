@@ -1,6 +1,8 @@
 import hashlib
+import logging
 import re
 from collections import Counter
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -14,6 +16,7 @@ from app.assistant.provider import AIProvider, build_ai_provider, deterministic_
 from app.catalog.service import product_card, starting_price
 from app.common.config import get_settings
 from app.common.database import session_factory
+from app.common.persistence import catalog_products
 from app.common.ranking import (
     bayesian_rating,
     cosine_similarity,
@@ -34,6 +37,41 @@ SYNONYMS = {
     "ticket": "admission",
 }
 
+logger = logging.getLogger(__name__)
+
+CONSTRAINT_FIELDS = {
+    "accessibility": "accessibility",
+    "budget": "max_total_price",
+    "category": "category",
+    "currency": "currency",
+    "date": "visit_start",
+    "duration": "max_duration_minutes",
+    "end_date": "visit_end",
+    "family_friendly": "family_friendly",
+    "free_cancellation": "free_cancellation",
+    "indoor_outdoor": "indoor_outdoor",
+    "instant_confirmation": "instant_confirmation",
+    "language": "language",
+    "max_duration": "max_duration_minutes",
+    "max_duration_minutes": "max_duration_minutes",
+    "max_price": "max_total_price",
+    "max_total_price": "max_total_price",
+    "rating": "rating",
+    "start_date": "visit_start",
+    "visit_date": "visit_start",
+    "visit_end": "visit_end",
+    "visit_start": "visit_start",
+}
+
+DATE_CONSTRAINT_FIELDS = {
+    "date",
+    "end_date",
+    "start_date",
+    "visit_date",
+    "visit_end",
+    "visit_start",
+}
+
 
 def should_extract_intent(request: SearchRequest) -> bool:
     query = request.query.strip()
@@ -47,21 +85,113 @@ def should_extract_intent(request: SearchRequest) -> bool:
     return bool(conversational or len(query.split()) > 5)
 
 
-def merge_filters(explicit: SearchFilters, intent: SearchIntent) -> SearchFilters:
+def sanitize_intent(query: str, intent: SearchIntent) -> SearchIntent:
+    mentions_date = bool(
+        re.search(
+            r"\b("
+            r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}|"
+            r"\d{1,2}[/-]\d{1,2}[/-](?:20)?\d{2}|"
+            r"january|february|march|april|may|june|july|august|"
+            r"september|october|november|december|"
+            r"today|tomorrow|tonight|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+            r"next week|this week|weekend"
+            r")\b",
+            query,
+            re.I,
+        )
+    )
+    constraints: list[dict[str, Any]] = []
+    for constraint in intent.hard_constraints:
+        field = str(constraint.get("field", "")).casefold()
+        operator = str(constraint.get("operator", "")).casefold()
+        value = constraint.get("value")
+        if value in (None, "", []) or operator in {"unspecified", "unknown"}:
+            continue
+        if field in DATE_CONSTRAINT_FIELDS and not mentions_date:
+            continue
+        if field == "category" and isinstance(value, list):
+            continue
+        constraints.append(constraint)
+    return intent.model_copy(
+        update={
+            "hard_constraints": constraints,
+            "needs_clarification": False,
+            "clarification_question": None,
+        }
+    )
+
+
+def _constraint_value(field: str, value: Any) -> Any:
+    if field == "accessibility":
+        return [str(item) for item in value] if isinstance(value, list) else [str(value)]
+    if field == "indoor_outdoor" and isinstance(value, list):
+        return str(value[0]) if value else None
+    if field in {"visit_start", "visit_end"}:
+        if isinstance(value, datetime):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("date constraint must be an ISO date or datetime")
+        normalized = value.replace("Z", "+00:00")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            normalized += "T00:00:00+00:00"
+        return datetime.fromisoformat(normalized)
+    if field in {"max_total_price", "rating"}:
+        return float(value)
+    if field == "max_duration_minutes":
+        return int(value)
+    if field in {
+        "family_friendly",
+        "free_cancellation",
+        "instant_confirmation",
+    }:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.casefold() in {"true", "yes", "required"}:
+            return True
+        if isinstance(value, str) and value.casefold() in {"false", "no"}:
+            return False
+        raise ValueError(f"{field} constraint must be boolean")
+    return str(value)
+
+
+def merge_filters(
+    explicit: SearchFilters, intent: SearchIntent
+) -> tuple[SearchFilters, list[str]]:
     values = explicit.model_dump()
+    unresolved: list[str] = []
     if not values["destination"] and intent.destination.name:
         values["destination"] = intent.destination.name
     for constraint in intent.hard_constraints:
-        field = constraint.get("field")
+        source_field = str(constraint.get("field", "")).casefold()
+        field = CONSTRAINT_FIELDS.get(source_field)
         value = constraint.get("value")
-        if field == "indoor_outdoor" and not values["indoor_outdoor"]:
-            values["indoor_outdoor"] = value[0] if isinstance(value, list) else value
-        if field == "accessibility" and not values["accessibility"]:
-            values["accessibility"] = [str(value)]
+        if not field:
+            unresolved.append(source_field or "unknown")
+            continue
+        if values.get(field) not in (None, [], ""):
+            continue
+        try:
+            values[field] = _constraint_value(field, value)
+        except (TypeError, ValueError):
+            unresolved.append(source_field)
     for preference in intent.soft_preferences:
         if preference.get("field") == "family_friendly" and values["family_friendly"] is None:
             values["family_friendly"] = bool(preference.get("value"))
-    return SearchFilters.model_validate(values)
+    values["exclusions"] = list(
+        dict.fromkeys([*values["exclusions"], *intent.exclusions])
+    )
+    if values["visit_start"] and not values["visit_end"]:
+        values["visit_end"] = values["visit_start"]
+    if (
+        values["visit_start"]
+        and values["visit_end"]
+        and values["visit_end"] < values["visit_start"]
+    ):
+        values["visit_end"] = values["visit_start"]
+        if explicit.visit_end is not None:
+            unresolved.append("visit_end")
+    return SearchFilters.model_validate(values), unresolved
 
 
 def _expanded_tokens(query: str) -> list[str]:
@@ -132,10 +262,17 @@ def _eligible(product: dict[str, Any], request: SearchRequest, filters: SearchFi
         _, currency = starting_price(product)
         if currency != filters.currency:
             return False
+    if filters.exclusions:
+        searchable = product["search_document"].casefold()
+        if any(exclusion.casefold() in searchable for exclusion in filters.exclusions):
+            return False
     if filters.visit_start:
         party_size = sum(person.count for person in request.party) or 1
+        visit_end = filters.visit_end or filters.visit_start
         if not any(
-            slot["starts_at"].date() == filters.visit_start.date()
+            filters.visit_start.date()
+            <= slot["starts_at"].date()
+            <= visit_end.date()
             and slot["capacity_remaining"] >= party_size
             and slot["status"] == "AVAILABLE"
             for option in product["options"]
@@ -178,18 +315,21 @@ class SearchService:
         self.settings = get_settings()
 
     async def search(self, request: SearchRequest) -> SearchResponse:
+        available_products = await catalog_products(self.data)
         if should_extract_intent(request):
             try:
                 intent = await self.ai.extract_intent(request.query)
             except Exception:
+                logger.exception("Intent extraction failed; using deterministic parsing")
                 intent = deterministic_intent(request.query)
         else:
             intent = SearchIntent(search_text=request.query)
+        intent = sanitize_intent(request.query, intent)
         if intent.destination.name:
             inferred = intent.destination.name.casefold()
             known_destinations = {
                 product["destination"].casefold()
-                for product in self.data.products.values()
+                for product in available_products
             }
             if not any(
                 inferred in destination or destination in inferred
@@ -202,10 +342,30 @@ class SearchService:
                         )
                     }
                 )
-        filters = merge_filters(request.filters, intent)
+        filters, unresolved = merge_filters(request.filters, intent)
+        if unresolved or intent.needs_clarification:
+            intent = intent.model_copy(
+                update={
+                    "needs_clarification": True,
+                    "clarification_question": intent.clarification_question
+                    or (
+                        "Please clarify these required constraints: "
+                        f"{', '.join(sorted(set(unresolved)))}."
+                        if unresolved
+                        else "Please clarify the required date, budget, or accessibility details."
+                    ),
+                }
+            )
+            return SearchResponse(
+                query_id=uuid4(),
+                intent=intent,
+                effective_filters=filters,
+                items=[],
+                facets={},
+            )
         eligible = [
             product
-            for product in self.data.products.values()
+            for product in available_products
             if _eligible(product, request, filters)
         ]
 
@@ -228,6 +388,7 @@ class SearchService:
             try:
                 self.data.query_embeddings[cache_key] = await self.ai.embed(normalized)
             except Exception:
+                logger.exception("Query embedding failed; using deterministic embedding")
                 from app.common.ranking import deterministic_embedding
 
                 self.data.query_embeddings[cache_key] = deterministic_embedding(normalized)
@@ -261,12 +422,19 @@ class SearchService:
                         free_cancellation=bool(filters.free_cancellation),
                         currency=filters.currency,
                         max_total_price=filters.max_total_price,
-                        accessibility=(
-                            filters.accessibility[0] if filters.accessibility else None
-                        ),
+                        accessibility=filters.accessibility,
+                        language=filters.language,
+                        exclusions=filters.exclusions,
                         visit_start=(
                             filters.visit_start.isoformat() if filters.visit_start else None
                         ),
+                        visit_end=(
+                            filters.visit_end.isoformat() if filters.visit_end else None
+                        ),
+                        party=[
+                            person.model_dump(mode="json")
+                            for person in request.party
+                        ],
                         party_size=sum(person.count for person in request.party) or 1,
                         lexical_limit=self.settings.search_lexical_candidates,
                         semantic_limit=self.settings.search_semantic_candidates,
@@ -274,7 +442,8 @@ class SearchService:
                         page_size=max(request.page_size * 3, 50),
                     )
             except Exception:
-                postgres_rows = []
+                logger.exception("PostgreSQL hybrid retrieval failed")
+                raise
 
         if postgres_rows:
             ordered = [str(row["id"]) for row in postgres_rows]

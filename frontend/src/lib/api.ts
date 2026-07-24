@@ -9,6 +9,8 @@ import type {
 } from '../types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
+const ALLOW_DEMO_FALLBACK =
+  import.meta.env.VITE_ALLOW_DEMO_FALLBACK === 'true'
 
 const SESSION_ID =
   localStorage.getItem('vietra-session-id') ?? crypto.randomUUID()
@@ -17,6 +19,15 @@ localStorage.setItem('vietra-session-id', SESSION_ID)
 const jsonHeaders = {
   'Content-Type': 'application/json',
   'X-Session-ID': SESSION_ID,
+}
+
+class ApiRequestError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -28,10 +39,44 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   })
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`)
+    const problem = await response
+      .json()
+      .catch(() => null) as Record<string, unknown> | null
+    throw new ApiRequestError(
+      String(problem?.detail ?? problem?.title ?? `Request failed: ${response.status}`),
+      response.status,
+    )
   }
   return response.json() as Promise<T>
 }
+
+const allowDemoFallbackOrThrow = (error: unknown) => {
+  if (ALLOW_DEMO_FALLBACK) return true
+  throw error
+}
+
+const actionLabels: Record<string, string> = {
+  ADD_TO_CART: 'Add to trip',
+  CHECK_AVAILABILITY: 'Check times',
+  PREPARE_CHECKOUT: 'Review checkout',
+  CONFIRM_SIMULATED_CHECKOUT: 'Confirm demo purchase',
+  VIEW_VOUCHER: 'View voucher',
+}
+
+const normalizeAssistantAction = (
+  action: Record<string, unknown>,
+): AssistantAction => ({
+  type: String(action.type) as AssistantAction['type'],
+  label:
+    String(action.label ?? '') ||
+    actionLabels[String(action.type)] ||
+    'Continue',
+  experience_id: action.experience_id
+    ? String(action.experience_id)
+    : undefined,
+  option_id: action.option_id ? String(action.option_id) : undefined,
+  slot_id: action.slot_id ? String(action.slot_id) : undefined,
+})
 
 const normalizeExperience = (item: Record<string, unknown>): Experience => {
   const backendOptions = Array.isArray(item.options)
@@ -108,6 +153,11 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
       ? item.accessibility_features.map(String)
       : [],
     options,
+    actions: Array.isArray(item.actions)
+      ? (item.actions as Array<Record<string, unknown>>).map(
+          normalizeAssistantAction,
+        )
+      : [],
   }
 }
 
@@ -229,7 +279,8 @@ export const filterDemoProducts = (
       (!filters.category ||
         filters.category === 'All' ||
         experience.category === filters.category) &&
-      (!filters.max_price || experience.price <= filters.max_price) &&
+      (!filters.max_total_price ||
+        experience.price <= filters.max_total_price) &&
       (!filters.family_friendly || experience.family_friendly) &&
       (!filters.free_cancellation || experience.free_cancellation)
     )
@@ -237,10 +288,13 @@ export const filterDemoProducts = (
 }
 
 export const api = {
+  demoFallbackEnabled: ALLOW_DEMO_FALLBACK,
+
   async listExperiences(): Promise<Experience[]> {
     try {
       return normalizeProducts(await request('/experiences'))
-    } catch {
+    } catch (error) {
+      allowDemoFallbackOrThrow(error)
       return demoExperiences
     }
   },
@@ -248,7 +302,12 @@ export const api = {
   async search(
     query: string,
     filters: SearchFilters,
-  ): Promise<{ items: Experience[]; intent?: Record<string, unknown> }> {
+    partySize: number,
+  ): Promise<{
+    items: Experience[]
+    intent?: Record<string, unknown>
+    effectiveFilters: SearchFilters
+  }> {
     try {
       const payload = await request<Record<string, unknown>>('/search', {
         method: 'POST',
@@ -256,7 +315,7 @@ export const api = {
         body: JSON.stringify({
           query,
           filters,
-          party: [{ type: 'adult', count: 2 }],
+          party: [{ type: 'adult', count: partySize }],
           sort: 'recommended',
           page_size: 24,
         }),
@@ -264,9 +323,15 @@ export const api = {
       return {
         items: normalizeProducts(payload),
         intent: payload.intent as Record<string, unknown> | undefined,
+        effectiveFilters:
+          (payload.effective_filters as SearchFilters | undefined) ?? filters,
       }
-    } catch {
-      return { items: filterDemoProducts(query, filters) }
+    } catch (error) {
+      allowDemoFallbackOrThrow(error)
+      return {
+        items: filterDemoProducts(query, filters),
+        effectiveFilters: filters,
+      }
     }
   },
 
@@ -276,7 +341,8 @@ export const api = {
     try {
       const query = context?.id ? `?experience_id=${context.id}` : ''
       return normalizeProducts(await request(`/recommendations${query}`))
-    } catch {
+    } catch (error) {
+      allowDemoFallbackOrThrow(error)
       const products = [...demoExperiences]
       if (context?.destination) {
         products.sort((a, b) =>
@@ -290,15 +356,28 @@ export const api = {
     }
   },
 
-  async createConversation(): Promise<string> {
+  async createConversation(context: {
+    query?: string
+    filters?: SearchFilters
+    resultIds?: string[]
+    partySize?: number
+  } = {}): Promise<string> {
     try {
       const conversation = await request<{ id: string }>('/conversations', {
         method: 'POST',
         headers: jsonHeaders,
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          query: context.query,
+          filters: context.filters ?? {},
+          result_ids: context.resultIds ?? [],
+          party: context.partySize
+            ? [{ type: 'adult', count: context.partySize }]
+            : [],
+        }),
       })
       return conversation.id
-    } catch {
+    } catch (error) {
+      allowDemoFallbackOrThrow(error)
       return `demo-${crypto.randomUUID()}`
     }
   },
@@ -309,35 +388,60 @@ export const api = {
     visibleProducts: Experience[],
   ): Promise<AssistantMessage> {
     try {
-      const response = await request<Record<string, unknown>>(
-        `/conversations/${conversationId}/messages?stream=false`,
+      const httpResponse = await fetch(
+        `${API_BASE}/conversations/${conversationId}/messages?stream=true`,
         {
           method: 'POST',
-          headers: { ...jsonHeaders, Accept: 'application/json' },
+          headers: { ...jsonHeaders, Accept: 'text/event-stream' },
           body: JSON.stringify({ message: text }),
         },
       )
-      const products = normalizeProducts(response)
-      const actionLabels: Record<string, string> = {
-        ADD_TO_CART: 'Add to trip',
-        CHECK_AVAILABILITY: 'Check times',
-        PREPARE_CHECKOUT: 'Review checkout',
-        CONFIRM_SIMULATED_CHECKOUT: 'Confirm demo purchase',
-        VIEW_VOUCHER: 'View voucher',
+      if (!httpResponse.ok) {
+        throw new ApiRequestError(
+          `Assistant request failed: ${httpResponse.status}`,
+          httpResponse.status,
+        )
       }
+      if (!httpResponse.body) {
+        throw new Error('Assistant response stream is unavailable.')
+      }
+      const reader = httpResponse.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let response: Record<string, unknown> | undefined
+      while (true) {
+        const { done, value } = await reader.read()
+        buffer += decoder.decode(value, { stream: !done })
+        const events = buffer.split('\n\n')
+        buffer = events.pop() ?? ''
+        for (const event of events) {
+          const lines = event.split('\n')
+          const eventName = lines
+            .find((line) => line.startsWith('event:'))
+            ?.slice(6)
+            .trim()
+          const data = lines
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trim())
+            .join('\n')
+          if (eventName === 'completed' && data) {
+            response = JSON.parse(data) as Record<string, unknown>
+          }
+          if (eventName === 'error' && data) {
+            const problem = JSON.parse(data) as Record<string, unknown>
+            throw new Error(String(problem.detail ?? 'Assistant request failed.'))
+          }
+        }
+        if (done) break
+      }
+      if (!response) {
+        throw new Error('Assistant stream ended without a completed response.')
+      }
+      const products = normalizeProducts(response)
       const actions = Array.isArray(response.actions)
-        ? (response.actions as Array<Record<string, unknown>>).map((action) => ({
-            type: String(action.type) as AssistantAction['type'],
-            label:
-              String(action.label ?? '') ||
-              actionLabels[String(action.type)] ||
-              'Continue',
-            experience_id: action.experience_id
-              ? String(action.experience_id)
-              : undefined,
-            option_id: action.option_id ? String(action.option_id) : undefined,
-            slot_id: action.slot_id ? String(action.slot_id) : undefined,
-          }))
+        ? (response.actions as Array<Record<string, unknown>>).map(
+            normalizeAssistantAction,
+          )
         : []
       return {
         id: crypto.randomUUID(),
@@ -351,7 +455,7 @@ export const api = {
         timestamp: new Date(),
       }
     } catch (error) {
-      if (!conversationId.startsWith('demo-')) throw error
+      if (!conversationId.startsWith('demo-') || !ALLOW_DEMO_FALLBACK) throw error
       const lower = text.toLowerCase()
       let matches = visibleProducts.length ? visibleProducts : demoExperiences
       let reply =
@@ -464,7 +568,7 @@ export const api = {
       })
       return normalizeCart(response, [product, ...knownProducts])
     } catch (error) {
-      if (!product.id.startsWith('exp-')) throw error
+      if (!product.id.startsWith('exp-') || !ALLOW_DEMO_FALLBACK) throw error
       return [
         ...existingItems,
         demoCartItem(product, date, adults, children),
@@ -472,12 +576,13 @@ export const api = {
     }
   },
 
-  async getCart(knownProducts: Experience[] = []): Promise<CartItem[] | null> {
+  async getCart(knownProducts: Experience[] = []): Promise<CartItem[]> {
     try {
       const response = await request<Record<string, unknown>>('/cart')
       return normalizeCart(response, knownProducts)
-    } catch {
-      return null
+    } catch (error) {
+      allowDemoFallbackOrThrow(error)
+      return []
     }
   },
 
@@ -500,7 +605,8 @@ export const api = {
       return normalizeExperience(
         await request<Record<string, unknown>>(`/experiences/${experienceId}`),
       )
-    } catch {
+    } catch (error) {
+      allowDemoFallbackOrThrow(error)
       return demoExperiences.find((product) => product.id === experienceId)
     }
   },
@@ -536,7 +642,10 @@ export const api = {
         currency: String(booking.currency),
       }
     } catch (error) {
-      if (!items.every((item) => item.experience.id.startsWith('exp-'))) {
+      if (
+        !ALLOW_DEMO_FALLBACK ||
+        !items.every((item) => item.experience.id.startsWith('exp-'))
+      ) {
         throw error
       }
       const total = items.reduce((sum, item) => sum + item.total, 0)

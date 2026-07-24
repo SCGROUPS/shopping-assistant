@@ -79,9 +79,12 @@ const money = (currency: string, amount: number) =>
   }).format(amount)
 
 function App() {
-  const [products, setProducts] = useState<Experience[]>(demoExperiences)
-  const [recommendations, setRecommendations] =
-    useState<Experience[]>(demoExperiences.slice(0, 6))
+  const [products, setProducts] = useState<Experience[]>(
+    api.demoFallbackEnabled ? demoExperiences : [],
+  )
+  const [recommendations, setRecommendations] = useState<Experience[]>(
+    api.demoFallbackEnabled ? demoExperiences.slice(0, 6) : [],
+  )
   const [query, setQuery] = useState('')
   const [destination, setDestination] = useState('Central Vietnam')
   const [date, setDate] = useState('2026-08-15')
@@ -92,8 +95,11 @@ function App() {
   const [assistantOpen, setAssistantOpen] = useState(false)
   const [assistantBusy, setAssistantBusy] = useState(false)
   const [messages, setMessages] = useState<AssistantMessage[]>([
-    initialMessage,
+    api.demoFallbackEnabled
+      ? initialMessage
+      : { ...initialMessage, products: undefined },
   ])
+  const [bootstrapping, setBootstrapping] = useState(true)
   const [conversationId, setConversationId] = useState<string>()
   const [cartOpen, setCartOpen] = useState(false)
   const [cartItems, setCartItems] = useState<CartItem[]>([])
@@ -103,17 +109,35 @@ function App() {
     null,
   )
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const [appError, setAppError] = useState('')
+  const [searchContext, setSearchContext] = useState<{
+    query: string
+    filters: SearchFilters
+    resultIds: string[]
+  }>({ query: '', filters: {}, resultIds: [] })
 
   useEffect(() => {
     void (async () => {
-      const [experiences, recommended] = await Promise.all([
-        api.listExperiences(),
-        api.recommendations(),
-      ])
-      if (experiences.length) setProducts(experiences)
-      if (recommended.length) setRecommendations(recommended)
-      const cart = await api.getCart([...experiences, ...recommended])
-      if (cart) setCartItems(cart)
+      try {
+        const [experiences, recommended] = await Promise.all([
+          api.listExperiences(),
+          api.recommendations(),
+        ])
+        if (experiences.length) setProducts(experiences)
+        if (recommended.length) setRecommendations(recommended)
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === 'welcome'
+              ? { ...message, products: experiences.slice(0, 3) }
+              : message,
+          ),
+        )
+        setCartItems(await api.getCart([...experiences, ...recommended]))
+      } catch {
+        setAppError('The live Vietra service is unavailable. Please try again shortly.')
+      } finally {
+        setBootstrapping(false)
+      }
     })()
   }, [])
 
@@ -131,38 +155,52 @@ function App() {
     setSearching(true)
     setHasSearched(true)
     const filters: SearchFilters = {
-      date,
+      destination:
+        destination === 'Central Vietnam' ? undefined : destination,
+      visit_start: date ? `${date}T00:00:00Z` : undefined,
       category: category === 'All' ? undefined : category,
       ...extraFilters,
     }
-    const result = await api.search(searchQuery, filters)
-    setProducts(result.items)
-    setSearching(false)
+    try {
+      const result = await api.search(searchQuery, filters, travellers)
+      setProducts(result.items)
+      setSearchContext({
+        query: searchQuery,
+        filters: result.effectiveFilters,
+        resultIds: result.items.map((item) => item.id),
+      })
+      setConversationId(undefined)
+      setAppError('')
 
-    if (searchQuery.trim().split(/\s+/).length >= 4) {
-      const best = result.items.slice(0, 3)
-      setMessages((current) => [
-        ...current,
-        {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          text: best.length
-            ? `I translated “${searchQuery}” into a few practical preferences. These have the strongest overall fit; I can compare them or shape them into a half-day plan.`
-            : `I could not find a live match for “${searchQuery}”. Try relaxing the destination, date, or activity preferences and I will search again.`,
-          products: best,
-          actions: best[0]
-            ? [
-                {
-                  type: 'ADD_TO_CART',
-                  label: `Reserve ${best[0].title}`,
-                  experience_id: best[0].id,
-                },
-              ]
-            : [],
-          timestamp: new Date(),
-        },
-      ])
-      setAssistantOpen(true)
+      if (searchQuery.trim().split(/\s+/).length >= 4) {
+        const best = result.items.slice(0, 3)
+        setMessages((current) => [
+          ...current,
+          {
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            text: best.length
+              ? `I translated “${searchQuery}” into a few practical preferences. These have the strongest overall fit; I can compare them or shape them into a half-day plan.`
+              : `I could not find a live match for “${searchQuery}”. Try relaxing the destination, date, or activity preferences and I will search again.`,
+            products: best,
+            actions: best[0]
+              ? [
+                  {
+                    type: 'ADD_TO_CART',
+                    label: `Reserve ${best[0].title}`,
+                    experience_id: best[0].id,
+                  },
+                ]
+              : [],
+            timestamp: new Date(),
+          },
+        ])
+        setAssistantOpen(true)
+      }
+    } catch {
+      setAppError('Search could not reach the live catalog. Your current results are unchanged.')
+    } finally {
+      setSearching(false)
     }
   }
 
@@ -243,7 +281,14 @@ function App() {
     setMessages((current) => [...current, userMessage])
     setAssistantBusy(true)
     try {
-      const id = conversationId ?? (await api.createConversation())
+      const id =
+        conversationId ??
+        (await api.createConversation({
+          query: searchContext.query,
+          filters: searchContext.filters,
+          resultIds: searchContext.resultIds,
+          partySize: travellers,
+        }))
       if (!conversationId) setConversationId(id)
       const response = await api.sendMessage(id, text, visibleProducts)
       setMessages((current) => [...current, response])
@@ -252,7 +297,7 @@ function App() {
         ...visibleProducts,
         ...recommendations,
       ])
-      if (cart) setCartItems(cart)
+      setCartItems(cart)
     } catch {
       setMessages((current) => [
         ...current,
@@ -377,6 +422,14 @@ function App() {
 
   return (
     <div className="app-shell">
+      {appError && (
+        <div className="service-error" role="alert">
+          {appError}
+          <button onClick={() => setAppError('')} aria-label="Dismiss service error">
+            <X size={16} />
+          </button>
+        </div>
+      )}
       <header className="site-header">
         <a className="brand" href="#top" aria-label="Vietra home">
           <span className="brand-mark">V</span>
@@ -594,7 +647,7 @@ function App() {
             </button>
           </div>
 
-          {searching ? (
+          {searching || bootstrapping ? (
             <div className="product-grid skeleton-grid">
               {Array.from({ length: 6 }, (_, index) => (
                 <div className="skeleton-card" key={index}>
@@ -787,7 +840,6 @@ function App() {
           void handleAssistantAction(action, actionProducts)
         }
         onView={setSelectedProduct}
-        onAdd={(product) => void addToCart(product, true)}
       />
 
       <CartDrawer

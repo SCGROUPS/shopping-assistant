@@ -33,9 +33,16 @@ from app.api.schemas import (
 from app.assistant.service import AssistantService
 from app.bookings.service import BookingService
 from app.cart.service import CartService
-from app.catalog.service import get_product, product_card, product_detail
+from app.catalog.service import get_product_async, product_card, product_detail
 from app.common.database import database_ready
 from app.common.errors import ApiError
+from app.common.models import BehaviorEvent
+from app.common.persistence import (
+    catalog_products,
+    database_mode,
+    ensure_session,
+    require_session_factory,
+)
 from app.common.store import store
 from app.recommendations.service import RecommendationService
 from app.search.service import SearchService
@@ -55,9 +62,11 @@ IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=8,
 async def search(
     request: SearchRequest, session_id: SessionHeader = "demo-session"
 ) -> SearchResponse:
-    store.session(session_id)
     result = await search_service.search(request)
-    _capture(session_id, EventRequest(event_type="search_submitted", query_id=result.query_id))
+    await _capture(
+        session_id,
+        EventRequest(event_type="search_submitted", query_id=result.query_id),
+    )
     return result
 
 
@@ -70,7 +79,7 @@ async def list_experiences(
 ) -> ExperienceListResponse:
     products = [
         product
-        for product in store.products.values()
+        for product in await catalog_products()
         if product["status"] == "PUBLISHED"
         and (not destination or product["destination"].casefold() == destination.casefold())
         and (not category or product["category"].casefold() == category.casefold())
@@ -86,8 +95,11 @@ async def list_experiences(
 async def experience_detail(
     experience_id: UUID, session_id: SessionHeader = "demo-session"
 ) -> ExperienceDetail:
-    product = get_product(experience_id)
-    _capture(session_id, EventRequest(event_type="experience_viewed", experience_id=experience_id))
+    product = await get_product_async(experience_id)
+    await _capture(
+        session_id,
+        EventRequest(event_type="experience_viewed", experience_id=experience_id),
+    )
     return product_detail(product)
 
 
@@ -97,9 +109,9 @@ async def availability(
     visit_start: datetime | None = None,
     session_id: SessionHeader = "demo-session",
 ) -> dict[str, Any]:
-    product = get_product(experience_id)
+    product = await get_product_async(experience_id)
     detail = product_detail(product, visit_start)
-    _capture(
+    await _capture(
         session_id, EventRequest(event_type="availability_checked", experience_id=experience_id)
     )
     return {
@@ -117,7 +129,7 @@ async def recommendations(
     destination: str | None = None,
     limit: int = Query(default=6, ge=1, le=20),
 ) -> RecommendationResponse:
-    return recommendation_service.recommend(
+    return await recommendation_service.recommend(
         session_id=session_id,
         placement=placement,
         experience_id=experience_id,
@@ -130,15 +142,14 @@ async def recommendations(
 async def capture_event(
     request: EventRequest, session_id: SessionHeader = "demo-session"
 ) -> dict[str, Any]:
-    return _capture(session_id, request)
+    return await _capture(session_id, request)
 
 
 @router.post("/conversations", status_code=201)
 async def create_conversation(
     request: ConversationCreate, session_id: SessionHeader = "demo-session"
 ) -> dict[str, Any]:
-    store.session(session_id)
-    conversation = assistant_service.create(session_id, request)
+    conversation = await assistant_service.create(session_id, request)
     return {"id": conversation["id"]}
 
 
@@ -146,7 +157,7 @@ async def create_conversation(
 async def get_conversation(
     conversation_id: UUID, session_id: SessionHeader = "demo-session"
 ) -> dict[str, Any]:
-    conversation = assistant_service.get(conversation_id, session_id)
+    conversation = await assistant_service.get(conversation_id, session_id)
     return {
         "id": conversation["id"],
         "status": conversation["status"],
@@ -166,24 +177,43 @@ async def conversation_message(
     session_id: SessionHeader = "demo-session",
     stream: bool | None = Query(default=None),
 ) -> Any:
-    response = await assistant_service.respond(conversation_id, session_id, body)
-    _capture(session_id, EventRequest(event_type="assistant_message_sent"))
     wants_stream = (
         stream
         if stream is not None
         else "text/event-stream" in http_request.headers.get("accept", "").casefold()
     )
     if not wants_stream:
+        response = await assistant_service.respond(conversation_id, session_id, body)
+        await _capture(session_id, EventRequest(event_type="assistant_message_sent"))
         return JSONResponse(jsonable_encoder(response))
 
     async def events():
         yield _sse("status", {"status": "working"})
-        yield _sse("text_delta", {"delta": response.message})
-        if response.products:
-            yield _sse("products", [item.model_dump(mode="json") for item in response.products])
-        if response.state_patch:
-            yield _sse("state_patch", response.state_patch)
-        yield _sse("completed", response.model_dump(mode="json"))
+        try:
+            response = await assistant_service.respond(conversation_id, session_id, body)
+            await _capture(
+                session_id,
+                EventRequest(event_type="assistant_message_sent"),
+            )
+            yield _sse("text_delta", {"delta": response.message})
+            if response.products:
+                yield _sse(
+                    "products",
+                    [item.model_dump(mode="json") for item in response.products],
+                )
+            if response.state_patch:
+                yield _sse("state_patch", response.state_patch)
+            yield _sse("completed", response.model_dump(mode="json"))
+        except ApiError as exc:
+            yield _sse(
+                "error",
+                {
+                    "status": exc.status,
+                    "title": exc.title,
+                    "detail": exc.detail,
+                    "code": exc.code,
+                },
+            )
 
     return StreamingResponse(
         events(),
@@ -194,7 +224,7 @@ async def conversation_message(
 
 @router.get("/cart", response_model=CartView)
 async def get_cart(session_id: SessionHeader = "demo-session") -> CartView:
-    return cart_service.get_cart(session_id)
+    return await cart_service.get_cart(session_id)
 
 
 @router.post("/cart/items", response_model=CartView)
@@ -203,8 +233,8 @@ async def add_cart_item(
     idempotency_key: IdempotencyHeader,
     session_id: SessionHeader = "demo-session",
 ) -> CartView:
-    result = cart_service.add_item(session_id, request, idempotency_key)
-    _capture(
+    result = await cart_service.add_item(session_id, request, idempotency_key)
+    await _capture(
         session_id,
         EventRequest(event_type="cart_item_added", experience_id=request.experience_id),
     )
@@ -217,15 +247,15 @@ async def remove_cart_item(
     idempotency_key: IdempotencyHeader,
     session_id: SessionHeader = "demo-session",
 ) -> CartView:
-    return cart_service.remove_item(session_id, item_id, idempotency_key)
+    return await cart_service.remove_item(session_id, item_id, idempotency_key)
 
 
 @router.post("/checkout/prepare", response_model=CheckoutPrepareResponse)
 async def prepare_checkout(
     session_id: SessionHeader = "demo-session",
 ) -> CheckoutPrepareResponse:
-    cart = cart_service.validate(session_id)
-    _capture(session_id, EventRequest(event_type="checkout_started"))
+    cart = await cart_service.validate(session_id)
+    await _capture(session_id, EventRequest(event_type="checkout_started"))
     return CheckoutPrepareResponse(
         cart=cart,
         ready=True,
@@ -239,23 +269,23 @@ async def confirm_checkout(
     idempotency_key: IdempotencyHeader,
     session_id: SessionHeader = "demo-session",
 ) -> BookingView:
-    booking = booking_service.confirm(
+    booking = await booking_service.confirm(
         session_id,
         idempotency_key=idempotency_key,
         customer_details=request.customer_details,
     )
-    _capture(session_id, EventRequest(event_type="booking_completed"))
+    await _capture(session_id, EventRequest(event_type="booking_completed"))
     return booking
 
 
 @router.get("/bookings/{booking_id}", response_model=BookingView)
 async def get_booking(booking_id: UUID) -> BookingView:
-    return booking_service.get(booking_id)
+    return await booking_service.get(booking_id)
 
 
 @router.get("/bookings/{booking_id}/voucher", response_model=VoucherView)
 async def get_voucher(booking_id: UUID) -> VoucherView:
-    return booking_service.voucher(booking_id)
+    return await booking_service.voucher(booking_id)
 
 
 @router.post("/admin/imports", status_code=202)
@@ -290,15 +320,16 @@ async def import_catalog(
 
 @router.get("/health")
 async def api_health() -> dict[str, Any]:
+    products = await catalog_products()
     return {
         "status": "ok",
-        "mode": "demo-memory",
-        "catalog_size": len(store.products),
+        "mode": "postgresql" if database_mode() else "demo-memory",
+        "catalog_size": len(products),
         "database_ready": await database_ready(),
     }
 
 
-def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
+async def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
     allowed = {
         "search_submitted",
         "search_results_viewed",
@@ -323,20 +354,39 @@ def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
         for key, value in request.properties.items()
         if key.casefold() not in {"message", "text", "email", "phone", "name"}
     }
-    event = {
-        "id": len(store.events) + 1,
-        "session_id": store.session(session_id)["id"],
-        "event_type": request.event_type,
-        "experience_id": request.experience_id,
-        "placement": request.placement,
-        "query_id": request.query_id,
-        "properties": safe_properties,
-        "occurred_at": request.occurred_at or datetime.now(UTC),
-    }
-    store.events.append(event)
-    if request.experience_id:
-        store.event_experiences[session_id].append((request.event_type, request.experience_id))
-    return {"accepted": True, "event_id": event["id"]}
+    if not database_mode():
+        event = {
+            "id": len(store.events) + 1,
+            "session_id": store.session(session_id)["id"],
+            "event_type": request.event_type,
+            "experience_id": request.experience_id,
+            "placement": request.placement,
+            "query_id": request.query_id,
+            "properties": safe_properties,
+            "occurred_at": request.occurred_at or datetime.now(UTC),
+        }
+        store.events.append(event)
+        if request.experience_id:
+            store.event_experiences[session_id].append(
+                (request.event_type, request.experience_id)
+            )
+        return {"accepted": True, "event_id": event["id"]}
+
+    factory = require_session_factory()
+    async with factory() as db, db.begin():
+        shopping_session = await ensure_session(db, session_id)
+        event = BehaviorEvent(
+            session_id=shopping_session.id,
+            event_type=request.event_type,
+            experience_id=request.experience_id,
+            placement=request.placement,
+            query_id=request.query_id,
+            properties=safe_properties,
+            occurred_at=request.occurred_at or datetime.now(UTC),
+        )
+        db.add(event)
+        await db.flush()
+        return {"accepted": True, "event_id": event.id}
 
 
 def _sse(event: str, payload: Any) -> str:
