@@ -5,9 +5,16 @@ It combines traditional filters, PostgreSQL full-text and vector search,
 explainable recommendations, voice interaction, and an Azure OpenAI shopping
 assistant that can guide a user through a simulated purchase.
 
-See [POC_SPEC.md](POC_SPEC.md) for the product and technical specification.
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for reproducible Azure deployment,
-validation, generated-data, cost, security, and teardown guidance.
+## Documentation
+
+- [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) — **start here.** As-built
+  architecture, the layered retrieval/ranking design, the two ranking engines,
+  assistant orchestration and presence model, cost architecture, known
+  divergences from the POC spec, and the MVP roadmap.
+- [POC_SPEC.md](POC_SPEC.md) — original product and technical specification;
+  still authoritative for the data model, API surface, and domain scope.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — reproducible Azure deployment,
+  validation, generated-data, cost, security, and teardown guidance.
 
 ## Stack
 
