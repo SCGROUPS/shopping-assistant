@@ -2,11 +2,13 @@ import hashlib
 import logging
 import re
 from collections import Counter
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
 from app.api.schemas import (
+    Participant,
     SearchFilters,
     SearchIntent,
     SearchRequest,
@@ -199,15 +201,24 @@ def _expanded_tokens(query: str) -> list[str]:
     return tokens + [synonym for token in tokens for synonym in tokenize(SYNONYMS.get(token, ""))]
 
 
-def _party_total(product: dict[str, Any], request: SearchRequest) -> float:
+def _party_total(product: dict[str, Any], party: Sequence[Participant]) -> float:
     option = product["options"][0]
     prices = {price["participant_type"]: price["amount"] for price in option["prices"]}
-    if not request.party:
+    if not party:
         return float(prices.get("adult", 0))
-    return float(sum(prices.get(person.type, 0) * person.count for person in request.party))
+    return float(sum(prices.get(person.type, 0) * person.count for person in party))
 
 
-def _eligible(product: dict[str, Any], request: SearchRequest, filters: SearchFilters) -> bool:
+def is_eligible(
+    product: dict[str, Any],
+    filters: SearchFilters,
+    party: Sequence[Participant] = (),
+) -> bool:
+    """Hard-constraint gate shared by search and recommendations.
+
+    Hard constraints are gates, never ranking boosts: an item the shopper cannot
+    book must be absent rather than ranked lower.
+    """
     if product["status"] != "PUBLISHED":
         return False
     if filters.destination_id and product["destination_id"] != filters.destination_id:
@@ -255,7 +266,7 @@ def _eligible(product: dict[str, Any], request: SearchRequest, filters: SearchFi
         return False
     if (
         filters.max_total_price is not None
-        and _party_total(product, request) > filters.max_total_price
+        and _party_total(product, party) > filters.max_total_price
     ):
         return False
     if filters.currency:
@@ -267,7 +278,7 @@ def _eligible(product: dict[str, Any], request: SearchRequest, filters: SearchFi
         if any(exclusion.casefold() in searchable for exclusion in filters.exclusions):
             return False
     if filters.visit_start:
-        party_size = sum(person.count for person in request.party) or 1
+        party_size = sum(person.count for person in party) or 1
         visit_end = filters.visit_end or filters.visit_start
         if not any(
             filters.visit_start.date()
@@ -366,7 +377,7 @@ class SearchService:
         eligible = [
             product
             for product in available_products
-            if _eligible(product, request, filters)
+            if is_eligible(product, filters, request.party)
         ]
 
         tokens = _expanded_tokens(intent.search_text or request.query)

@@ -1,13 +1,15 @@
 from collections import Counter
+from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
-from app.api.schemas import RecommendationResponse
+from app.api.schemas import Participant, RecommendationResponse, SearchFilters
 from app.catalog.service import get_product_async, product_card
 from app.common.config import get_settings
 from app.common.persistence import catalog_products, event_history
 from app.common.ranking import bayesian_rating, cosine_similarity, mmr_diversify
 from app.common.store import DemoStore, store
+from app.search.service import is_eligible
 
 COMPLEMENTS = {
     "Museum or cultural venue": {"Food experience", "Cruise", "Guided tour"},
@@ -16,6 +18,50 @@ COMPLEMENTS = {
     "Cruise": {"Food experience", "Guided tour", "Open-dated voucher"},
     "Activity or class": {"Food experience", "Cruise", "Guided tour"},
 }
+
+PREFERENCE_FIELDS = (
+    "category",
+    "rating",
+    "max_duration_minutes",
+    "indoor_outdoor",
+    "language",
+    "instant_confirmation",
+    "free_cancellation",
+    "family_friendly",
+)
+
+
+def _availability_only(gate: SearchFilters) -> SearchFilters:
+    """Drop soft preference constraints, keep everything that affects bookability."""
+    relaxed = gate.model_copy(deep=True)
+    for field in PREFERENCE_FIELDS:
+        setattr(relaxed, field, None)
+    relaxed.exclusions = []
+    return relaxed
+
+
+def _eligible_ids(
+    products: list[dict[str, Any]],
+    gate: SearchFilters,
+    party: Sequence[Participant],
+    current: dict[str, Any] | None,
+) -> set[Any]:
+    """Apply the shared eligibility gate, relaxing preferences before returning nothing.
+
+    Bookability constraints (date, capacity, budget, accessibility, destination) are
+    never relaxed. A recommendation the shopper cannot book is a dead end at the
+    moment of highest intent, which is worse than a shorter rail.
+    """
+    for tier in (gate, _availability_only(gate)):
+        ids = {
+            product["id"]
+            for product in products
+            if not (current and product["id"] == current["id"])
+            and is_eligible(product, tier, party)
+        }
+        if ids:
+            return ids
+    return set()
 
 
 class RecommendationService:
@@ -31,6 +77,8 @@ class RecommendationService:
         experience_id: UUID | None = None,
         destination: str | None = None,
         limit: int = 6,
+        filters: SearchFilters | None = None,
+        party: Sequence[Participant] = (),
     ) -> RecommendationResponse:
         products = await catalog_products(self.data)
         products_by_id = {product["id"]: product for product in products}
@@ -41,6 +89,10 @@ class RecommendationService:
         )
         if current and not destination:
             destination = current["destination"]
+        gate = (filters or SearchFilters()).model_copy(deep=True)
+        if destination:
+            gate.destination = destination
+        eligible_ids = _eligible_ids(products, gate, party, current)
         history = await event_history(session_id, data=self.data)
         weights = {
             "experience_impression": 0.1,
@@ -66,9 +118,7 @@ class RecommendationService:
 
         candidates: list[tuple[dict[str, Any], float, str, str]] = []
         for product in products:
-            if product["status"] != "PUBLISHED" or (current and product["id"] == current["id"]):
-                continue
-            if destination and product["destination"].casefold() != destination.casefold():
+            if product["id"] not in eligible_ids:
                 continue
             context_fit = 1.0 if destination and product["destination"] == destination else 0.65
             item_similarity = (
@@ -114,16 +164,7 @@ class RecommendationService:
             candidates.append((product, score, reason_code, reason))
 
         if not candidates:
-            for product in products:
-                if not current or product["id"] != current["id"]:
-                    candidates.append(
-                        (
-                            product,
-                            product["popularity_score"],
-                            "TRENDING_DESTINATION",
-                            f"Trending in {product['destination']}.",
-                        )
-                    )
+            return RecommendationResponse(items=[])
         candidates.sort(key=lambda item: item[1], reverse=True)
         diversified_ids = mmr_diversify(
             [

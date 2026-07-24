@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -7,6 +8,7 @@ from sqlalchemy import select, update
 
 from app.api.schemas import (
     AssistantAction,
+    AssistantContext,
     AssistantProduct,
     AssistantResponse,
     CartItemRequest,
@@ -37,6 +39,57 @@ from app.recommendations.service import RecommendationService
 from app.search.service import SearchService
 
 logger = logging.getLogger(__name__)
+
+CONFIRM_PHRASES = {"confirm", "confirm booking", "yes, confirm", "confirm checkout"}
+
+ORDINALS = {
+    "first": 0, "1st": 0, "one": 0,
+    "second": 1, "2nd": 1, "two": 1,
+    "third": 2, "3rd": 2, "three": 2,
+    "fourth": 3, "4th": 3, "four": 3,
+    "fifth": 4, "5th": 4, "five": 4,
+    "last": -1,
+}
+
+
+def keyword_tool(lowered: str) -> str | None:
+    """Deterministic fallback used only when the planner is unavailable."""
+    if lowered in CONFIRM_PHRASES:
+        return "confirm_simulated_checkout"
+    if any(term in lowered for term in ("checkout", "pay", "book now")):
+        return "prepare_checkout"
+    if "add" in lowered and "cart" in lowered:
+        return "add_to_cart"
+    if "availability" in lowered or "available" in lowered:
+        return "check_availability"
+    if "compare" in lowered:
+        return "compare_experiences"
+    if any(term in lowered for term in ("similar", "also like", "complete my day")):
+        return "get_recommendations"
+    return None
+
+
+def _resolve_referent(products: list[dict[str, Any]], message: str) -> dict[str, Any]:
+    """Resolve which of the last results the shopper means.
+
+    Falls back to the first result, but honours an explicit title mention or an
+    ordinal reference such as "add the second one to my cart".
+    """
+    if not message:
+        return products[0]
+    lowered = message.casefold()
+    titled = [
+        product for product in products if product["title"].casefold() in lowered
+    ]
+    if titled:
+        return titled[0]
+    for word, index in ORDINALS.items():
+        if re.search(rf"\b{re.escape(word)}\b", lowered):
+            try:
+                return products[index]
+            except IndexError:
+                break
+    return products[0]
 
 
 class AssistantService:
@@ -221,38 +274,42 @@ class AssistantService:
                 "assistant-turn-limit",
             )
         lowered = request.message.casefold().strip()
+        self._merge_context(conversation, request.context)
         planned_tool = None
         try:
             planned_tool = await self.ai.plan_action(request.message, conversation["state"])
         except Exception:
             logger.exception("Assistant action planning failed")
             planned_tool = None
-        response: AssistantResponse
 
-        if (
-            lowered in {"confirm", "confirm booking", "yes, confirm", "confirm checkout"}
-            or planned_tool == "confirm_simulated_checkout"
+        # The planner decides; keyword matching is only a fallback for when planning
+        # is unavailable (demo mode) or returns nothing.
+        tool = planned_tool or keyword_tool(lowered)
+        if tool == "confirm_simulated_checkout" and not self._confirmation_allowed(
+            conversation, lowered
         ):
+            # Re-show the summary if the shopper is mid-checkout, otherwise treat the
+            # planner's guess as noise rather than acting on it.
+            tool = (
+                "prepare_checkout"
+                if conversation["state"].get("pending_action") == "CONFIRM_CHECKOUT"
+                else None
+            )
+
+        response: AssistantResponse
+        if tool == "confirm_simulated_checkout":
             response = await self._confirm_checkout(conversation, session_id)
-        elif (
-            any(term in lowered for term in ("checkout", "pay", "book now"))
-            or planned_tool == "prepare_checkout"
-        ):
+        elif tool == "prepare_checkout":
             response = await self._prepare_checkout(conversation, session_id)
-        elif ("add" in lowered and "cart" in lowered) or planned_tool == "add_to_cart":
-            response = await self._add_first_result(conversation, session_id)
-        elif (
-            "availability" in lowered
-            or "available" in lowered
-            or planned_tool == "check_availability"
-        ):
-            response = await self._availability(conversation)
-        elif "compare" in lowered or planned_tool == "compare_experiences":
+        elif tool == "add_to_cart":
+            response = await self._add_selected_result(
+                conversation, session_id, request.message
+            )
+        elif tool == "check_availability":
+            response = await self._availability(conversation, request.message)
+        elif tool == "compare_experiences":
             response = await self._compare(conversation)
-        elif (
-            any(term in lowered for term in ("similar", "also like", "complete my day"))
-            or planned_tool == "get_recommendations"
-        ):
+        elif tool == "get_recommendations":
             response = await self._recommend(conversation, session_id)
         else:
             response = await self._search(conversation, request.message)
@@ -263,6 +320,60 @@ class AssistantService:
             response=response,
         )
         return response
+
+    @staticmethod
+    def _confirmation_allowed(conversation: dict[str, Any], lowered: str) -> bool:
+        """A simulated booking requires an explicit user confirmation and is never
+        triggered by a model decision alone.
+
+        `_confirm_checkout` separately enforces that a booking summary is pending.
+        """
+        return lowered in CONFIRM_PHRASES
+
+    @staticmethod
+    def _merge_context(
+        conversation: dict[str, Any], context: AssistantContext | None
+    ) -> None:
+        """Fold live storefront state into the conversation.
+
+        The storefront and the assistant are two renderings of one session, so
+        filters the shopper set in the grid must apply here without being retyped.
+        """
+        if context is None:
+            return
+        state = conversation["state"]
+        if context.filters is not None:
+            merged = {
+                **state.get("filters", {}),
+                **{
+                    key: value
+                    for key, value in context.filters.model_dump(mode="json").items()
+                    if value not in (None, [], "")
+                },
+            }
+            state["filters"] = merged
+        if context.party:
+            state["party"] = [person.model_dump(mode="json") for person in context.party]
+        if context.result_ids:
+            state["last_result_ids"] = [str(item) for item in context.result_ids]
+        if context.query:
+            state["last_query"] = context.query
+        if context.result_count is not None:
+            state["last_result_count"] = context.result_count
+        if context.recently_viewed:
+            state["recently_viewed"] = [str(item) for item in context.recently_viewed]
+        if context.cart_experience_ids:
+            state["cart_experience_ids"] = [
+                str(item) for item in context.cart_experience_ids
+            ]
+        if context.focused_experience_id:
+            focused = str(context.focused_experience_id)
+            state["focused_experience_id"] = focused
+            # A shopper who opened the assistant from a card means that card.
+            state["last_result_ids"] = [
+                focused,
+                *[item for item in state.get("last_result_ids", []) if item != focused],
+            ]
 
     async def _search(self, conversation: dict[str, Any], message: str) -> AssistantResponse:
         filters = SearchFilters.model_validate(conversation["state"].get("filters", {}))
@@ -341,9 +452,9 @@ class AssistantService:
         )
 
     async def _availability(
-        self, conversation: dict[str, Any]
+        self, conversation: dict[str, Any], message: str = ""
     ) -> AssistantResponse:
-        product = await self._selected_product(conversation)
+        product = await self._selected_product(conversation, message)
         detail = product_detail(product)
         slots = detail.options[0].slots[:3]
         if not slots:
@@ -431,7 +542,20 @@ class AssistantService:
             placement="complete_your_day",
             experience_id=current["id"],
             limit=4,
+            filters=SearchFilters.model_validate(conversation["state"].get("filters", {})),
+            party=[
+                Participant.model_validate(item)
+                for item in conversation["state"].get("party", [])
+            ],
         )
+        if not result.items:
+            return AssistantResponse(
+                message=(
+                    "I could not find a complementary experience that is still bookable "
+                    "for your dates and party. Would you like me to try another day?"
+                ),
+                clarification="Shall I look at nearby dates?",
+            )
         products = [
             self._commerce_product(
                 await get_product_async(item.id, self.data),
@@ -452,10 +576,10 @@ class AssistantService:
             ],
         )
 
-    async def _add_first_result(
-        self, conversation: dict[str, Any], session_id: str
+    async def _add_selected_result(
+        self, conversation: dict[str, Any], session_id: str, message: str = ""
     ) -> AssistantResponse:
-        product = await self._selected_product(conversation)
+        product = await self._selected_product(conversation, message)
         option = product["options"][0]
         participants = [
             Participant.model_validate(item)
@@ -544,7 +668,7 @@ class AssistantService:
         )
 
     async def _selected_product(
-        self, conversation: dict[str, Any]
+        self, conversation: dict[str, Any], message: str = ""
     ) -> dict[str, Any]:
         ids = conversation["state"].get("last_result_ids", [])
         if not ids:
@@ -554,7 +678,8 @@ class AssistantService:
                 "Search for an experience before this action.",
                 "no-selection",
             )
-        return await get_product_async(UUID(ids[0]), self.data)
+        products = [await get_product_async(UUID(item), self.data) for item in ids]
+        return _resolve_referent(products, message)
 
     def _commerce_product(
         self,

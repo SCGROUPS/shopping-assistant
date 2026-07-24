@@ -59,6 +59,17 @@ export type SearchFilters = {
   exclusions?: string[]
 }
 
+export type AssistantContext = {
+  query?: string
+  filters?: SearchFilters
+  party?: Array<{ type: string; count: number }>
+  result_ids?: string[]
+  result_count?: number
+  recently_viewed?: string[]
+  focused_experience_id?: string
+  cart_experience_ids?: string[]
+}
+
 export type AssistantAction = {
   type:
     | 'VIEW'
@@ -82,6 +93,7 @@ export type AssistantMessage = {
   text: string
   products?: Experience[]
   actions?: AssistantAction[]
+  filters?: SearchFilters
   timestamp: Date
 }
 

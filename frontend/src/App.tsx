@@ -22,7 +22,7 @@ import {
   WandSparkles,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import './App.css'
 import { AssistantPanel } from './components/AssistantPanel'
@@ -34,6 +34,7 @@ import { categories, demoExperiences } from './data/demo'
 import { api } from './lib/api'
 import type {
   AssistantAction,
+  AssistantContext,
   AssistantMessage,
   CartItem,
   Experience,
@@ -115,6 +116,13 @@ function App() {
     filters: SearchFilters
     resultIds: string[]
   }>({ query: '', filters: {}, resultIds: [] })
+  const viewedIds = useRef<string[]>([])
+
+  const liveFilters = (): SearchFilters => ({
+    destination: destination === 'Central Vietnam' ? undefined : destination,
+    visit_start: date ? `${date}T00:00:00Z` : undefined,
+    category: category === 'All' ? undefined : category,
+  })
 
   useEffect(() => {
     void (async () => {
@@ -141,6 +149,20 @@ function App() {
     })()
   }, [])
 
+  useEffect(() => {
+    if (!hasSearched) return
+    void (async () => {
+      try {
+        setRecommendations(
+          await api.recommendations(undefined, liveFilters(), travellers),
+        )
+      } catch {
+        // A stale rail is worse than a short one; leave the previous state.
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasSearched, destination, date, travellers])
+
   const visibleProducts = useMemo(() => {
     if (category === 'All') return products
     return products.filter((product) => product.category === category)
@@ -148,19 +170,20 @@ function App() {
 
   const cartTotal = cartItems.reduce((sum, item) => sum + item.total, 0)
 
+  const viewProduct = (product: Experience | null) => {
+    if (product && !viewedIds.current.includes(product.id)) {
+      viewedIds.current = [...viewedIds.current, product.id].slice(-20)
+    }
+    setSelectedProduct(product)
+  }
+
   const runSearch = async (
     searchQuery = query,
     extraFilters: SearchFilters = {},
   ) => {
     setSearching(true)
     setHasSearched(true)
-    const filters: SearchFilters = {
-      destination:
-        destination === 'Central Vietnam' ? undefined : destination,
-      visit_start: date ? `${date}T00:00:00Z` : undefined,
-      category: category === 'All' ? undefined : category,
-      ...extraFilters,
-    }
+    const filters: SearchFilters = { ...liveFilters(), ...extraFilters }
     try {
       const result = await api.search(searchQuery, filters, travellers)
       setProducts(result.items)
@@ -271,7 +294,32 @@ function App() {
     }
   }
 
-  const sendAssistantMessage = async (text: string) => {
+  const assistantContext = (focused?: Experience): AssistantContext => ({
+    query: searchContext.query || query,
+    filters: { ...liveFilters(), ...searchContext.filters },
+    party: [{ type: 'adult', count: travellers }],
+    result_ids: visibleProducts.slice(0, 12).map((item) => item.id),
+    result_count: products.length,
+    recently_viewed: viewedIds.current.slice(-8),
+    focused_experience_id: focused?.id,
+    cart_experience_ids: cartItems.map((item) => item.experience.id),
+  })
+
+  const applyAssistantFilters = (filters?: SearchFilters) => {
+    if (!filters) return
+    if (filters.destination && filters.destination !== destination) {
+      setDestination(filters.destination)
+    }
+    if (filters.visit_start) {
+      const nextDate = filters.visit_start.slice(0, 10)
+      if (nextDate !== date) setDate(nextDate)
+    }
+    if (filters.category && filters.category !== category) {
+      setCategory(filters.category)
+    }
+  }
+
+  const sendAssistantMessage = async (text: string, focused?: Experience) => {
     const userMessage: AssistantMessage = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -290,8 +338,14 @@ function App() {
           partySize: travellers,
         }))
       if (!conversationId) setConversationId(id)
-      const response = await api.sendMessage(id, text, visibleProducts)
+      const response = await api.sendMessage(
+        id,
+        text,
+        visibleProducts,
+        assistantContext(focused),
+      )
       setMessages((current) => [...current, response])
+      applyAssistantFilters(response.filters)
       const cart = await api.getCart([
         ...(response.products ?? []),
         ...visibleProducts,
@@ -664,7 +718,7 @@ function App() {
                 <ProductCard
                   key={product.id}
                   product={product}
-                  onView={setSelectedProduct}
+                  onView={viewProduct}
                   onAdd={(item) => void addToCart(item)}
                 />
               ))}
@@ -716,6 +770,12 @@ function App() {
             </button>
           </div>
           <div className="recommendation-cards">
+            {recommendations.length === 0 && (
+              <p className="recommendation-empty">
+                Nothing in this destination is still bookable for your dates and
+                party size. Try another day and I will rebuild the plan.
+              </p>
+            )}
             {recommendations.slice(0, 3).map((product, index) => (
               <div
                 className={`recommendation-card card-${index + 1}`}
@@ -739,7 +799,7 @@ function App() {
                     {money(product.currency, product.price)}
                   </span>
                 </div>
-                <button onClick={() => setSelectedProduct(product)}>
+                <button onClick={() => viewProduct(product)}>
                   <ArrowRight size={17} />
                 </button>
               </div>
@@ -839,7 +899,7 @@ function App() {
         onAction={(action, actionProducts) =>
           void handleAssistantAction(action, actionProducts)
         }
-        onView={setSelectedProduct}
+        onView={viewProduct}
       />
 
       <CartDrawer

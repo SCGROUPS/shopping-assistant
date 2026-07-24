@@ -1,6 +1,7 @@
 import { demoExperiences } from '../data/demo'
 import type {
   AssistantAction,
+  AssistantContext,
   AssistantMessage,
   CartItem,
   Experience,
@@ -337,9 +338,20 @@ export const api = {
 
   async recommendations(
     context?: Partial<Experience>,
+    filters: SearchFilters = {},
+    travellers = 0,
   ): Promise<Experience[]> {
     try {
-      const query = context?.id ? `?experience_id=${context.id}` : ''
+      const params = new URLSearchParams()
+      if (context?.id) params.set('experience_id', context.id)
+      if (filters.destination) params.set('destination', filters.destination)
+      if (filters.visit_start) params.set('visit_start', filters.visit_start)
+      if (filters.visit_end) params.set('visit_end', filters.visit_end)
+      if (filters.max_total_price !== undefined) {
+        params.set('max_total_price', String(filters.max_total_price))
+      }
+      if (travellers) params.set('travellers', String(travellers))
+      const query = params.toString() ? `?${params}` : ''
       return normalizeProducts(await request(`/recommendations${query}`))
     } catch (error) {
       allowDemoFallbackOrThrow(error)
@@ -386,6 +398,7 @@ export const api = {
     conversationId: string,
     text: string,
     visibleProducts: Experience[],
+    context: AssistantContext = {},
   ): Promise<AssistantMessage> {
     try {
       const httpResponse = await fetch(
@@ -393,7 +406,7 @@ export const api = {
         {
           method: 'POST',
           headers: { ...jsonHeaders, Accept: 'text/event-stream' },
-          body: JSON.stringify({ message: text }),
+          body: JSON.stringify({ message: text, context }),
         },
       )
       if (!httpResponse.ok) {
@@ -443,6 +456,7 @@ export const api = {
             normalizeAssistantAction,
           )
         : []
+      const statePatch = (response.state_patch ?? {}) as Record<string, unknown>
       return {
         id: crypto.randomUUID(),
         role: 'assistant',
@@ -452,6 +466,7 @@ export const api = {
           'I found a few experiences that fit.',
         products,
         actions,
+        filters: statePatch.filters as SearchFilters | undefined,
         timestamp: new Date(),
       }
     } catch (error) {

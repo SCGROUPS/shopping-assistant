@@ -25,7 +25,9 @@ from app.api.schemas import (
     ExperienceDetail,
     ExperienceListResponse,
     MessageRequest,
+    Participant,
     RecommendationResponse,
+    SearchFilters,
     SearchRequest,
     SearchResponse,
     VoucherView,
@@ -128,13 +130,27 @@ async def recommendations(
     experience_id: UUID | None = None,
     destination: str | None = None,
     limit: int = Query(default=6, ge=1, le=20),
+    visit_start: datetime | None = None,
+    visit_end: datetime | None = None,
+    travellers: int = Query(default=0, ge=0, le=20),
+    max_total_price: float | None = Query(default=None, ge=0),
+    currency: str | None = None,
 ) -> RecommendationResponse:
+    filters = SearchFilters(
+        visit_start=visit_start,
+        visit_end=visit_end,
+        max_total_price=max_total_price,
+        currency=currency,
+    )
+    party = [Participant(type="adult", count=travellers)] if travellers else []
     return await recommendation_service.recommend(
         session_id=session_id,
         placement=placement,
         experience_id=experience_id,
         destination=destination,
         limit=limit,
+        filters=filters,
+        party=party,
     )
 
 

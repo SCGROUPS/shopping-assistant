@@ -218,8 +218,22 @@ class ConversationCreate(BaseModel):
     party: list[Participant] = Field(default_factory=list)
 
 
+class AssistantContext(BaseModel):
+    """Storefront state handed to the assistant so a shopper never repeats work."""
+
+    query: str | None = None
+    filters: SearchFilters | None = None
+    party: list[Participant] = Field(default_factory=list)
+    result_ids: list[UUID] = Field(default_factory=list)
+    result_count: int | None = None
+    recently_viewed: list[UUID] = Field(default_factory=list)
+    focused_experience_id: UUID | None = None
+    cart_experience_ids: list[UUID] = Field(default_factory=list)
+
+
 class MessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    context: AssistantContext | None = None
 
 
 class AssistantAction(BaseModel):
