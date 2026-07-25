@@ -576,6 +576,12 @@ each deploy. Capacity already consumed by confirmed bookings is subtracted, so
 a refresh can never resurrect inventory that was sold, and remaining capacity is
 floored at zero. Behavioural history is untouched.
 
+Note when reading the API that `product_detail` caps each option at 24 slots,
+so the *visible* window is narrower than the data — an experience running two
+departures a day shows about twelve days even though roughly thirty are
+stored. A short window in the response is a display cap, not expired
+inventory.
+
 ### 10.2 Display currency
 
 `common/currency.py`. Conversion is **presentation-only and server-side**.
