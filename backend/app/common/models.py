@@ -81,6 +81,18 @@ class Experience(Base, TimestampMixin):
     popularity_score: Mapped[Decimal] = mapped_column(Numeric(8, 5), default=0)
     status: Mapped[str] = mapped_column(String(30), default="DRAFT")
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set when automated classification was not confident. The product is held
+    # in PENDING_REVIEW rather than sold on a guess.
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    review_note: Mapped[str] = mapped_column(Text, default="")
+    # Merchandising. Bounded deliberately: a campaign should be able to move a
+    # product up the page, not replace relevance with whatever pays most.
+    boost: Mapped[Decimal] = mapped_column(Numeric(4, 2), default=1)
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    suppressed: Mapped[bool] = mapped_column(Boolean, default=False)
+    promotion_label: Mapped[str] = mapped_column(String(60), default="")
+    promotion_starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    promotion_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     options: Mapped[list["ExperienceOption"]] = relationship(cascade="all, delete-orphan")
     media: Mapped[list["ExperienceMedia"]] = relationship(cascade="all, delete-orphan")
 
@@ -301,3 +313,75 @@ class ImportJob(Base, TimestampMixin):
     source_name: Mapped[str] = mapped_column(String(250))
     imported_count: Mapped[int] = mapped_column(Integer, default=0)
     errors: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+
+
+class Operator(Base, TimestampMixin):
+    """A member of staff who can change the business.
+
+    Authorisation used to be a request header any caller could set. Operators
+    are real rows with a hashed credential, so an action can be attributed to a
+    person - which is what makes the audit log worth keeping.
+    """
+
+    __tablename__ = "operators"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String(200), unique=True)
+    name: Mapped[str] = mapped_column(String(120))
+    role: Mapped[str] = mapped_column(String(30))
+    key_prefix: Mapped[str] = mapped_column(String(12), unique=True, index=True)
+    key_hash: Mapped[str] = mapped_column(String(200))
+    key_salt: Mapped[str] = mapped_column(String(64))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AuditLog(Base):
+    """Append-only record of every operator mutation.
+
+    Written in the same transaction as the change it describes, so the log
+    cannot claim something the database does not show.
+    """
+
+    __tablename__ = "audit_log"
+    __table_args__ = (Index("ix_audit_entity_time", "entity_type", "entity_id", "occurred_at"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    operator_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("operators.id"))
+    operator_email: Mapped[str] = mapped_column(String(200))
+    action: Mapped[str] = mapped_column(String(60))
+    entity_type: Mapped[str] = mapped_column(String(40))
+    entity_id: Mapped[str] = mapped_column(String(120))
+    summary: Mapped[str] = mapped_column(Text, default="")
+    changes: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+
+
+class BusinessSetting(Base, TimestampMixin):
+    """A tunable the business owns, held as data rather than deployed code.
+
+    Ranking weights, commercial take rates and assistant policy live here so
+    retuning is a change an operator makes and observes, not a release.
+    """
+
+    __tablename__ = "business_settings"
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    value: Mapped[Any] = mapped_column(JSONB)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    updated_by: Mapped[str] = mapped_column(String(200), default="")
+
+
+class ExperienceOverride(Base, TimestampMixin):
+    """Fields a human has corrected, and must not have overwritten.
+
+    The importer rewrites every field on every run. Without this table an
+    operator's correction survives until the next deploy and no longer, which
+    would make the catalog editor a place where work goes to die.
+    """
+
+    __tablename__ = "experience_overrides"
+    experience_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("experiences.id", ondelete="CASCADE"), primary_key=True
+    )
+    fields: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    updated_by: Mapped[str] = mapped_column(String(200), default="")

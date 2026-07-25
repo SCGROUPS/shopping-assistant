@@ -15,6 +15,13 @@ param intentDeployment string
 param embeddingDeployment string
 param imageDeployment string
 
+// Without this the operator console has no first credential and nobody can
+// create one, because creating operators itself requires an operator. Left
+// empty the storefront runs exactly as before and the console is unreachable,
+// which is the safe default for an unattended deploy.
+@secure()
+param adminBootstrapKey string = ''
+
 var normalizedPrefix = toLower(replace(prefix, '-', ''))
 var postgresAdmin = 'vietraadmin'
 var databaseName = 'vietra'
@@ -175,6 +182,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'azure-openai-api-key'
           value: aiApiKey
         }
+        {
+          name: 'admin-bootstrap-key'
+          value: adminBootstrapKey
+        }
       ]
     }
     template: {
@@ -198,6 +209,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'DATABASE_URL'
               secretRef: 'database-url'
+            }
+            {
+              name: 'ADMIN_BOOTSTRAP_KEY'
+              secretRef: 'admin-bootstrap-key'
             }
             {
               name: 'AZURE_OPENAI_ENDPOINT'
@@ -318,6 +333,10 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
         {
           name: 'azure-openai-api-key'
           value: aiApiKey
+        }
+        {
+          name: 'admin-bootstrap-key'
+          value: adminBootstrapKey
         }
       ]
     }

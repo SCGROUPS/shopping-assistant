@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 from httpx import AsyncClient
 
+from app.admin.auth import DEMO_BOOTSTRAP_KEY
 from app.common.analytics import assistant_holdout, funnel_report
 from app.common.config import get_settings
 from app.common.embedding_cache import cache_key, normalize
@@ -140,8 +141,15 @@ async def test_session_context_exposes_the_cohort(client: AsyncClient):
     assert body["assistant_holdout"] is False
 
 
+async def test_the_funnel_is_not_readable_without_a_credential(client: AsyncClient):
+    """Conversion, revenue and model spend were served to anyone who asked."""
+    assert (await client.get("/api/v1/analytics/funnel")).status_code == 401
+
+
 async def test_funnel_endpoint_reports_spend_against_the_budget(client: AsyncClient):
-    response = await client.get("/api/v1/analytics/funnel")
+    response = await client.get(
+        "/api/v1/analytics/funnel", headers={"X-API-Key": DEMO_BOOTSTRAP_KEY}
+    )
     assert response.status_code == 200
     cost = response.json()["cost"]
     assert cost["budget_usd"] == get_settings().openai_daily_budget

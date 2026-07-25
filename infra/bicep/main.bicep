@@ -27,6 +27,10 @@ param buildRevision string = 'bootstrap'
 @description('Initial PostgreSQL administrator password.')
 param postgresAdminPassword string
 
+@secure()
+@description('First operator credential for the console. Empty leaves the console unreachable, which is the safe default for an unattended deploy.')
+param adminBootstrapKey string = ''
+
 param chatDeployment string = 'gpt-5.4-mini'
 param intentDeployment string = 'gpt-5-nano'
 param embeddingDeployment string = 'text-embedding-3-small'
@@ -67,6 +71,7 @@ module resources 'resources.bicep' = {
     imageDeployment: imageDeployment
     aiEndpoint: aiAccount.outputs.endpoint
     aiApiKey: aiAccount.outputs.apiKey
+    adminBootstrapKey: adminBootstrapKey
   }
 }
 

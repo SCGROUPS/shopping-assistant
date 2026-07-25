@@ -183,9 +183,49 @@ def quality(product: dict[str, Any]) -> float:
     return bayesian_rating(product["rating"], product["review_count"]) / 5
 
 
-def margin_fit(product: dict[str, Any]) -> float:
-    rate = CATEGORY_TAKE_RATE.get(product["category"], DEFAULT_TAKE_RATE)
-    return rate / MAX_TAKE_RATE
+def margin_fit(product: dict[str, Any], take_rates: dict[str, float] | None = None) -> float:
+    """Commercial value, normalised against the best rate on offer.
+
+    Take rates are configuration (`runtime_config.category_take_rates`), so a
+    commercial change is a value an operator edits rather than a release. The
+    module-level dict remains the default and the fallback.
+    """
+    rates = take_rates or CATEGORY_TAKE_RATE
+    ceiling = max([*rates.values(), DEFAULT_TAKE_RATE]) or MAX_TAKE_RATE
+    rate = rates.get(product["category"], DEFAULT_TAKE_RATE)
+    return rate / ceiling
+
+
+def promotion_active(product: dict[str, Any], now: datetime | None = None) -> bool:
+    """Is this product's merchandising window open?
+
+    A campaign that outlives its dates is how a storefront ends up promoting
+    Tet offers in June, so the window is checked at read time rather than
+    trusted to a job that clears it.
+    """
+    moment = now or datetime.now(UTC)
+    starts, ends = product.get("promotion_starts_at"), product.get("promotion_ends_at")
+    if starts and moment < starts:
+        return False
+    return not (ends and moment > ends)
+
+
+def merchandising_multiplier(
+    product: dict[str, Any], ceiling: float = 1.5, now: datetime | None = None
+) -> float:
+    """The operator's thumb on the scale, bounded.
+
+    Merchandising has to be able to move a product up the page without being
+    able to replace relevance with whatever pays most, so the multiplier is
+    clamped to a configured ceiling and only applies inside its window.
+    """
+    if not promotion_active(product, now):
+        return 1.0
+    try:
+        boost = float(product.get("boost") or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(max(boost, 1.0 / ceiling), ceiling)
 
 
 def context_fit(

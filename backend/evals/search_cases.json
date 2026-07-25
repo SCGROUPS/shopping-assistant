@@ -1,0 +1,202 @@
+{
+  "suite": "search",
+  "description": "Storefront search. Runs with no model configured, so it is safe in CI. Every case is a shopper request plus the properties any acceptable answer must have.",
+  "cases": [
+    {
+      "id": "sunset-cruise-ha-long",
+      "query": "sunset cruise in Ha Long",
+      "why": "The plainest possible request. If ranking cannot do this, nothing else matters.",
+      "expect": {
+        "min_results": 5,
+        "expect_terms_in_top": {
+          "terms": [
+            "cruise"
+          ],
+          "k": 3
+        }
+      }
+    },
+    {
+      "id": "hanoi-street-food",
+      "query": "street food tour in Hanoi Old Quarter",
+      "page_size": 5,
+      "why": "The reported failure: a food question answered with boat trips and cycling. Scoped to the first screen, because a ranked list of twenty is allowed a weak tail \u2014 the top of the page is the claim.",
+      "expect": {
+        "min_results": 3,
+        "expect_terms_in_top": {
+          "terms": [
+            "food"
+          ],
+          "k": 3
+        },
+        "require_any_term": [
+          "food",
+          "market",
+          "coffee",
+          "bites",
+          "cooking"
+        ]
+      }
+    },
+    {
+      "id": "ocean-not-mountain",
+      "query": "somewhere by the sea, not the mountains",
+      "filters": {
+        "exclusions": [
+          "mountain"
+        ]
+      },
+      "why": "A stated exclusion is a hard constraint. Explaining which mountain trip is least mountainous is not an answer.",
+      "expect": {
+        "min_results": 3,
+        "forbid_terms": [
+          "mountain"
+        ]
+      }
+    },
+    {
+      "id": "budget-ceiling-holds",
+      "query": "cheap day trip",
+      "filters": {
+        "max_total_price": 500000
+      },
+      "why": "A budget is a promise. One over-priced card destroys trust in every other number on the page.",
+      "expect": {
+        "min_results": 1,
+        "max_price": 500000
+      }
+    },
+    {
+      "id": "quality-floor-holds",
+      "query": "highly rated experiences in Hoi An",
+      "filters": {
+        "rating": 4.5
+      },
+      "why": "Filters are the one part of the UI a shopper can verify at a glance.",
+      "expect": {
+        "min_results": 3,
+        "min_rating": 4.5
+      }
+    },
+    {
+      "id": "short-activity",
+      "query": "something quick before dinner",
+      "filters": {
+        "max_duration_minutes": 180
+      },
+      "why": "Duration is the constraint most often silently dropped when relevance is strong.",
+      "expect": {
+        "min_results": 3,
+        "max_duration_minutes": 180
+      }
+    },
+    {
+      "id": "category-filter-holds",
+      "query": "wellness",
+      "filters": {
+        "category": "Wellness"
+      },
+      "why": "An explicit category is not a hint.",
+      "expect": {
+        "min_results": 3,
+        "require_category": "Wellness"
+      }
+    },
+    {
+      "id": "price-sort-is-honoured",
+      "query": "day trip",
+      "sort": "price",
+      "why": "A sort control that ranking quietly overrides is a lie in the UI.",
+      "expect": {
+        "min_results": 5,
+        "ascending": "price"
+      }
+    },
+    {
+      "id": "rating-sort-is-honoured",
+      "query": "day trip",
+      "sort": "rating",
+      "why": "Same argument as price, and the case merchandising pins could plausibly break.",
+      "expect": {
+        "min_results": 5,
+        "descending": "rating"
+      }
+    },
+    {
+      "id": "family-with-toddler",
+      "query": "gentle activity for a family with a toddler",
+      "filters": {
+        "family_friendly": true
+      },
+      "party": [
+        {
+          "type": "adult",
+          "count": 2
+        },
+        {
+          "type": "child",
+          "count": 1
+        }
+      ],
+      "why": "Party composition has to reach ranking, not just the price calculation.",
+      "expect": {
+        "min_results": 3
+      }
+    },
+    {
+      "id": "destination-is-respected",
+      "query": "things to do in Sapa",
+      "filters": {
+        "destination": "Sapa"
+      },
+      "why": "Selling a Phu Quoc boat trip to someone in the mountains is the most expensive kind of irrelevance.",
+      "expect": {
+        "min_results": 3,
+        "require_any_term": [
+          "sapa"
+        ]
+      }
+    },
+    {
+      "id": "nonsense-does-not-crash",
+      "query": "qwertyuiop asdfghjkl",
+      "why": "Garbage input must degrade to browsing, not error and not an empty page.",
+      "expect": {
+        "min_results": 1
+      }
+    },
+    {
+      "id": "empty-query-browses",
+      "query": "",
+      "why": "The first page load carries no query at all.",
+      "expect": {
+        "min_results": 10
+      }
+    },
+    {
+      "id": "instant-confirmation-only",
+      "query": "book for tomorrow",
+      "filters": {
+        "instant_confirmation": true
+      },
+      "why": "Late bookers filter on this and cannot recover from a wrong answer.",
+      "expect": {
+        "min_results": 3
+      }
+    },
+    {
+      "id": "cooking-class",
+      "query": "cooking class",
+      "why": "Specific vocabulary that exists in the catalogue should rank exactly.",
+      "expect": {
+        "min_results": 1,
+        "expect_terms_in_top": {
+          "terms": [
+            "cooking"
+          ],
+          "k": 3
+        }
+      }
+    }
+  ]
+}

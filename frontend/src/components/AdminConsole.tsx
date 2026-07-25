@@ -1,0 +1,891 @@
+// The operator console.
+//
+// Deliberately plain. This is a staff tool used all day by people who need to
+// see state and change it, so it favours density and directness over the
+// storefront's warmth. Every control here is gated by a capability the server
+// enforces independently; hiding a button the server would reject is a
+// courtesy, not the security boundary.
+
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  AdminError,
+  changeMerchandising,
+  changeStatus,
+  fetchAudit,
+  fetchCatalog,
+  fetchExperience,
+  fetchFunnel,
+  fetchOverview,
+  fetchSettings,
+  getApiKey,
+  patchExperience,
+  resetSetting,
+  saveSetting,
+  setApiKey,
+  whoami,
+} from '../lib/adminApi'
+import type {
+  AuditEntry,
+  CatalogFilters,
+  CatalogPage,
+  CatalogRow,
+  Capability,
+  FunnelView,
+  Principal,
+  ReviewSummary,
+  SettingView,
+} from '../lib/adminApi'
+
+type Tab = 'review' | 'catalog' | 'settings' | 'audit' | 'insight'
+
+const TABS: Array<{ id: Tab; label: string; needs?: Capability }> = [
+  { id: 'review', label: 'Review queue' },
+  { id: 'catalog', label: 'Catalogue' },
+  { id: 'settings', label: 'Configuration', needs: 'configure' },
+  { id: 'audit', label: 'Audit' },
+  { id: 'insight', label: 'Performance' },
+]
+
+const STATUSES = ['DRAFT', 'PENDING_REVIEW', 'PUBLISHED', 'ARCHIVED']
+
+const EDITABLE_TEXT: Array<{ field: string; label: string; long?: boolean }> = [
+  { field: 'title', label: 'Title' },
+  { field: 'short_description', label: 'Short description', long: true },
+  { field: 'description', label: 'Description', long: true },
+  { field: 'category', label: 'Category' },
+  { field: 'meeting_point', label: 'Meeting point' },
+]
+
+const vnd = (value: number | null | undefined) =>
+  value == null ? '—' : `₫${Math.round(value).toLocaleString('en-US')}`
+
+const when = (value: string | null | undefined) =>
+  value ? new Date(value).toLocaleString() : '—'
+
+function SignIn({ onSignedIn }: { onSignedIn: (who: Principal) => void }) {
+  const [key, setKey] = useState(getApiKey())
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setBusy(true)
+    setError(null)
+    setApiKey(key)
+    try {
+      onSignedIn(await whoami())
+    } catch (problem) {
+      // 401 and "backend is down" are different problems with different
+      // fixes, so they get different sentences.
+      const status = problem instanceof AdminError ? problem.status : 0
+      setError(
+        status === 401
+          ? 'That key is not recognised.'
+          : `Could not reach the console API (${status || 'network error'}).`,
+      )
+      setApiKey('')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="ops-signin">
+      <form onSubmit={submit}>
+        <h1>Vietra operations</h1>
+        <p>Sign in with your operator key.</p>
+        <input
+          type="password"
+          value={key}
+          onChange={(event) => setKey(event.target.value)}
+          placeholder="vk_…"
+          aria-label="Operator key"
+          autoFocus
+        />
+        <button type="submit" disabled={busy || !key.trim()}>
+          {busy ? 'Checking…' : 'Sign in'}
+        </button>
+        {error ? <p className="ops-error">{error}</p> : null}
+      </form>
+    </div>
+  )
+}
+
+function Row({
+  row,
+  can,
+  onSelect,
+  selected,
+}: {
+  row: CatalogRow
+  can: (capability: Capability) => boolean
+  onSelect: () => void
+  selected: boolean
+}) {
+  return (
+    <tr
+      className={`${selected ? 'is-selected' : ''} ${row.needs_review ? 'needs-review' : ''}`}
+      onClick={onSelect}
+    >
+      <td>
+        <strong>{row.title}</strong>
+        <span className="ops-sub">
+          {row.destination} · {row.category}
+          {row.supplier ? ` · ${row.supplier}` : ''}
+        </span>
+      </td>
+      <td>
+        <span className={`ops-status ops-status-${row.status.toLowerCase()}`}>
+          {row.status.replace('_', ' ').toLowerCase()}
+        </span>
+        {row.needs_review ? <span className="ops-flag">needs review</span> : null}
+      </td>
+      <td>{vnd(row.price)}</td>
+      <td>{row.rating.toFixed(1)}</td>
+      <td>
+        {row.suppressed ? <span className="ops-flag ops-flag-off">hidden</span> : null}
+        {row.pinned ? <span className="ops-flag">pinned</span> : null}
+        {row.boost !== 1 ? <span className="ops-flag">×{row.boost.toFixed(2)}</span> : null}
+        {row.promotion_label ? (
+          <span className="ops-flag">{row.promotion_label}</span>
+        ) : null}
+      </td>
+      <td>
+        {row.overridden_fields.length ? (
+          <span
+            className="ops-flag ops-flag-edit"
+            title={`Protected from re-import: ${row.overridden_fields.join(', ')}`}
+          >
+            {row.overridden_fields.length} edited
+          </span>
+        ) : (
+          <span className="ops-sub">supplier</span>
+        )}
+      </td>
+      <td className="ops-actions-cell">{can('catalog:write') ? 'Open' : 'View'}</td>
+    </tr>
+  )
+}
+
+function Editor({
+  row,
+  can,
+  ceiling,
+  onChanged,
+  onClose,
+}: {
+  row: CatalogRow
+  can: (capability: Capability) => boolean
+  ceiling: number
+  onChanged: (row: CatalogRow) => void
+  onClose: () => void
+}) {
+  const [draft, setDraft] = useState<Record<string, string>>({})
+  const [note, setNote] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [detail, setDetail] = useState<Record<string, unknown> | null>(null)
+  const [history, setHistory] = useState<AuditEntry[]>([])
+
+  useEffect(() => {
+    setDraft({})
+    setError(null)
+    let live = true
+    void (async () => {
+      try {
+        const [full, audit] = await Promise.all([
+          fetchExperience(row.id),
+          fetchAudit(row.id, 10),
+        ])
+        if (!live) return
+        setDetail(full)
+        setHistory(audit.entries)
+      } catch {
+        if (live) setDetail(null)
+      }
+    })()
+    return () => {
+      live = false
+    }
+  }, [row.id])
+
+  const run = async (task: () => Promise<CatalogRow>) => {
+    setBusy(true)
+    setError(null)
+    try {
+      onChanged(await task())
+      setDraft({})
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : 'Something went wrong')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const current = (field: string) =>
+    draft[field] ?? String((detail?.[field] as string | undefined) ?? '')
+
+  const dirty = Object.keys(draft).length > 0
+
+  return (
+    <aside className="ops-editor">
+      <header>
+        <div>
+          <h2>{row.title}</h2>
+          <span className="ops-sub">
+            {row.slug} · {row.destination}
+          </span>
+        </div>
+        <button type="button" onClick={onClose} aria-label="Close editor">
+          ✕
+        </button>
+      </header>
+
+      {row.needs_review ? (
+        <div className="ops-callout">
+          <strong>Flagged on import.</strong>
+          <span>{row.review_note || 'The importer was not confident about this record.'}</span>
+        </div>
+      ) : null}
+
+      {row.overridden_fields.length ? (
+        <div className="ops-callout ops-callout-quiet">
+          <strong>Protected from re-import</strong>
+          <span>
+            {row.overridden_fields.join(', ')} — the supplier feed will no longer
+            overwrite these.
+          </span>
+        </div>
+      ) : null}
+
+      <section>
+        <h3>Details</h3>
+        {EDITABLE_TEXT.map(({ field, label, long }) => (
+          <label key={field} className="ops-field">
+            <span>
+              {label}
+              {row.overridden_fields.includes(field) ? (
+                <em className="ops-sub"> (edited)</em>
+              ) : null}
+            </span>
+            {long ? (
+              <textarea
+                rows={3}
+                value={current(field)}
+                disabled={!can('catalog:write') || !detail}
+                onChange={(event) =>
+                  setDraft({ ...draft, [field]: event.target.value })
+                }
+              />
+            ) : (
+              <input
+                value={current(field)}
+                disabled={!can('catalog:write') || !detail}
+                onChange={(event) =>
+                  setDraft({ ...draft, [field]: event.target.value })
+                }
+              />
+            )}
+          </label>
+        ))}
+        <button
+          type="button"
+          disabled={!dirty || busy || !can('catalog:write')}
+          onClick={() => void run(() => patchExperience(row.id, draft))}
+        >
+          {busy ? 'Saving…' : 'Save details'}
+        </button>
+      </section>
+
+      <section>
+        <h3>Status</h3>
+        <p className="ops-sub">
+          Only published experiences appear in search or the assistant.
+        </p>
+        <input
+          value={note}
+          placeholder="Why (recorded in the audit trail)"
+          onChange={(event) => setNote(event.target.value)}
+        />
+        <div className="ops-buttons">
+          {STATUSES.map((status) => (
+            <button
+              key={status}
+              type="button"
+              className={row.status === status ? 'is-current' : ''}
+              disabled={busy || row.status === status || !can('catalog:publish')}
+              onClick={() => void run(() => changeStatus(row.id, status, note))}
+            >
+              {status.replace('_', ' ').toLowerCase()}
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section>
+        <h3>Merchandising</h3>
+        <p className="ops-sub">
+          A boost is a thumb on the scale, capped at ×{ceiling.toFixed(2)} so it
+          cannot outrank relevance outright.
+        </p>
+        <label className="ops-field">
+          <span>Boost ({row.boost.toFixed(2)})</span>
+          <input
+            type="range"
+            min={Number((1 / ceiling).toFixed(2))}
+            max={ceiling}
+            step={0.05}
+            value={row.boost}
+            disabled={busy || !can('merchandise')}
+            onChange={(event) =>
+              void run(() =>
+                changeMerchandising(row.id, { boost: Number(event.target.value) }),
+              )
+            }
+          />
+        </label>
+        <div className="ops-buttons">
+          <button
+            type="button"
+            className={row.pinned ? 'is-current' : ''}
+            disabled={busy || !can('merchandise')}
+            onClick={() =>
+              void run(() => changeMerchandising(row.id, { pinned: !row.pinned }))
+            }
+          >
+            {row.pinned ? 'Unpin' : 'Pin to top'}
+          </button>
+          <button
+            type="button"
+            className={row.suppressed ? 'is-current' : ''}
+            disabled={busy || !can('merchandise')}
+            onClick={() =>
+              void run(() =>
+                changeMerchandising(row.id, { suppressed: !row.suppressed }),
+              )
+            }
+          >
+            {row.suppressed ? 'Restore to storefront' : 'Hide from storefront'}
+          </button>
+        </div>
+        <p className="ops-sub">
+          Pinning applies to the recommended sort only. Under an explicit price
+          or rating sort it is ignored, because overriding the control the
+          shopper just used would be a lie.
+        </p>
+      </section>
+
+      {history.length ? (
+        <section>
+          <h3>Recent changes</h3>
+          <ul className="ops-history">
+            {history.map((entry) => (
+              <li key={entry.id}>
+                <span className="ops-sub">{when(entry.occurred_at)}</span>
+                <strong>{entry.operator}</strong> {entry.action}
+                {Object.keys(entry.changes).length ? (
+                  <span className="ops-sub">
+                    {' '}
+                    ({Object.keys(entry.changes).join(', ')})
+                  </span>
+                ) : null}
+                {entry.summary ? <em> — {entry.summary}</em> : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {error ? <p className="ops-error">{error}</p> : null}
+    </aside>
+  )
+}
+
+function Settings({ can }: { can: (capability: Capability) => boolean }) {
+  const [settings, setSettings] = useState<SettingView[]>([])
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [status, setStatus] = useState<Record<string, string>>({})
+
+  const load = useCallback(async () => {
+    const payload = await fetchSettings()
+    setSettings(payload.settings)
+    setDrafts({})
+  }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const commit = async (key: string) => {
+    setStatus({ ...status, [key]: 'saving' })
+    try {
+      const parsed = JSON.parse(drafts[key])
+      await saveSetting(key, parsed)
+      await load()
+      setStatus({ ...status, [key]: 'saved' })
+    } catch (problem) {
+      setStatus({
+        ...status,
+        [key]:
+          problem instanceof SyntaxError
+            ? 'That is not valid JSON.'
+            : problem instanceof Error
+              ? problem.message
+              : 'Rejected',
+      })
+    }
+  }
+
+  return (
+    <div className="ops-settings">
+      <p className="ops-sub">
+        These take effect within about thirty seconds, with no deploy. A value
+        the server rejects is never stored, and a stored value that stops
+        validating is ignored rather than taking ranking down.
+      </p>
+      {settings.map((setting) => (
+        <article key={setting.key}>
+          <header>
+            <h3>{setting.key}</h3>
+            {setting.overridden ? (
+              <span className="ops-flag">changed · v{setting.version}</span>
+            ) : (
+              <span className="ops-sub">default</span>
+            )}
+          </header>
+          <p className="ops-sub">{setting.description}</p>
+          <textarea
+            rows={Math.min(
+              16,
+              (drafts[setting.key] ?? JSON.stringify(setting.value, null, 2)).split(
+                '\n',
+              ).length + 1,
+            )}
+            disabled={!can('configure')}
+            value={drafts[setting.key] ?? JSON.stringify(setting.value, null, 2)}
+            onChange={(event) =>
+              setDrafts({ ...drafts, [setting.key]: event.target.value })
+            }
+          />
+          <div className="ops-buttons">
+            <button
+              type="button"
+              disabled={!can('configure') || drafts[setting.key] === undefined}
+              onClick={() => void commit(setting.key)}
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              disabled={!can('configure') || !setting.overridden}
+              onClick={() => void resetSetting(setting.key).then(load)}
+            >
+              Reset to default
+            </button>
+            {status[setting.key] ? (
+              <span
+                className={
+                  status[setting.key] === 'saved' ? 'ops-sub' : 'ops-error'
+                }
+              >
+                {status[setting.key]}
+              </span>
+            ) : null}
+          </div>
+        </article>
+      ))}
+    </div>
+  )
+}
+
+function Audit() {
+  const [entries, setEntries] = useState<AuditEntry[]>([])
+
+  useEffect(() => {
+    void fetchAudit(undefined, 100).then((payload) => setEntries(payload.entries))
+  }, [])
+
+  return (
+    <table className="ops-table">
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>Who</th>
+          <th>Did what</th>
+          <th>To</th>
+          <th>Changes</th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.map((entry) => (
+          <tr key={entry.id}>
+            <td className="ops-sub">{when(entry.occurred_at)}</td>
+            <td>{entry.operator}</td>
+            <td>{entry.action}</td>
+            <td className="ops-sub">
+              {entry.entity_type} {entry.entity_id.slice(0, 8)}
+            </td>
+            <td>
+              {Object.entries(entry.changes).map(([field, delta]) => (
+                <div key={field} className="ops-sub">
+                  <strong>{field}</strong>: {JSON.stringify(delta.from)} →{' '}
+                  {JSON.stringify(delta.to)}
+                </div>
+              ))}
+              {entry.summary ? <em>{entry.summary}</em> : null}
+            </td>
+          </tr>
+        ))}
+        {entries.length === 0 ? (
+          <tr>
+            <td colSpan={5} className="ops-sub">
+              Nothing has been changed yet.
+            </td>
+          </tr>
+        ) : null}
+      </tbody>
+    </table>
+  )
+}
+
+function Insight() {
+  const [funnel, setFunnel] = useState<FunnelView | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    void fetchFunnel()
+      .then(setFunnel)
+      .catch((problem) =>
+        setError(problem instanceof Error ? problem.message : 'Unavailable'),
+      )
+  }, [])
+
+  if (error) return <p className="ops-error">{error}</p>
+  if (!funnel) return <p className="ops-sub">Loading…</p>
+
+  const { totals, assistant, search_health: search, cost } = funnel
+  const stages: Array<[string, number]> = [
+    ['Saw an experience', totals.experience_impression],
+    ['Opened one', totals.experience_viewed],
+    ['Added to trip', totals.cart_item_added],
+    ['Started checkout', totals.checkout_started],
+    ['Booked', totals.booking_completed],
+  ]
+  const top = Math.max(1, totals.experience_impression)
+  const rate = (value: number | null) =>
+    value == null ? '—' : `${(value * 100).toFixed(1)}%`
+
+  // The assistant costs money and roughly twelve seconds a turn. Whether it
+  // earns that is one comparison, so it goes at the top rather than buried.
+  const lift =
+    assistant.touched_conversion != null && assistant.untouched_conversion != null
+      ? assistant.touched_conversion - assistant.untouched_conversion
+      : null
+
+  return (
+    <div className="ops-insight">
+      <div className="ops-metrics">
+        <div>
+          <span className="ops-sub">Assistant lift</span>
+          <strong>
+            {lift == null ? 'Not enough data' : `${lift >= 0 ? '+' : ''}${(lift * 100).toFixed(1)}pp`}
+          </strong>
+          <span className="ops-sub">
+            {rate(assistant.touched_conversion)} with · {rate(assistant.untouched_conversion)}{' '}
+            without · {assistant.touched_sessions + assistant.untouched_sessions} sessions
+          </span>
+        </div>
+        <div>
+          <span className="ops-sub">Searches finding nothing</span>
+          <strong>{rate(search.zero_result_rate)}</strong>
+          <span className="ops-sub">
+            {search.zero_results} of {search.searches} · {search.relaxed_recoveries} recovered by
+            relaxing
+          </span>
+        </div>
+        <div>
+          <span className="ops-sub">Model spend today ({cost.day})</span>
+          <strong>
+            ${cost.spent_usd.toFixed(2)} / ${cost.budget_usd.toFixed(2)}
+          </strong>
+          <span className="ops-sub">{cost.calls} calls</span>
+          {cost.breaker_tripped ? (
+            <span className="ops-flag ops-flag-off">budget breaker tripped</span>
+          ) : null}
+        </div>
+      </div>
+      <ul className="ops-funnel">
+        {stages.map(([label, value]) => (
+          <li key={label}>
+            <span>{label}</span>
+            <div className="ops-bar">
+              <div style={{ width: `${Math.min(100, (value / top) * 100)}%` }} />
+            </div>
+            <strong>{value.toLocaleString()}</strong>
+          </li>
+        ))}
+      </ul>
+      <p className="ops-sub">
+        A zero-result rate that will not come down is usually a catalogue gap,
+        not a ranking bug. Those queries are the buying list.
+      </p>
+    </div>
+  )
+}
+
+export default function AdminConsole() {
+  const [principal, setPrincipal] = useState<Principal | null>(null)
+  const [checking, setChecking] = useState(Boolean(getApiKey()))
+  const [tab, setTab] = useState<Tab>('review')
+  const [page, setPage] = useState<CatalogPage | null>(null)
+  const [summary, setSummary] = useState<ReviewSummary | null>(null)
+  const [selected, setSelected] = useState<CatalogRow | null>(null)
+  const [query, setQuery] = useState('')
+  const [statusFilter, setStatusFilter] = useState('')
+  const [pageNumber, setPageNumber] = useState(1)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [ceiling, setCeiling] = useState(1.5)
+
+  useEffect(() => {
+    if (!getApiKey()) return
+    void whoami()
+      .then(setPrincipal)
+      .catch(() => setApiKey(''))
+      .finally(() => setChecking(false))
+  }, [])
+
+  const can = useCallback(
+    (capability: Capability) =>
+      Boolean(principal?.capabilities.includes(capability)),
+    [principal],
+  )
+
+  const filters = useMemo<CatalogFilters>(
+    () => ({
+      q: query || undefined,
+      status: statusFilter || undefined,
+      needsReview: tab === 'review' ? true : undefined,
+      page: pageNumber,
+      pageSize: 25,
+    }),
+    [query, statusFilter, tab, pageNumber],
+  )
+
+  const load = useCallback(async () => {
+    if (!principal) return
+    setLoadError(null)
+    try {
+      const [catalog, overview] = await Promise.all([
+        fetchCatalog(filters),
+        fetchOverview(),
+      ])
+      setPage(catalog)
+      setSummary(overview)
+    } catch (problem) {
+      setLoadError(problem instanceof Error ? problem.message : 'Could not load')
+    }
+  }, [principal, filters])
+
+  useEffect(() => {
+    if (tab === 'review' || tab === 'catalog') void load()
+  }, [tab, load])
+
+  useEffect(() => {
+    if (!principal) return
+    void fetchSettings()
+      .then((payload) => {
+        const found = payload.settings.find(
+          (setting) => setting.key === 'max_merchandising_boost',
+        )
+        if (typeof found?.value === 'number') setCeiling(found.value)
+      })
+      .catch(() => undefined)
+  }, [principal])
+
+  const applyRow = (row: CatalogRow) => {
+    setSelected(row)
+    setPage((current) =>
+      current
+        ? {
+            ...current,
+            items: current.items.map((item) => (item.id === row.id ? row : item)),
+          }
+        : current,
+    )
+    void fetchOverview().then(setSummary).catch(() => undefined)
+  }
+
+  if (checking) return <div className="ops-shell ops-sub">Checking your key…</div>
+  if (!principal)
+    return (
+      <SignIn
+        onSignedIn={(who) => {
+          setPrincipal(who)
+          setChecking(false)
+        }}
+      />
+    )
+
+  const visibleTabs = TABS.filter((entry) => !entry.needs || can(entry.needs))
+
+  return (
+    <div className="ops-shell">
+      <header className="ops-header">
+        <div>
+          <h1>Vietra operations</h1>
+          <span className="ops-sub">
+            {principal.name || principal.email} · {principal.role.replace('_', ' ')}
+          </span>
+        </div>
+        <div className="ops-header-right">
+          {summary ? (
+            <span className={summary.needs_review ? 'ops-flag' : 'ops-sub'}>
+              {summary.needs_review} awaiting review
+            </span>
+          ) : null}
+          <a href="/">Storefront</a>
+          <button
+            type="button"
+            onClick={() => {
+              setApiKey('')
+              setPrincipal(null)
+            }}
+          >
+            Sign out
+          </button>
+        </div>
+      </header>
+
+      <nav className="ops-tabs">
+        {visibleTabs.map((entry) => (
+          <button
+            key={entry.id}
+            type="button"
+            className={tab === entry.id ? 'is-current' : ''}
+            onClick={() => {
+              setTab(entry.id)
+              setPageNumber(1)
+              setSelected(null)
+            }}
+          >
+            {entry.label}
+          </button>
+        ))}
+      </nav>
+
+      <main className="ops-main">
+        {tab === 'settings' ? <Settings can={can} /> : null}
+        {tab === 'audit' ? <Audit /> : null}
+        {tab === 'insight' ? <Insight /> : null}
+
+        {tab === 'review' || tab === 'catalog' ? (
+          <div className="ops-catalog">
+            <div className="ops-list">
+              {tab === 'review' ? (
+                <p className="ops-sub">
+                  Imported records the system was not confident about. They are
+                  held out of search until someone here decides, so an unreviewed
+                  listing never reaches a shopper.
+                </p>
+              ) : (
+                <div className="ops-filters">
+                  <input
+                    value={query}
+                    placeholder="Search title, slug or destination"
+                    onChange={(event) => {
+                      setQuery(event.target.value)
+                      setPageNumber(1)
+                    }}
+                  />
+                  <select
+                    value={statusFilter}
+                    onChange={(event) => {
+                      setStatusFilter(event.target.value)
+                      setPageNumber(1)
+                    }}
+                  >
+                    <option value="">Any status</option>
+                    {STATUSES.map((status) => (
+                      <option key={status} value={status}>
+                        {status.replace('_', ' ').toLowerCase()}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {loadError ? <p className="ops-error">{loadError}</p> : null}
+
+              <table className="ops-table">
+                <thead>
+                  <tr>
+                    <th>Experience</th>
+                    <th>Status</th>
+                    <th>From</th>
+                    <th>Rating</th>
+                    <th>Merchandising</th>
+                    <th>Source</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {(page?.items ?? []).map((row) => (
+                    <Row
+                      key={row.id}
+                      row={row}
+                      can={can}
+                      selected={selected?.id === row.id}
+                      onSelect={() => setSelected(row)}
+                    />
+                  ))}
+                  {page && page.items.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="ops-sub">
+                        {tab === 'review'
+                          ? 'Nothing is waiting. Every imported experience has been decided.'
+                          : 'No experiences match those filters.'}
+                      </td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+
+              {page && page.total > page.page_size ? (
+                <div className="ops-pager">
+                  <button
+                    type="button"
+                    disabled={pageNumber <= 1}
+                    onClick={() => setPageNumber((value) => value - 1)}
+                  >
+                    Previous
+                  </button>
+                  <span className="ops-sub">
+                    {(page.page - 1) * page.page_size + 1}–
+                    {Math.min(page.page * page.page_size, page.total)} of {page.total}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={page.page * page.page_size >= page.total}
+                    onClick={() => setPageNumber((value) => value + 1)}
+                  >
+                    Next
+                  </button>
+                </div>
+              ) : null}
+            </div>
+
+            {selected ? (
+              <Editor
+                row={selected}
+                can={can}
+                ceiling={ceiling}
+                onChanged={applyRow}
+                onClose={() => setSelected(null)}
+              />
+            ) : null}
+          </div>
+        ) : null}
+      </main>
+    </div>
+  )
+}

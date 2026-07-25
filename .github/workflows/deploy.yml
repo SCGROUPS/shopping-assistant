@@ -68,6 +68,13 @@ jobs:
           uv run ruff check .
           uv run pyright
 
+      # Types and unit tests cannot tell you the answers got worse. This can:
+      # it fails on any golden case that used to pass, so a ranking change has
+      # to be argued for rather than merged on the strength of looking sensible.
+      - name: Evaluate answer quality
+        working-directory: backend
+        run: uv run python -m app.evals.cli --suite search
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -108,6 +115,7 @@ jobs:
         env:
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+          ADMIN_BOOTSTRAP_KEY: ${{ secrets.ADMIN_BOOTSTRAP_KEY }}
           VIETRA_PREFIX: ${{ vars.VIETRA_PREFIX }}
           AZURE_LOCATION: eastus2
           AZURE_POSTGRES_LOCATION: centralus
@@ -124,6 +132,7 @@ jobs:
         working-directory: frontend
         env:
           PLAYWRIGHT_BASE_URL: ${{ steps.deploy.outputs.app_url }}
+          ADMIN_API_KEY: ${{ secrets.ADMIN_BOOTSTRAP_KEY }}
         run: |
           pnpm install --frozen-lockfile
           pnpm exec playwright install --with-deps chromium

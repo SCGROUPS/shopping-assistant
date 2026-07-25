@@ -5,6 +5,7 @@ from httpx import AsyncClient
 
 from app.common.persistence import catalog_products, demand_stats, event_history
 from app.common.ranking import cosine_similarity
+from app.common.runtime_config import get_config
 from app.recommendations.service import RecommendationService, _popularity
 
 
@@ -116,8 +117,9 @@ async def test_observed_demand_overrides_the_seeded_popularity_proxy(client: Asy
 
 async def test_cold_start_redistributes_the_session_weight():
     service = RecommendationService()
-    cold = service._weights(has_session=False)
-    warm = service._weights(has_session=True)
+    configured = (await get_config())["recommendation_weights"]
+    cold = service._weights(has_session=False, configured=configured)
+    warm = service._weights(has_session=True, configured=configured)
     assert cold["session"] == 0.0
     assert cold["context_fit"] > warm["context_fit"]
     assert sum(cold.values()) == pytest.approx(sum(warm.values()))

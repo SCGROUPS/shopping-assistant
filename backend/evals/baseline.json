@@ -1,0 +1,147 @@
+{
+  "search": {
+    "suite": "search",
+    "passed": 15,
+    "total": 15,
+    "pass_rate": 1.0,
+    "latency_p95_ms": 16.5,
+    "violation_counts": {},
+    "cases": [
+      {
+        "id": "sunset-cruise-ha-long",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 16.5,
+        "error": null,
+        "why": "The plainest possible request. If ranking cannot do this, nothing else matters.",
+        "violations": []
+      },
+      {
+        "id": "hanoi-street-food",
+        "passed": true,
+        "results": 5,
+        "latency_ms": 15.4,
+        "error": null,
+        "why": "The reported failure: a food question answered with boat trips and cycling. Scoped to the first screen, because a ranked list of twenty is allowed a weak tail \u2014 the top of the page is the claim.",
+        "violations": []
+      },
+      {
+        "id": "ocean-not-mountain",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 14.9,
+        "error": null,
+        "why": "A stated exclusion is a hard constraint. Explaining which mountain trip is least mountainous is not an answer.",
+        "violations": []
+      },
+      {
+        "id": "budget-ceiling-holds",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 5.4,
+        "error": null,
+        "why": "A budget is a promise. One over-priced card destroys trust in every other number on the page.",
+        "violations": []
+      },
+      {
+        "id": "quality-floor-holds",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 2.4,
+        "error": null,
+        "why": "Filters are the one part of the UI a shopper can verify at a glance.",
+        "violations": []
+      },
+      {
+        "id": "short-activity",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 8.2,
+        "error": null,
+        "why": "Duration is the constraint most often silently dropped when relevance is strong.",
+        "violations": []
+      },
+      {
+        "id": "category-filter-holds",
+        "passed": true,
+        "results": 17,
+        "latency_ms": 2.3,
+        "error": null,
+        "why": "An explicit category is not a hint.",
+        "violations": []
+      },
+      {
+        "id": "price-sort-is-honoured",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 16.7,
+        "error": null,
+        "why": "A sort control that ranking quietly overrides is a lie in the UI.",
+        "violations": []
+      },
+      {
+        "id": "rating-sort-is-honoured",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 15.3,
+        "error": null,
+        "why": "Same argument as price, and the case merchandising pins could plausibly break.",
+        "violations": []
+      },
+      {
+        "id": "family-with-toddler",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 13.8,
+        "error": null,
+        "why": "Party composition has to reach ranking, not just the price calculation.",
+        "violations": []
+      },
+      {
+        "id": "destination-is-respected",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 2.4,
+        "error": null,
+        "why": "Selling a Phu Quoc boat trip to someone in the mountains is the most expensive kind of irrelevance.",
+        "violations": []
+      },
+      {
+        "id": "nonsense-does-not-crash",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 14.7,
+        "error": null,
+        "why": "Garbage input must degrade to browsing, not error and not an empty page.",
+        "violations": []
+      },
+      {
+        "id": "empty-query-browses",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 13.4,
+        "error": null,
+        "why": "The first page load carries no query at all.",
+        "violations": []
+      },
+      {
+        "id": "instant-confirmation-only",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 14.8,
+        "error": null,
+        "why": "Late bookers filter on this and cannot recover from a wrong answer.",
+        "violations": []
+      },
+      {
+        "id": "cooking-class",
+        "passed": true,
+        "results": 20,
+        "latency_ms": 14.3,
+        "error": null,
+        "why": "Specific vocabulary that exists in the catalogue should rank exactly.",
+        "violations": []
+      }
+    ]
+  }
+}
