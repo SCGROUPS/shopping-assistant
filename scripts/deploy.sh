@@ -124,6 +124,10 @@ build_revision="build-$(date -u +%Y%m%d%H%M%S)"
 run_job() {
   local job_name="$1"
   local description="$2"
+  # Polls of ten seconds. The default suits a migration; the catalogue job is
+  # given its own bound because it does the work, and a bound shorter than the
+  # job's own timeout fails the deployment for a job that is still succeeding.
+  local attempts="${3:-120}"
   local execution=""
   local status=""
 
@@ -144,7 +148,7 @@ run_job() {
     return 1
   fi
 
-  for _ in {1..120}; do
+  for _ in $(seq 1 "$attempts"); do
     status="$(az containerapp job execution show \
       --resource-group "$resource_group" \
       --name "$job_name" \
@@ -163,7 +167,7 @@ run_job() {
     sleep 10
   done
 
-  echo "${description} did not complete within 20 minutes (execution ${execution})." >&2
+  echo "${description} did not complete within $((attempts / 6)) minutes (execution ${execution})." >&2
   return 1
 }
 
@@ -182,7 +186,12 @@ run_job "job-${prefix}-migrate" "Schema migration"
 
 deploy_stack "${login_server}/vietra:latest" "$build_revision"
 
-run_job "job-${prefix}-catalog" "Catalog job"
+# The catalogue job imports, reconciles and then drains the index queue, and
+# `run_reindex` deliberately waits out a lease before giving up. Its bound has
+# to outlast the job's own 3600s timeout rather than inherit the migration's,
+# so that a job which fails on time reports as failed rather than as a script
+# that gave up on something still running.
+run_job "job-${prefix}-catalog" "Catalog job" 380
 
 hostname="$(az containerapp show \
   --resource-group "$resource_group" \

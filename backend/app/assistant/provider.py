@@ -430,6 +430,14 @@ class AzureOpenAIProvider:
         kwargs: dict[str, Any] = {
             "azure_endpoint": settings.azure_openai_endpoint,
             "api_version": settings.azure_openai_api_version,
+            # A request with no deadline is not a request, it is a hostage. The
+            # indexing worker holds a lease while it waits, and an unbounded
+            # call means the lease can expire under a request that is still
+            # notionally in flight - the work is handed to someone else, the
+            # attempt is spent, and nothing anywhere reports a problem. This has
+            # to stay comfortably below `catalog.indexing.LEASE_SECONDS`.
+            "timeout": settings.azure_openai_timeout_seconds,
+            "max_retries": 2,
         }
         if settings.azure_openai_api_key:
             kwargs["api_key"] = settings.azure_openai_api_key

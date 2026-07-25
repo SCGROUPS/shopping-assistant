@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     azure_openai_endpoint: str | None = None
     azure_openai_api_key: str | None = None
     azure_openai_api_version: str = "2025-04-01-preview"
+    # Well below `catalog.indexing.LEASE_SECONDS`, so a stalled request always
+    # gives up before the lease it is holding expires underneath it.
+    azure_openai_timeout_seconds: float = 60.0
     azure_openai_chat_deployment: str = "gpt-5.4-mini"
     azure_openai_intent_deployment: str = "gpt-5-nano"
     azure_openai_embedding_deployment: str = "text-embedding-3-small"
