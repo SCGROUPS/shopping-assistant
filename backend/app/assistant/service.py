@@ -69,6 +69,12 @@ def keyword_tool(lowered: str) -> str | None:
     return None
 
 
+def _join(labels: list[str]) -> str:
+    if len(labels) == 1:
+        return labels[0]
+    return f"{', '.join(labels[:-1])} and {labels[-1]}"
+
+
 def _resolve_referent(products: list[dict[str, Any]], message: str) -> dict[str, Any]:
     """Resolve which of the last results the shopper means.
 
@@ -404,10 +410,11 @@ class AssistantService:
         if not products:
             return AssistantResponse(
                 message=(
-                    "I could not find an exact match without relaxing your constraints. "
-                    "Which constraint would you like to change?"
+                    "Nothing is bookable even after I widened your dates and dropped the "
+                    "optional preferences. Only your accessibility needs and exclusions "
+                    "were kept. Shall I try a different destination?"
                 ),
-                clarification="Would you like to change destination, budget, or activity type?",
+                clarification="Would you like to change destination or travel dates?",
             )
         facts = [
             {
@@ -419,9 +426,16 @@ class AssistantService:
             }
             for product in result.items[:4]
         ]
-        message_text = (
-            f"I found {len(products)} grounded options. The first choices best match your request."
-        )
+        if result.relaxed_preferences:
+            message_text = (
+                f"No exact match, so I relaxed {_join(result.relaxed_preferences)} "
+                f"and found {len(products)} bookable options."
+            )
+        else:
+            message_text = (
+                f"I found {len(products)} grounded options. "
+                "The first choices best match your request."
+            )
         try:
             enhanced = await self.ai.enhance_assistant(message, facts)
             if enhanced:
@@ -432,6 +446,7 @@ class AssistantService:
             message=message_text,
             state_patch={"filters": conversation["state"]["filters"], "last_result_ids": ids},
             products=products,
+            relaxed_preferences=result.relaxed_preferences,
             filter_updates=[
                 {"field": key, "value": value, "source": "inferred"}
                 for key, value in result.effective_filters.model_dump(mode="json").items()

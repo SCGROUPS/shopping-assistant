@@ -221,6 +221,7 @@ const normalizeCart = async (
       experience: product,
       option_id: String(item.option_id),
       option_name: String(item.option_name ?? ''),
+      slot_id: item.slot_id ? String(item.slot_id) : undefined,
       date: startsAt?.toISOString().slice(0, 10) ?? '',
       time: startsAt?.toLocaleTimeString([], {
         hour: '2-digit',
@@ -243,6 +244,7 @@ const demoCartItem = (
   experience: product,
   option_id: product.options?.[0]?.id,
   option_name: product.options?.[0]?.name,
+  slot_id: product.options?.[0]?.slots?.[0]?.id,
   date,
   time: product.options?.[0]?.start_times?.[0],
   adults,
@@ -308,6 +310,8 @@ export const api = {
     items: Experience[]
     intent?: Record<string, unknown>
     effectiveFilters: SearchFilters
+    relaxedPreferences: string[]
+    facets: Record<string, Record<string, number>>
   }> {
     try {
       const payload = await request<Record<string, unknown>>('/search', {
@@ -326,12 +330,17 @@ export const api = {
         intent: payload.intent as Record<string, unknown> | undefined,
         effectiveFilters:
           (payload.effective_filters as SearchFilters | undefined) ?? filters,
+        relaxedPreferences: (payload.relaxed_preferences as string[]) ?? [],
+        facets:
+          (payload.facets as Record<string, Record<string, number>>) ?? {},
       }
     } catch (error) {
       allowDemoFallbackOrThrow(error)
       return {
         items: filterDemoProducts(query, filters),
         effectiveFilters: filters,
+        relaxedPreferences: [],
+        facets: {},
       }
     }
   },

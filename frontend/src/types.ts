@@ -102,6 +102,7 @@ export type CartItem = {
   experience: Experience
   option_id?: string
   option_name?: string
+  slot_id?: string
   date: string
   time?: string
   adults: number

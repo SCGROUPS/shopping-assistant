@@ -130,6 +130,7 @@ class SearchResponse(BaseModel):
     items: list[ExperienceCard]
     recommendations: list[ExperienceCard] | None = None
     facets: dict[str, dict[str, int]]
+    relaxed_preferences: list[str] = Field(default_factory=list)
 
 
 class ExperienceListResponse(BaseModel):

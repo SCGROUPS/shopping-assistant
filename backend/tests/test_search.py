@@ -215,3 +215,56 @@ def test_optional_filters_and_multi_category_interests_do_not_block_search():
     assert filters.category is None
     assert filters.indoor_outdoor is None
     assert filters.family_friendly is True
+
+
+async def test_relaxation_recovers_from_zero_results(client: AsyncClient):
+    response = await client.post(
+        "/api/v1/search",
+        json={
+            "query": "museum",
+            "filters": {
+                "destination": "Hoi An",
+                "category": "Cruise",
+                "max_duration_minutes": 5,
+                "rating": 4.9,
+            },
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["items"], "relaxation should recover bookable results"
+    assert payload["relaxed_preferences"], "the shopper must be told what changed"
+
+
+async def test_relaxation_never_drops_accessibility(client: AsyncClient):
+    response = await client.post(
+        "/api/v1/search",
+        json={
+            "query": "impossible combination",
+            "filters": {
+                "accessibility": ["wheelchair"],
+                "max_duration_minutes": 1,
+                "rating": 5.0,
+            },
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert "accessibility" not in " ".join(payload["relaxed_preferences"])
+    for item in payload["items"]:
+        detail = await client.get(f"/api/v1/experiences/{item['id']}")
+        features = " ".join(detail.json()["accessibility_features"]).casefold()
+        assert "wheelchair" in features
+
+
+async def test_facets_allow_sideways_drill_down(client: AsyncClient):
+    response = await client.post(
+        "/api/v1/search",
+        json={"query": "things to do", "filters": {"category": "Food & drink"}},
+    )
+    assert response.status_code == 200
+    facets = response.json()["facets"]
+    assert len(facets["category"]) > 1, (
+        "category counts must ignore the category filter so shoppers can switch tabs"
+    )
+    assert facets["destination"], "destination counts should still be populated"

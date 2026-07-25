@@ -12,6 +12,7 @@ import {
   MapPin,
   Menu,
   Minus,
+  Plus,
   Search,
   ShieldCheck,
   ShoppingBag,
@@ -72,6 +73,49 @@ const formatDate = (date: string) => {
   }).format(new Date(`${date}T12:00:00`))
 }
 
+const ANY_DESTINATION = 'Anywhere in Vietnam'
+
+const isoDay = (offsetDays: number) =>
+  new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10)
+
+// The seeded catalogue publishes slots for today+1 .. today+30, so a fixed
+// default date would silently fall outside every availability window.
+const defaultVisitDate = () => isoDay(7)
+
+type AdvancedFilters = {
+  maxTotalPrice?: number
+  rating?: number
+  maxDurationMinutes?: number
+  indoorOutdoor?: string
+  language?: string
+  instantConfirmation: boolean
+  freeCancellation: boolean
+  familyFriendly: boolean
+  accessibility: string[]
+}
+
+const emptyAdvanced: AdvancedFilters = {
+  instantConfirmation: false,
+  freeCancellation: false,
+  familyFriendly: false,
+  accessibility: [],
+}
+
+const durationChoices = [
+  { label: 'Up to 2 hours', value: 120 },
+  { label: 'Up to 4 hours', value: 240 },
+  { label: 'Up to a full day', value: 600 },
+]
+
+const ratingChoices = [4.0, 4.5, 4.8]
+
+const accessibilityChoices = [
+  'wheelchair',
+  'step-free',
+  'audio guide',
+  'sign language',
+]
+
 const money = (currency: string, amount: number) =>
   new Intl.NumberFormat('en-US', {
     style: 'currency',
@@ -87,8 +131,8 @@ function App() {
     api.demoFallbackEnabled ? demoExperiences.slice(0, 6) : [],
   )
   const [query, setQuery] = useState('')
-  const [destination, setDestination] = useState('Central Vietnam')
-  const [date, setDate] = useState('2026-08-15')
+  const [destination, setDestination] = useState(ANY_DESTINATION)
+  const [date, setDate] = useState(defaultVisitDate())
   const [travellers, setTravellers] = useState(2)
   const [category, setCategory] = useState('All')
   const [searching, setSearching] = useState(false)
@@ -117,12 +161,40 @@ function App() {
     resultIds: string[]
   }>({ query: '', filters: {}, resultIds: [] })
   const viewedIds = useRef<string[]>([])
+  const [relaxedPreferences, setRelaxedPreferences] = useState<string[]>([])
+  const [facets, setFacets] = useState<Record<string, Record<string, number>>>(
+    {},
+  )
+  const [filterPanelOpen, setFilterPanelOpen] = useState(false)
+  const [advanced, setAdvanced] = useState<AdvancedFilters>(emptyAdvanced)
 
-  const liveFilters = (): SearchFilters => ({
-    destination: destination === 'Central Vietnam' ? undefined : destination,
-    visit_start: date ? `${date}T00:00:00Z` : undefined,
-    category: category === 'All' ? undefined : category,
-  })
+  const liveFilters = (): SearchFilters => {
+    const filters: SearchFilters = {
+      destination: destination === ANY_DESTINATION ? undefined : destination,
+      visit_start: date ? `${date}T00:00:00Z` : undefined,
+      category: category === 'All' ? undefined : category,
+    }
+    if (advanced.maxTotalPrice) filters.max_total_price = advanced.maxTotalPrice
+    if (advanced.rating) filters.rating = advanced.rating
+    if (advanced.maxDurationMinutes)
+      filters.max_duration_minutes = advanced.maxDurationMinutes
+    if (advanced.indoorOutdoor) filters.indoor_outdoor = advanced.indoorOutdoor
+    if (advanced.language) filters.language = advanced.language
+    if (advanced.instantConfirmation) filters.instant_confirmation = true
+    if (advanced.freeCancellation) filters.free_cancellation = true
+    if (advanced.familyFriendly) filters.family_friendly = true
+    if (advanced.accessibility.length)
+      filters.accessibility = advanced.accessibility
+    return filters
+  }
+
+  const activeFilterCount =
+    (destination === ANY_DESTINATION ? 0 : 1) +
+    (category === 'All' ? 0 : 1) +
+    Object.entries(advanced).filter(([key, value]) => {
+      if (key === 'accessibility') return (value as string[]).length > 0
+      return Boolean(value)
+    }).length
 
   useEffect(() => {
     void (async () => {
@@ -164,9 +236,33 @@ function App() {
   }, [hasSearched, destination, date, travellers])
 
   const visibleProducts = useMemo(() => {
-    if (category === 'All') return products
+    // Once a search has run the backend has already applied the category
+    // filter; filtering again client-side would hide relaxed results.
+    if (hasSearched || category === 'All') return products
     return products.filter((product) => product.category === category)
-  }, [category, products])
+  }, [category, hasSearched, products])
+
+  const destinationOptions = useMemo(() => {
+    const names = new Set<string>()
+    for (const product of [...products, ...recommendations]) {
+      if (product.destination) names.add(product.destination)
+    }
+    return [ANY_DESTINATION, ...[...names].sort()]
+  }, [products, recommendations])
+
+  // Tabs follow the live catalogue rather than the demo labels, so a tab can
+  // never point at a category the backend has nothing to return for.
+  const categoryTabs = useMemo(() => {
+    const counts = facets.category
+    if (!counts || Object.keys(counts).length === 0) return categories
+    const ranked = Object.entries(counts)
+      .filter(([, count]) => count > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([name]) => name)
+    if (category !== 'All' && !ranked.includes(category)) ranked.push(category)
+    return ['All', ...ranked]
+  }, [category, facets])
 
   const cartTotal = cartItems.reduce((sum, item) => sum + item.total, 0)
 
@@ -180,6 +276,7 @@ function App() {
   const runSearch = async (
     searchQuery = query,
     extraFilters: SearchFilters = {},
+    announce = true,
   ) => {
     setSearching(true)
     setHasSearched(true)
@@ -187,6 +284,8 @@ function App() {
     try {
       const result = await api.search(searchQuery, filters, travellers)
       setProducts(result.items)
+      setRelaxedPreferences(result.relaxedPreferences)
+      setFacets(result.facets)
       setSearchContext({
         query: searchQuery,
         filters: result.effectiveFilters,
@@ -195,7 +294,7 @@ function App() {
       setConversationId(undefined)
       setAppError('')
 
-      if (searchQuery.trim().split(/\s+/).length >= 4) {
+      if (announce && searchQuery.trim().split(/\s+/).length >= 4) {
         const best = result.items.slice(0, 3)
         setMessages((current) => [
           ...current,
@@ -232,6 +331,12 @@ function App() {
     void runSearch()
   }
 
+  useEffect(() => {
+    if (!hasSearched) return
+    void runSearch(searchContext.query, {}, false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [category, advanced])
+
   const chooseSuggestion = (suggestion: string) => {
     setQuery(suggestion)
     void runSearch(suggestion)
@@ -242,7 +347,17 @@ function App() {
     fromAssistant = false,
     selection: Pick<AssistantAction, 'option_id' | 'slot_id'> = {},
   ) => {
-    if (cartItems.some((item) => item.experience.id === product.id)) {
+    // A cart line is (experience, option, date/slot): the same tour on another
+    // date is a different, bookable line rather than a duplicate.
+    const alreadyBooked = cartItems.some(
+      (item) =>
+        item.experience.id === product.id &&
+        (!selection.option_id || item.option_id === selection.option_id) &&
+        (selection.slot_id
+          ? item.slot_id === selection.slot_id
+          : item.date === date),
+    )
+    if (alreadyBooked) {
       setSelectedProduct(null)
       if (!fromAssistant) setCartOpen(true)
       return
@@ -578,21 +693,27 @@ function App() {
                   }}
                 />
               </div>
-              <button
-                type="button"
-                className="search-segment destination-segment"
-                onClick={() =>
-                  setDestination((value) =>
-                    value === 'Central Vietnam' ? 'Hoi An' : 'Central Vietnam',
-                  )
-                }
-              >
+              <label className="search-segment destination-segment">
                 <MapPin size={18} />
                 <span>
                   <small>Destination</small>
                   <strong>{destination}</strong>
+                  <select
+                    value={destination}
+                    onChange={(event) => setDestination(event.target.value)}
+                    aria-label="Destination"
+                  >
+                    {destinationOptions.map((name) => {
+                      const count = facets.destination?.[name]
+                      return (
+                        <option key={name} value={name}>
+                          {count === undefined ? name : `${name} (${count})`}
+                        </option>
+                      )
+                    })}
+                  </select>
                 </span>
-              </button>
+              </label>
               <label className="search-segment">
                 <CalendarDays size={18} />
                 <span>
@@ -601,24 +722,44 @@ function App() {
                   <input
                     type="date"
                     value={date}
+                    min={isoDay(1)}
+                    max={isoDay(30)}
                     onChange={(event) => setDate(event.target.value)}
                     aria-label="Visit date"
                   />
                 </span>
               </label>
-              <button
-                type="button"
-                className="search-segment"
-                onClick={() =>
-                  setTravellers((value) => (value === 6 ? 1 : value + 1))
-                }
-              >
+              <div className="search-segment guest-segment">
                 <Users size={18} />
                 <span>
                   <small>Guests</small>
-                  <strong>{travellers} travellers</strong>
+                  <strong>
+                    {travellers} {travellers === 1 ? 'traveller' : 'travellers'}
+                  </strong>
                 </span>
-              </button>
+                <div className="guest-stepper">
+                  <button
+                    type="button"
+                    aria-label="Remove a traveller"
+                    disabled={travellers <= 1}
+                    onClick={() =>
+                      setTravellers((value) => Math.max(1, value - 1))
+                    }
+                  >
+                    <Minus size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Add a traveller"
+                    disabled={travellers >= 12}
+                    onClick={() =>
+                      setTravellers((value) => Math.min(12, value + 1))
+                    }
+                  >
+                    <Plus size={14} />
+                  </button>
+                </div>
+              </div>
               <button className="search-submit" disabled={searching}>
                 {searching ? <span className="search-loader" /> : <Search size={20} />}
                 <span>Explore</span>
@@ -684,22 +825,212 @@ function App() {
 
           <div className="filter-toolbar">
             <div className="category-tabs">
-              {categories.map((item) => (
-                <button
-                  className={category === item ? 'active' : ''}
-                  key={item}
-                  onClick={() => setCategory(item)}
-                >
-                  {item}
-                </button>
-              ))}
+              {categoryTabs.map((item) => {
+                const count =
+                  item === 'All'
+                    ? Object.values(facets.category ?? {}).reduce(
+                        (sum, value) => sum + value,
+                        0,
+                      )
+                    : facets.category?.[item]
+                return (
+                  <button
+                    className={category === item ? 'active' : ''}
+                    key={item}
+                    onClick={() => setCategory(item)}
+                  >
+                    {item}
+                    {hasSearched && count !== undefined && (
+                      <em className="facet-count">{count}</em>
+                    )}
+                  </button>
+                )
+              })}
             </div>
-            <button className="filter-button">
+            <button
+              className="filter-button"
+              aria-expanded={filterPanelOpen}
+              onClick={() => setFilterPanelOpen((open) => !open)}
+            >
               <Filter size={16} />
               All filters
-              <span>3</span>
+              {activeFilterCount > 0 && <span>{activeFilterCount}</span>}
             </button>
           </div>
+
+          {filterPanelOpen && (
+            <div className="filter-panel">
+              <div className="filter-group">
+                <h4>Budget (total for {travellers})</h4>
+                <input
+                  type="number"
+                  min={0}
+                  step={100000}
+                  placeholder="No limit"
+                  value={advanced.maxTotalPrice ?? ''}
+                  onChange={(event) =>
+                    setAdvanced((current) => ({
+                      ...current,
+                      maxTotalPrice: event.target.value
+                        ? Number(event.target.value)
+                        : undefined,
+                    }))
+                  }
+                  aria-label="Maximum total price"
+                />
+              </div>
+              <div className="filter-group">
+                <h4>Minimum rating</h4>
+                <div className="chip-row">
+                  {ratingChoices.map((value) => (
+                    <button
+                      key={value}
+                      className={advanced.rating === value ? 'active' : ''}
+                      onClick={() =>
+                        setAdvanced((current) => ({
+                          ...current,
+                          rating: current.rating === value ? undefined : value,
+                        }))
+                      }
+                    >
+                      {value.toFixed(1)}+
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="filter-group">
+                <h4>Duration</h4>
+                <div className="chip-row">
+                  {durationChoices.map((choice) => (
+                    <button
+                      key={choice.value}
+                      className={
+                        advanced.maxDurationMinutes === choice.value
+                          ? 'active'
+                          : ''
+                      }
+                      onClick={() =>
+                        setAdvanced((current) => ({
+                          ...current,
+                          maxDurationMinutes:
+                            current.maxDurationMinutes === choice.value
+                              ? undefined
+                              : choice.value,
+                        }))
+                      }
+                    >
+                      {choice.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="filter-group">
+                <h4>Setting</h4>
+                <div className="chip-row">
+                  {['indoor', 'outdoor'].map((value) => (
+                    <button
+                      key={value}
+                      className={
+                        advanced.indoorOutdoor === value ? 'active' : ''
+                      }
+                      onClick={() =>
+                        setAdvanced((current) => ({
+                          ...current,
+                          indoorOutdoor:
+                            current.indoorOutdoor === value ? undefined : value,
+                        }))
+                      }
+                    >
+                      {value === 'indoor' ? 'Indoor' : 'Outdoor'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="filter-group">
+                <h4>Booking terms</h4>
+                <div className="chip-row">
+                  <button
+                    className={advanced.instantConfirmation ? 'active' : ''}
+                    onClick={() =>
+                      setAdvanced((current) => ({
+                        ...current,
+                        instantConfirmation: !current.instantConfirmation,
+                      }))
+                    }
+                  >
+                    Instant confirmation
+                  </button>
+                  <button
+                    className={advanced.freeCancellation ? 'active' : ''}
+                    onClick={() =>
+                      setAdvanced((current) => ({
+                        ...current,
+                        freeCancellation: !current.freeCancellation,
+                      }))
+                    }
+                  >
+                    Free cancellation
+                  </button>
+                  <button
+                    className={advanced.familyFriendly ? 'active' : ''}
+                    onClick={() =>
+                      setAdvanced((current) => ({
+                        ...current,
+                        familyFriendly: !current.familyFriendly,
+                      }))
+                    }
+                  >
+                    Family friendly
+                  </button>
+                </div>
+              </div>
+              <div className="filter-group">
+                <h4>Accessibility</h4>
+                <div className="chip-row">
+                  {accessibilityChoices.map((value) => (
+                    <button
+                      key={value}
+                      className={
+                        advanced.accessibility.includes(value) ? 'active' : ''
+                      }
+                      onClick={() =>
+                        setAdvanced((current) => ({
+                          ...current,
+                          accessibility: current.accessibility.includes(value)
+                            ? current.accessibility.filter(
+                                (item) => item !== value,
+                              )
+                            : [...current.accessibility, value],
+                        }))
+                      }
+                    >
+                      {value}
+                    </button>
+                  ))}
+                </div>
+                <small>Accessibility needs are never relaxed.</small>
+              </div>
+              <button
+                className="filter-reset"
+                onClick={() => setAdvanced(emptyAdvanced)}
+                disabled={activeFilterCount === 0}
+              >
+                Clear filters
+              </button>
+            </div>
+          )}
+
+          {relaxedPreferences.length > 0 && (
+            <div className="relaxation-notice" role="status">
+              <Sparkles size={16} />
+              <p>
+                No exact match, so we relaxed{' '}
+                <strong>{relaxedPreferences.join(', ')}</strong> to keep
+                bookable options on screen. Your accessibility needs were kept
+                intact.
+              </p>
+            </div>
+          )}
 
           {searching || bootstrapping ? (
             <div className="product-grid skeleton-grid">
@@ -714,7 +1045,7 @@ function App() {
             </div>
           ) : (
             <div className="product-grid">
-              {visibleProducts.slice(0, 8).map((product) => (
+              {visibleProducts.map((product) => (
                 <ProductCard
                   key={product.id}
                   product={product}

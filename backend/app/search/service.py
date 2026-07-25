@@ -3,7 +3,7 @@ import logging
 import re
 from collections import Counter
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -28,6 +28,8 @@ from app.common.ranking import (
 )
 from app.common.store import DemoStore, store
 from app.search.postgres import hybrid_search
+
+DATE_WIDEN_DAYS = 3
 
 SYNONYMS = {
     "kids": "family",
@@ -319,6 +321,99 @@ def _explanations(
     return reasons[:3]
 
 
+def _drop(field: str):
+    def mutate(filters: SearchFilters) -> None:
+        setattr(filters, field, None)
+
+    return mutate
+
+
+def _widen_dates(filters: SearchFilters) -> None:
+    if not filters.visit_start:
+        return
+    end = filters.visit_end or filters.visit_start
+    filters.visit_start = filters.visit_start - timedelta(days=DATE_WIDEN_DAYS)
+    filters.visit_end = end + timedelta(days=DATE_WIDEN_DAYS)
+
+
+# Ordered least-costly first. Accessibility requirements and explicit exclusions are
+# never relaxed: showing a wheelchair user an inaccessible tour is worse than showing
+# nothing at all.
+RELAXATION_STEPS: tuple[tuple[str, str, Any], ...] = (
+    ("max_duration_minutes", "maximum duration", _drop("max_duration_minutes")),
+    ("rating", "minimum rating", _drop("rating")),
+    ("instant_confirmation", "instant confirmation", _drop("instant_confirmation")),
+    ("free_cancellation", "free cancellation", _drop("free_cancellation")),
+    ("category", "category", _drop("category")),
+    ("indoor_outdoor", "indoor or outdoor preference", _drop("indoor_outdoor")),
+    ("language", "language", _drop("language")),
+    ("family_friendly", "family-friendly filter", _drop("family_friendly")),
+    ("visit_start", f"exact date (searched ±{DATE_WIDEN_DAYS} days)", _widen_dates),
+    ("max_total_price", "budget", _drop("max_total_price")),
+    ("destination", "destination", _drop("destination")),
+)
+
+
+def relax_until_results(
+    products: list[dict[str, Any]],
+    filters: SearchFilters,
+    party: Sequence[Participant],
+) -> tuple[list[dict[str, Any]], SearchFilters, list[str]]:
+    """Find results by progressively relaxing the least valuable constraints.
+
+    A zero-result page is the most common exit point in tourism shopping, so the
+    engine trades an exact match for a bookable one and reports what it changed.
+    """
+    eligible = [product for product in products if is_eligible(product, filters, party)]
+    if eligible:
+        return eligible, filters, []
+
+    working = filters.model_copy(deep=True)
+    relaxed: list[str] = []
+    for field, label, mutate in RELAXATION_STEPS:
+        if getattr(working, field) in (None, [], ""):
+            continue
+        mutate(working)
+        relaxed.append(label)
+        eligible = [
+            product for product in products if is_eligible(product, working, party)
+        ]
+        if eligible:
+            return eligible, working, relaxed
+    return [], working, relaxed
+
+
+FACET_FIELDS: tuple[tuple[str, str], ...] = (
+    ("destination", "destination"),
+    ("category", "category"),
+    ("indoor_outdoor", "indoor_outdoor"),
+)
+
+
+def _facets(
+    products: list[dict[str, Any]],
+    filters: SearchFilters,
+    party: Sequence[Participant],
+) -> dict[str, dict[str, int]]:
+    """Count each facet with its own filter removed.
+
+    Counting against the fully filtered set would collapse every facet to the
+    single selected value, which makes the counts useless for drilling sideways.
+    """
+    facets: dict[str, dict[str, int]] = {}
+    for facet_name, field in FACET_FIELDS:
+        scoped = filters.model_copy(deep=True)
+        setattr(scoped, field, None)
+        facets[facet_name] = dict(
+            Counter(
+                product[field]
+                for product in products
+                if is_eligible(product, scoped, party)
+            )
+        )
+    return facets
+
+
 class SearchService:
     def __init__(self, data: DemoStore = store, ai_provider: AIProvider | None = None) -> None:
         self.data = data
@@ -374,11 +469,9 @@ class SearchService:
                 items=[],
                 facets={},
             )
-        eligible = [
-            product
-            for product in available_products
-            if is_eligible(product, filters, request.party)
-        ]
+        eligible, filters, relaxed_preferences = relax_until_results(
+            available_products, filters, request.party
+        )
 
         tokens = _expanded_tokens(intent.search_text or request.query)
         lexical_scored: list[tuple[str, float]] = []
@@ -504,11 +597,7 @@ class SearchService:
         }
         final.sort(key=sorters[request.sort], reverse=True)
         page = final[: request.page_size]
-        facets = {
-            "destination": dict(Counter(product["destination"] for product in eligible)),
-            "category": dict(Counter(product["category"] for product in eligible)),
-            "indoor_outdoor": dict(Counter(product["indoor_outdoor"] for product in eligible)),
-        }
+        facets = _facets(available_products, filters, request.party)
         return SearchResponse(
             query_id=uuid4(),
             intent=intent,
@@ -518,4 +607,5 @@ class SearchService:
                 for product, _ in page
             ],
             facets=facets,
+            relaxed_preferences=relaxed_preferences,
         )
