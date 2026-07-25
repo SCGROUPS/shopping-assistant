@@ -301,6 +301,13 @@ forces `needs_review = False` and leaves status alone. Without it the queue
 refills itself with decisions already made, and a queue that does that stops
 being read.
 
+An override must also be reversible. Left alone it is a one-way door: the first
+typo fix freezes that field against every future supplier correction, and the
+operator has no way to say they were wrong. `DELETE /admin/experiences/{id}/
+overrides/{field}` hands the field back to the feed — it deliberately does not
+restore the previous value, because the point is to defer to the supplier, and
+the next import is what supplies it.
+
 ### Merchandising
 
 Three controls, each bounded by an argument rather than by taste:

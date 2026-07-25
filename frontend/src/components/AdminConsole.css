@@ -374,6 +374,39 @@
   border-color: #cfdcfb;
 }
 
+.ops-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.ops-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #fff;
+  border: 1px solid #cfdcfb;
+  border-radius: 999px;
+  padding: 2px 4px 2px 10px;
+  font-size: 11px;
+}
+
+.ops-chip button {
+  border: 0;
+  background: #dbe6fd;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 10px;
+  cursor: pointer;
+  color: #24406e;
+}
+
+.ops-chip button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .ops-history {
   list-style: none;
   margin: 0;

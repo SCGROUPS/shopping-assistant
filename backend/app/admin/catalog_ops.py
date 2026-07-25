@@ -409,6 +409,45 @@ async def update_experience(
     return await get_experience(experience_id)
 
 
+async def clear_override(
+    experience_id: UUID, field: str, principal: Principal
+) -> dict[str, Any]:
+    """Hand a field back to the supplier feed.
+
+    Without this an override is a one-way door: the moment an operator fixes a
+    typo, that field is frozen against every future import, so a later supplier
+    correction can never land. Clearing does not restore the old value - the
+    next import does that - because the supplier is the source of truth we are
+    deferring back to.
+    """
+    if field not in EDITABLE_FIELDS and field not in {"status"}:
+        raise ApiError(422, "Invalid edit", f"{field!r} is not an override", "invalid-edit")
+    factory = _require_db()
+    async with factory() as session, session.begin():
+        experience = await _load(session, experience_id)
+        override = await session.get(ExperienceOverride, experience.id)
+        held = dict(override.fields) if override is not None else {}
+        if field not in held:
+            raise ApiError(
+                404, "No override", f"{field!r} is not overridden", "override-not-found"
+            )
+        del held[field]
+        assert override is not None
+        override.fields = held
+        override.updated_by = principal.email
+
+        audit.record(
+            session,
+            principal,
+            action="catalog.clear_override",
+            entity_type="experience",
+            entity_id=experience.id,
+            summary=f"Released {field} on '{experience.title}' back to the supplier feed",
+            changes={field: {"from": "operator-managed", "to": "supplier-managed"}},
+        )
+    return await get_experience(experience_id)
+
+
 async def set_status(
     experience_id: UUID, status: str, principal: Principal, note: str = ""
 ) -> dict[str, Any]:

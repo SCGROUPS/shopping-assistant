@@ -70,6 +70,28 @@ test.describe('operator console', () => {
     expect(errors, `console errors: ${errors.join(' | ')}`).toEqual([])
   })
 
+  test('an override can be released back to the supplier feed', async ({ page }) => {
+    // Without this an edit is a one-way door: the field is frozen against every
+    // future supplier correction and the operator cannot undo it.
+    await page.goto('/admin')
+    await page.getByLabel('Operator key').fill(KEY)
+    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.getByRole('button', { name: 'Catalogue' }).click()
+    await page.locator('.ops-table tbody tr').first().click()
+
+    const meeting = page.getByLabel('Meeting point')
+    await expect(meeting).toBeEnabled()
+    // Unique per run: filling the value already there fires no change event, so
+    // Save stays disabled and the test would depend on what ran before it.
+    await meeting.fill(`Released-field browser check ${Date.now()}`)
+    await page.getByRole('button', { name: 'Save details' }).click()
+
+    const chip = page.locator('.ops-chip', { hasText: 'meeting_point' })
+    await expect(chip).toBeVisible()
+    await chip.getByRole('button', { name: 'release' }).click()
+    await expect(chip).toHaveCount(0)
+  })
+
   test('rejects a configuration change the server will not accept', async ({ page }) => {
     await page.goto('/admin')
     await page.getByLabel('Operator key').fill(KEY)

@@ -11,6 +11,7 @@ import {
   AdminError,
   changeMerchandising,
   changeStatus,
+  clearOverride,
   fetchAudit,
   fetchCatalog,
   fetchExperience,
@@ -252,9 +253,24 @@ function Editor({
         <div className="ops-callout ops-callout-quiet">
           <strong>Protected from re-import</strong>
           <span>
-            {row.overridden_fields.join(', ')} — the supplier feed will no longer
-            overwrite these.
+            The supplier feed will no longer overwrite these. Release one to let
+            the next import manage it again.
           </span>
+          <div className="ops-chips">
+            {row.overridden_fields.map((field) => (
+              <span key={field} className="ops-chip">
+                {field}
+                <button
+                  type="button"
+                  disabled={busy || !can('catalog:write')}
+                  title={`Release ${field} back to the supplier feed`}
+                  onClick={() => void run(() => clearOverride(row.id, field))}
+                >
+                  release
+                </button>
+              </span>
+            ))}
+          </div>
         </div>
       ) : null}
 

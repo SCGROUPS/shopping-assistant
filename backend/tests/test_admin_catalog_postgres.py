@@ -123,6 +123,45 @@ async def test_an_operator_correction_survives_the_next_import(factory):
     assert override.updated_by == OPERATOR.email
 
 
+async def test_a_released_field_goes_back_to_tracking_the_supplier(factory):
+    """An override must not be a one-way door.
+
+    Once a field is overridden the supplier can never correct it again, so
+    without a release the first typo fix freezes that field forever - and the
+    operator has no way to tell the system it was wrong.
+    """
+    await _import()
+    before = await _only(factory)
+    await catalog_ops.update_experience(
+        before.id, {"category": "Culture", "duration_minutes": 300}, OPERATOR
+    )
+
+    released = await catalog_ops.clear_override(before.id, "category", OPERATOR)
+    assert released["overridden_fields"] == ["duration_minutes"]
+
+    # Releasing does not restore the old value on its own; the import does.
+    await _import()
+
+    after = await _only(factory)
+    assert after.category == "Day trip"
+    assert after.duration_minutes == 300
+
+    entries = await catalog_ops.recent_audit(entity_id=str(after.id))
+    assert any(entry["action"] == "catalog.clear_override" for entry in entries)
+
+
+async def test_releasing_a_field_nobody_overrode_is_refused(factory):
+    """Silence here would let the console show a release that did nothing."""
+    await _import()
+    experience = await _only(factory)
+    from app.common.errors import ApiError
+
+    with pytest.raises(ApiError) as problem:
+        await catalog_ops.clear_override(experience.id, "category", OPERATOR)
+    assert problem.value.status == 404
+    assert problem.value.code == "override-not-found"
+
+
 async def test_an_unreviewed_import_is_held_out_of_the_storefront(factory):
     """Classification failed, so the listing is not trustworthy enough to sell.
 

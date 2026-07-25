@@ -103,6 +103,13 @@ async def update_experience(
     return await catalog_ops.update_experience(experience_id, changes, principal)
 
 
+@router.delete("/experiences/{experience_id}/overrides/{field}")
+async def clear_override(
+    experience_id: UUID, field: str, principal: CatalogWrite
+) -> dict[str, Any]:
+    return await catalog_ops.clear_override(experience_id, field, principal)
+
+
 @router.post("/experiences/{experience_id}/status")
 async def change_status(
     experience_id: UUID, principal: CatalogPublish, body: StatusChange
