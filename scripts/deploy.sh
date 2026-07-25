@@ -36,15 +36,51 @@ if [[ -n "$ai_account_name" ]]; then
   deployment_parameters+=(aiAccountName="$ai_account_name")
 fi
 
-az deployment sub create \
-  --name "$deployment" \
-  --location "$location" \
-  --template-file infra/bicep/main.bicep \
-  --parameters \
-    "${deployment_parameters[@]}" \
-    containerImage="$bootstrap_image" \
-    buildRevision="$bootstrap_revision" \
-  --output none
+# This script runs the same ARM deployment twice — once to bootstrap the
+# registry, once with the real image. Azure Database for PostgreSQL rejects a
+# configuration write while the server is still settling from a previous
+# operation ("ServerIsBusy"), so the second deployment can fail purely because
+# the first one just succeeded. The condition is transient and clears on its
+# own, so retry it rather than failing a deployment that is actually fine.
+deploy_stack() {
+  local image="$1"
+  local revision="$2"
+  local attempt=1
+  local max_attempts=4
+  local delay=90
+  local log
+
+  log="$(mktemp)"
+  while true; do
+    if az deployment sub create \
+      --name "$deployment" \
+      --location "$location" \
+      --template-file infra/bicep/main.bicep \
+      --parameters \
+        "${deployment_parameters[@]}" \
+        containerImage="$image" \
+        buildRevision="$revision" \
+      --output none 2>"$log"; then
+      rm -f "$log"
+      return 0
+    fi
+
+    # Only retry the known-transient condition. Anything else is a real
+    # failure and must surface immediately rather than after four waits.
+    if (( attempt >= max_attempts )) || ! grep -qiE 'ServerIsBusy|busy processing another operation' "$log"; then
+      cat "$log" >&2
+      rm -f "$log"
+      return 1
+    fi
+
+    echo "Azure reported a busy server; retrying in ${delay}s (attempt ${attempt}/${max_attempts})." >&2
+    sleep "$delay"
+    attempt=$(( attempt + 1 ))
+    delay=$(( delay * 2 ))
+  done
+}
+
+deploy_stack "$bootstrap_image" "$bootstrap_revision"
 
 registry="$(az deployment sub show \
   --name "$deployment" \
@@ -73,15 +109,7 @@ login_server="$(az acr show \
 
 build_revision="build-$(date -u +%Y%m%d%H%M%S)"
 
-az deployment sub create \
-  --name "$deployment" \
-  --location "$location" \
-  --template-file infra/bicep/main.bicep \
-  --parameters \
-    "${deployment_parameters[@]}" \
-    buildRevision="$build_revision" \
-    containerImage="${login_server}/vietra:latest" \
-  --output none
+deploy_stack "${login_server}/vietra:latest" "$build_revision"
 
 az containerapp job start \
   --resource-group "$resource_group" \
