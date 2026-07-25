@@ -1240,6 +1240,19 @@ at the attempt limit, a repeatable error strands them permanently: invisible to
 the queue, never retried, with the backlog reading empty. Each item is wrapped
 individually, so one bad record costs one record.
 
+**The catalogue is the authority on whether a document is current, not the
+work item.** The worker re-reads the record inside its commit transaction and
+compares its output against what the catalogue says right now. A work item
+records what some caller *asked for*, and that can be older than what is
+committed — reconciliation reads, computes, then enqueues, so a request can
+arrive describing a version an edit has already superseded, and the item can be
+`done` by then. Treating the work item as the truth would make the worker
+discard a correct document, consume an attempt, and repeat until the item was
+retired as `failed`: a failure that never happened, on a product indexed
+correctly the whole time. When the catalogue really has moved, the item is
+handed back carrying the fingerprint now wanted, and the attempt is *not* spent
+— being overtaken is not failing.
+
 **Reconciliation revives failed work; it never overwrites live work.** These
 pull in opposite directions and both matter. A `failed` item is by definition
 not indexed, so any request to index it should retry it — a conflict clause
@@ -1293,7 +1306,25 @@ tagged `VI`, producing a document that is built, stored, searchable, and empty.
 process, so every deploy cancels it mid-batch. Without an explicit release, up
 to a full batch stays leased for the lease duration and each redeploy burns
 another attempt against the limit — a frequently-deployed service could exhaust
-items without a single genuine failure.
+items without a single genuine failure. The item currently being processed stays
+in that outstanding set for the whole of its turn, *including while its failure
+is being recorded*, because the transition is exactly where a cancellation
+leaves it held with its attempt already spent.
+
+**An item can end up leased, out of attempts, and owned by nobody.** Leasing
+requires `attempts < MAX_ATTEMPTS`, so if the failure transition itself cannot
+be written — a database error while recording it, a process that dies between
+leasing and reporting — the row keeps the status `leased` after its lease
+expires and is never selected again. Not queued, not failed, not held: invisible
+to the queue, the backlog and every retry. Leasing therefore begins by retiring
+expired leases with no attempts left, and `_fail` logs its own failure rather
+than suppressing it, so the state has both a recovery and an explanation.
+
+**A drain that stops is not a queue that is empty.** The loop ends when a round
+builds nothing, and a round in which every item failed transiently returns them
+all to `queued` and builds none. The repair command therefore reports the
+remaining backlog by status and exits non-zero, which is what makes "the job
+succeeded" a claim about the index rather than about the command.
 
 **The catalog job drains too, and this is not redundancy.** The web app runs
 with `minReplicas: 0`, so the in-process worker only exists while the app is
@@ -1585,6 +1616,13 @@ first, then revision 2's.
 | **A 500-document drain is a repair command** | A construction-version bump enqueues ~3,000 locale documents; a bounded drain exits successfully having fixed a sixth of them. The bound belongs to the in-process worker only (§9.4) |
 | **Normalising `source_language` where it is read is sufficient** | `indexed_locales` lowercased and `resolution_chain` did not, so a record tagged `VI` would be indexed under `vi` with a chain looking for `VI` — a document built, stored, searchable and empty. It is normalised on write (§9.4) |
 | **Reconciling the catalogue in one transaction is fine at this size** | It is `experiences × (locales + 1)` queries holding one snapshot; it pages by keyset and commits per page, so an interrupted pass keeps its work (§9.4) |
+| **A work item's fingerprint says what the document should be** | It says what a caller asked for, which reconciliation can make older than what is committed. Compared against it, the worker discards correct documents and retires the item as `failed` after five attempts that never failed (§9.4) |
+| **`only_if_idle` closes the reconciliation race** | It only covers the interleaving where the newer work is still pending. If the worker finished first the item is `done`, the stale request is accepted, and the damage is the same. The catalogue re-read at commit is what closes it (§9.4) |
+| **Leasing recovers any item a worker abandons** | Not one whose lease expired on its final attempt: leasing requires `attempts < MAX_ATTEMPTS`, so it stays `leased` forever, invisible to the queue and the backlog alike. Expired leases with no attempts left are retired on the way in (§9.4) |
+| **Dropping the current item from the outstanding set before processing it is safe** | A cancellation arriving while its failure was being recorded then released every later lease and left this one held with its attempt spent (§9.4) |
+| **A drain that returns zero means the queue is empty** | A round in which every item failed transiently returns them to `queued` and builds nothing, so the repair command exited successfully having rebuilt none of the index it exists to repair (§9.4) |
+| **A default argument reads the module constant** | `page_size: int = RECONCILE_PAGE_SIZE` binds at import, so the paging test monkeypatching the constant ran a single page of 200 and proved nothing about paging (§9.4) |
+| **Normalising `source_language` in the chain builder is enough** | Field resolution compared each candidate against the raw column, so a record tagged `VI` resolved no fields at all — the one failure mode the normalisation was added to prevent (§9.4) |
 | **`information_schema.data_type` compares column types** | It reports every `varchar(n)` as "character varying" and every `vector(n)` as "USER-DEFINED", so a migration creating `vector(1536)` against a model wanting `vector(512)` compared equal. `format_type` is what compares (§13) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,

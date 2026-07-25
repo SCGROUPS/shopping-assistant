@@ -17,7 +17,7 @@ from uuid import uuid4
 import pytest
 from conftest import create_postgres_schema, reset_postgres
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.admin import catalog_ops, settings_ops
@@ -1065,3 +1065,240 @@ async def test_reconciliation_covers_a_catalogue_larger_than_one_page(factory, m
     # Every product, not just the first page of two.
     assert stale >= experiences * len(SUPPORTED_LOCALES)
     assert queued == stale
+
+
+async def test_a_stale_reconciliation_request_does_not_fail_a_current_document(factory):
+    """A work item records what someone asked for, not what is true.
+
+    Reconciliation reads the catalogue, computes a fingerprint, and enqueues
+    afterwards. An edit landing in that window is indexed by the worker first,
+    so the item is `done` when the stale request arrives - and "only write over
+    idle items" happily accepts it. The worker then rebuilds the *current*
+    text, finds the work item asking for the previous version, and discards a
+    correct document. Repeated to the attempt limit that retires the item as
+    `failed`: a failure that never happened, on a product that was indexed
+    correctly the whole time.
+    """
+    from app.catalog import indexing
+    from app.common.models import ExperienceSearchDocument, IndexWorkItem
+
+    await _import()
+    experience = await _only(factory)
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+
+    async with factory() as db:
+        row = (
+            await db.execute(
+                select(Experience, Destination.name)
+                .join(Destination, Destination.id == Experience.destination_id)
+                .where(Experience.id == experience.id)
+            )
+        ).first()
+        assert row is not None
+        stale_fingerprint = indexing.index_fingerprint(
+            await indexing.resolved_document_text(db, row[0], row[1], "en"), "en"
+        )
+
+    # The edit is made and fully indexed before the stale request arrives.
+    await catalog_ops.update_experience(experience.id, {"title": "Indexed Already"}, OPERATOR)
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+
+    async with factory() as db, db.begin():
+        await indexing.enqueue_reindex(
+            db, experience.id, "en", stale_fingerprint, only_if_idle=True
+        )
+
+    for _ in range(indexing.MAX_ATTEMPTS + 1):
+        await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+
+    async with factory() as db:
+        item = await db.scalar(
+            select(IndexWorkItem).where(
+                IndexWorkItem.experience_id == experience.id,
+                IndexWorkItem.locale == "en",
+            )
+        )
+        document = await db.scalar(
+            select(ExperienceSearchDocument).where(
+                ExperienceSearchDocument.experience_id == experience.id,
+                ExperienceSearchDocument.locale == "en",
+            )
+        )
+    assert item is not None
+    assert item.status == "done"
+    assert document is not None
+    assert "Indexed Already" in document.document_text
+
+
+async def test_a_lease_that_expired_with_no_attempts_left_is_retired(factory):
+    """An item can end up leased, out of attempts, and owned by nobody.
+
+    Leasing requires `attempts < MAX_ATTEMPTS`, so if the failure transition
+    itself could not be written - a database error while recording it, a
+    process that died between leasing and reporting - the row keeps the status
+    `leased` after its lease expires and is never selected again. It is not
+    queued, not failed and not held: invisible to the queue, to the backlog and
+    to every retry, permanently.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.catalog import indexing
+    from app.common.models import IndexWorkItem
+
+    await _import()
+    experience = await _only(factory)
+
+    async with factory() as db, db.begin():
+        await db.execute(
+            update(IndexWorkItem)
+            .where(
+                IndexWorkItem.experience_id == experience.id,
+                IndexWorkItem.locale == "vi",
+            )
+            .values(
+                status="leased",
+                lease_token=uuid4(),
+                leased_until=datetime.now(UTC) - timedelta(hours=1),
+                attempts=indexing.MAX_ATTEMPTS,
+            )
+        )
+
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+
+    async with factory() as db:
+        item = await db.scalar(
+            select(IndexWorkItem).where(
+                IndexWorkItem.experience_id == experience.id,
+                IndexWorkItem.locale == "vi",
+            )
+        )
+    assert item is not None
+    assert item.status == "failed"
+    assert item.lease_token is None
+
+
+async def test_a_shutdown_while_recording_a_failure_still_releases_the_item(factory):
+    """Cancellation during the failure transition must not strand the item.
+
+    The item being failed is the one item the release path used to skip: it had
+    already been dropped from the outstanding set before processing began. A
+    deploy landing while its failure was being committed released every later
+    lease and left this one held, with its attempt spent and nothing pointing
+    at it.
+    """
+    import asyncio
+
+    from app.catalog import indexing
+    from app.common.models import IndexWorkItem
+
+    await _import()
+    experience = await _only(factory)
+
+    original_process = indexing._process_one
+    original_fail = indexing._fail
+
+    async def always_broken(*args, **kwargs):
+        raise RuntimeError("indexing is broken")
+
+    async def cancelled_fail(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    indexing._process_one = always_broken
+    indexing._fail = cancelled_fail
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+    finally:
+        indexing._process_one = original_process
+        indexing._fail = original_fail
+
+    async with factory() as db:
+        items = list(
+            (
+                await db.scalars(
+                    select(IndexWorkItem).where(IndexWorkItem.experience_id == experience.id)
+                )
+            ).all()
+        )
+    assert items
+    assert all(item.status == "queued" for item in items)
+    assert all(item.lease_token is None for item in items)
+    assert all(item.attempts == 0 for item in items)
+
+
+async def test_the_production_reconcile_path_commits_every_page(factory, monkeypatch):
+    """`run_reconcile` is what production runs, so it is what has to be tested.
+
+    It differs from the in-transaction helper in exactly the ways that can go
+    wrong: it commits between pages and carries a cursor across transactions.
+    A pass that reconciled the first page and stopped would report the rest of
+    the catalogue healthy, which is indistinguishable from success.
+    """
+    from app.catalog import indexing
+    from app.common.models import IndexWorkItem
+
+    await upsert_catalog(
+        [
+            to_catalog_product(
+                {**RAW, "product_id": f"OPS{n}", "name": f"Marble Mountains Half Day {n}"},
+                FACETS,
+                days=3,
+            )
+            for n in range(1, 8)
+        ],
+        supplier_external_id="TRIPPASS",
+        supplier_name="Trippass",
+        ai_provider=_StubEmbedder(),
+    )
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+
+    monkeypatch.setattr(database, "session_factory", factory, raising=False)
+    monkeypatch.setattr(indexing, "RECONCILE_PAGE_SIZE", 2)
+    monkeypatch.setattr(indexing, "DOCUMENT_VERSION", f"{indexing.DOCUMENT_VERSION}-next")
+
+    pages: list[int] = []
+    original = indexing.reconcile_page
+
+    async def counting(session, **kwargs):
+        pages.append(1)
+        return await original(session, **kwargs)
+
+    monkeypatch.setattr(indexing, "reconcile_page", counting)
+    stale = await indexing.run_reconcile()
+
+    async with factory() as db:
+        queued = await db.scalar(
+            select(func.count())
+            .select_from(IndexWorkItem)
+            .where(IndexWorkItem.status == "queued")
+        )
+
+    # Seven products at two per page is four pages plus the empty one that ends
+    # the walk - if the cursor did not survive the commit, this would be two.
+    assert len(pages) == 5
+    assert stale == 7 * len(SUPPORTED_LOCALES)
+    assert queued == stale
+
+
+async def test_a_drain_that_builds_nothing_still_reports_its_backlog(factory, monkeypatch):
+    """"The queue stopped producing" is not "the queue is empty".
+
+    A round in which every item fails transiently returns them all to `queued`
+    and builds none, which ends the drain. Without a backlog report the repair
+    command exits successfully having rebuilt nothing at all, and the job that
+    exists to guarantee the index is current is the one claiming it is.
+    """
+    from app.catalog import indexing
+    from app.common import database
+
+    await _import()
+    monkeypatch.setattr(database, "session_factory", factory, raising=False)
+    monkeypatch.setattr(
+        "app.assistant.provider.build_ai_provider", lambda: _StubEmbedder(fail=True)
+    )
+
+    built = await indexing.drain_index_queue(limit=None)
+    assert built == 0
+
+    backlog = await indexing.index_backlog()
+    assert backlog.get("queued", 0) >= len(SUPPORTED_LOCALES) - 1

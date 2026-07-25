@@ -25,7 +25,7 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import case, select, true, update
+from sqlalchemy import case, func, select, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -230,9 +230,11 @@ async def resolved_document_text(
     ).scalars()
     translations = {row.locale: row for row in rows}
 
+    source = source_locale(experience)
+
     def resolve(field: str) -> str:
         for candidate in chain:
-            if candidate == experience.source_language:
+            if candidate == source:
                 value = getattr(experience, field, "") or ""
                 if value:
                     return value
@@ -378,6 +380,31 @@ async def _lease(session: AsyncSession, limit: int) -> list[tuple[Any, ...]]:
     """
     token = uuid.uuid4()
     now = datetime.now(UTC)
+
+    # Retire leases that expired with no attempts left. Leasing requires
+    # `attempts < MAX_ATTEMPTS`, so an item whose lease expired on its final
+    # attempt is never selected again while its status still reads `leased` -
+    # not queued, not failed, not held by anyone. That happens whenever the
+    # transition itself could not be written: a database error during `_fail`,
+    # or a process that died between leasing and recording the outcome. Without
+    # this sweep those rows are invisible to the queue, to the backlog count and
+    # to any retry, forever.
+    await session.execute(
+        update(IndexWorkItem)
+        .where(
+            IndexWorkItem.status == "leased",
+            IndexWorkItem.leased_until < now,
+            IndexWorkItem.attempts >= MAX_ATTEMPTS,
+        )
+        .values(
+            status="failed",
+            lease_token=None,
+            leased_until=None,
+            error_detail="lease expired with no attempts remaining",
+            updated_at=now,
+        )
+    )
+
     candidates = (
         select(IndexWorkItem.experience_id, IndexWorkItem.locale)
         .where(
@@ -433,13 +460,18 @@ async def process_index_work(
     remaining = list(leases)
     try:
         for index, (experience_id, locale, token) in enumerate(leases):
-            remaining = list(leases[index + 1 :])
+            # The current item stays in `remaining` for the whole iteration,
+            # including while its failure is being recorded. Dropping it first
+            # meant a cancellation arriving during `_fail` released every later
+            # lease and left this one held with its attempt spent. Releasing an
+            # item that `_fail` already moved is harmless - the update requires
+            # the row to still be `leased` under this token.
+            remaining = list(leases[index:])
             try:
                 completed += await _process_one(
                     session_factory, provider, experience_id, locale, token, embeddings
                 )
             except asyncio.CancelledError:
-                remaining = list(leases[index:])
                 raise
             except Exception:  # noqa: BLE001 - one bad record must not strand the batch
                 # Every failure has to reach the same transition, not just the
@@ -451,6 +483,7 @@ async def process_index_work(
                 # the queue and any retry.
                 logger.exception("Indexing failed for %s/%s", experience_id, locale)
                 await _fail(session_factory, experience_id, locale, token, "indexing failed")
+            remaining = list(leases[index + 1 :])
         remaining = []
     except asyncio.CancelledError:
         # A shutdown mid-batch would otherwise leave every unstarted item leased
@@ -470,7 +503,12 @@ async def _fail(
     every status view reports it as pending, so exhaustion has to be an explicit
     terminal state rather than the absence of progress.
     """
-    with suppress(Exception):
+    # Logged rather than suppressed. When the original error is a database
+    # error, the transition is the operation most likely to fail too - and a
+    # silent failure here leaves the item `leased` with its attempt consumed,
+    # which is precisely the state nothing else was looking for. The expired
+    # lease sweep in `_lease` is what recovers it; this is what explains it.
+    try:
         async with session_factory() as session, session.begin():
             await session.execute(
                 update(IndexWorkItem)
@@ -490,6 +528,8 @@ async def _fail(
                     updated_at=datetime.now(UTC),
                 )
             )
+    except Exception:  # noqa: BLE001 - recovery is the sweep, not a raise here
+        logger.exception("Could not record the failure of %s/%s", experience_id, locale)
 
 
 async def _release(session_factory: Any, leases: Sequence[tuple[Any, str, Any]]) -> None:
@@ -580,10 +620,47 @@ async def _process_one(
                 .with_for_update()
             )
         ).scalar_one_or_none()
-        if current is None or current.lease_token != token or current.fingerprint != fingerprint:
-            # Someone edited the record or took the lease from us. Our
-            # output describes content that no longer exists; discard it
-            # and leave the row for whoever holds it now.
+        if current is None or current.lease_token != token:
+            # The lease was taken from us. Whoever holds it now owns the
+            # outcome, and our document is theirs to supersede.
+            return 0
+
+        # The catalogue decides whether our output is current - not the work
+        # item. A work item records what some caller *asked for*, and that can
+        # be older than what is committed: reconciliation reads the catalogue,
+        # computes a fingerprint, and enqueues afterwards, so a request can
+        # arrive describing a version an edit has already superseded. Comparing
+        # our output against the work item would then discard a correct
+        # document, consume an attempt, and repeat until the item was retired
+        # as failed - a failure that never happened, on a document that was
+        # right the first time.
+        latest = (
+            await session.execute(
+                select(Experience, Destination.name)
+                .join(Destination, Destination.id == Experience.destination_id)
+                .where(Experience.id == experience_id)
+            )
+        ).first()
+        if latest is None:
+            current.status = "done"
+            current.lease_token = None
+            current.leased_until = None
+            current.updated_at = datetime.now(UTC)
+            return 0
+
+        desired = index_fingerprint(
+            await resolved_document_text(session, latest[0], latest[1], locale), locale
+        )
+        if desired != fingerprint:
+            # The catalogue genuinely moved while we were embedding. Record
+            # what is wanted now and hand the item back without spending the
+            # attempt: nothing failed, we were simply overtaken.
+            current.fingerprint = desired
+            current.status = "queued"
+            current.lease_token = None
+            current.leased_until = None
+            current.attempts = max(current.attempts - 1, 0)
+            current.updated_at = datetime.now(UTC)
             return 0
 
         await upsert_search_document(
@@ -593,6 +670,9 @@ async def _process_one(
             document_text=text,
             embedding=embedding,
         )
+        # The item may have asked for an older fingerprint than the one we just
+        # satisfied; what is recorded is what the document actually holds.
+        current.fingerprint = desired
         current.status = "done"
         current.lease_token = None
         current.leased_until = None
@@ -629,7 +709,7 @@ async def reconcile_page(
     session: AsyncSession,
     *,
     after_id: uuid.UUID | None = None,
-    page_size: int = RECONCILE_PAGE_SIZE,
+    page_size: int | None = None,
 ) -> tuple[int, uuid.UUID | None]:
     """One page of reconciliation. Returns what it enqueued and where it stopped.
 
@@ -641,14 +721,20 @@ async def reconcile_page(
     while the pass runs cannot make it skip or repeat one.
 
     Returns `None` as the cursor when the catalogue is exhausted.
+
+    `page_size` resolves the module constant at call time rather than binding it
+    as a default, so the page size is a knob rather than a value frozen at
+    import - which also means a test can actually make the catalogue span more
+    than one page.
     """
+    size = page_size if page_size is not None else RECONCILE_PAGE_SIZE
     rows = (
         await session.execute(
             select(Experience, Destination.name)
             .join(Destination, Destination.id == Experience.destination_id)
             .where(Experience.id > after_id if after_id is not None else true())
             .order_by(Experience.id)
-            .limit(page_size)
+            .limit(size)
         )
     ).all()
     if not rows:
@@ -725,6 +811,23 @@ async def drain_index_queue(*, limit: int | None = 500) -> int:
             return total
         if limit is not None and total >= limit:
             return total
+
+
+async def index_backlog() -> dict[str, int]:
+    """Work items by status, for a command that has to report what it left behind."""
+    from app.common.database import session_factory
+
+    if session_factory is None:
+        return {}
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(IndexWorkItem.status, func.count())
+                .where(IndexWorkItem.status != "done")
+                .group_by(IndexWorkItem.status)
+            )
+        ).all()
+    return {status: count for status, count in rows}
 
 
 async def index_worker_loop(interval_seconds: float = 15.0) -> None:

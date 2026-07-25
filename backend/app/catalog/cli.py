@@ -5,7 +5,7 @@ import json
 from app.admin.cli import create_operator, list_operators
 from app.catalog.db_seed import refresh_availability, seed_database
 from app.catalog.importer import import_trippass
-from app.catalog.indexing import drain_index_queue, run_reconcile
+from app.catalog.indexing import drain_index_queue, index_backlog, run_reconcile
 from app.catalog.seed import build_seed_catalog
 from app.common.store import store
 
@@ -75,6 +75,16 @@ def main() -> None:
         queued = asyncio.run(run_reconcile())
         count = asyncio.run(drain_index_queue(limit=None))
         print(f"Reconciled {queued} stale locales; rebuilt {count} search documents")
+        # The drain stops when a round builds nothing, which is not the same as
+        # the queue being empty: a round in which every item failed transiently
+        # returns its items to `queued` and builds none. Reporting the backlog
+        # and exiting non-zero is what turns "the job succeeded" into a claim
+        # about the index rather than about the command.
+        backlog = asyncio.run(index_backlog())
+        if backlog:
+            summary = ", ".join(f"{count} {status}" for status, count in sorted(backlog.items()))
+            print(f"Index backlog not empty: {summary}")
+            raise SystemExit(1)
         return
     if args.command == "seed-db":
         count = asyncio.run(seed_database(force=args.force))
