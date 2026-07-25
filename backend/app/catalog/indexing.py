@@ -224,6 +224,42 @@ async def mark_locale_indexed(
     )
 
 
+async def retire_satisfied_work(
+    session: AsyncSession,
+    experience_id: uuid.UUID,
+    locale: str,
+    fingerprint: str,
+) -> None:
+    """Clear a request the stored document already satisfies.
+
+    A work item can fail while something else brings the document current - a
+    direct import of unchanged text, or a request that succeeded on another
+    path. Reconciliation then walks past it, because the document *is* current
+    and there is nothing to enqueue, and the terminal `failed` row survives
+    forever. Every repair job after that reports a backlog it can never empty,
+    so a deployment fails permanently on an index that is completely healthy.
+
+    Guarded by the fingerprint and restricted to unleased rows, so a request for
+    a version this document does not hold is never cleared.
+    """
+    await session.execute(
+        update(IndexWorkItem)
+        .where(
+            IndexWorkItem.experience_id == experience_id,
+            IndexWorkItem.locale == locale,
+            IndexWorkItem.status.in_(["queued", "failed"]),
+            IndexWorkItem.fingerprint == fingerprint,
+        )
+        .values(
+            status="done",
+            lease_token=None,
+            leased_until=None,
+            error_detail=None,
+            updated_at=datetime.now(UTC),
+        )
+    )
+
+
 async def resolution_chain(experience: Experience, locale: str) -> tuple[str, ...]:
     """Locales to try for `locale`, in order, for this particular record.
 
@@ -799,6 +835,7 @@ async def reconcile_page(
             text = await resolved_document_text(session, experience, destination_name, locale)
             fingerprint = index_fingerprint(text, locale)
             if stored.get(locale) == fingerprint:
+                await retire_satisfied_work(session, experience.id, locale, fingerprint)
                 continue
             # Counted from what the write actually changed, not from what we
             # intended, so a reconciliation that collided with pending work does
@@ -856,7 +893,7 @@ async def drain_index_queue(*, limit: int | None = 500) -> int:
 
 
 async def run_reindex(
-    *, settle_seconds: float = 90.0, poll_seconds: float = 3.0
+    *, settle_seconds: float = LEASE_SECONDS + 120.0, poll_seconds: float = 3.0
 ) -> tuple[int, int, dict[str, int]]:
     """Reconcile, drain, and wait for work this process cannot take itself.
 
@@ -869,6 +906,12 @@ async def run_reindex(
 
     Leased and queued rows are therefore treated as in flight and waited on to a
     bound. A `failed` row is terminal by definition and returns immediately.
+
+    The window has to outlast a lease. A worker holding a live lease is doing
+    nothing wrong, and this process cannot take that work until the lease
+    expires - so a window shorter than `LEASE_SECONDS` fails the deployment for
+    a healthy replica that was simply slow, which is exactly what a request to
+    an embedding provider with no explicit timeout can be.
     """
     reconciled = await run_reconcile()
     built = 0

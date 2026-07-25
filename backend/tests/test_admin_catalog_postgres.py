@@ -1449,3 +1449,132 @@ async def test_the_repair_job_does_not_wait_out_a_terminal_failure(factory, monk
 
     assert backlog.get("failed", 0) >= 1
     assert elapsed < 10
+
+
+async def test_a_re_import_during_an_outage_keeps_the_healthy_embedding(factory):
+    """A provider outage must not downgrade a document that was already right.
+
+    The fan-out only enqueues locales whose stored document disagrees with what
+    it should be. An unchanged re-import agrees, so nothing is enqueued - and if
+    the import then wrote its deterministic fallback anyway, it would replace a
+    real embedding with numbers unrelated to any query, with no work item left
+    anywhere to put it back. The catalogue would look untouched and the product
+    would be gone from semantic search.
+    """
+    from app.catalog import indexing
+    from app.common.models import IndexWorkItem
+
+    await _import()
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+    experience = await _only(factory)
+
+    async with factory() as db:
+        before = await db.scalar(
+            select(ExperienceSearchDocument).where(
+                ExperienceSearchDocument.experience_id == experience.id,
+                ExperienceSearchDocument.locale == "en",
+            )
+        )
+    assert before is not None
+    assert before.embedding_model == indexing.EMBEDDING_MODEL
+
+    await upsert_catalog(
+        [to_catalog_product(RAW, FACETS, days=3)],
+        supplier_external_id="TRIPPASS",
+        supplier_name="Trippass",
+        ai_provider=_StubEmbedder(fail=True),
+    )
+
+    async with factory() as db:
+        after = await db.scalar(
+            select(ExperienceSearchDocument).where(
+                ExperienceSearchDocument.experience_id == experience.id,
+                ExperienceSearchDocument.locale == "en",
+            )
+        )
+        outstanding = list(
+            (
+                await db.scalars(
+                    select(IndexWorkItem).where(
+                        IndexWorkItem.experience_id == experience.id,
+                        IndexWorkItem.status != "done",
+                    )
+                )
+            ).all()
+        )
+    assert after is not None
+    assert after.embedding_model == indexing.EMBEDDING_MODEL
+    assert after.index_fingerprint == before.index_fingerprint
+    assert outstanding == []
+
+
+async def test_a_failure_the_document_has_outlived_stops_blocking_the_repair_job(factory):
+    """A terminal row for work something else completed must not be terminal forever.
+
+    The document can be brought current by another path while a request for it
+    is failing - a direct import of unchanged text, most obviously. The
+    reconciliation pass then walks straight past, because the document really is
+    current and there is nothing to enqueue, and the `failed` row survives every
+    pass. Every repair job after that reports a backlog it cannot empty, so
+    deployments fail permanently on an index that is completely healthy.
+    """
+    from app.catalog import indexing
+    from app.common.models import IndexWorkItem
+
+    await _import()
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+    experience = await _only(factory)
+
+    async with factory() as db:
+        current = await db.scalar(
+            select(ExperienceSearchDocument.index_fingerprint).where(
+                ExperienceSearchDocument.experience_id == experience.id,
+                ExperienceSearchDocument.locale == "vi",
+            )
+        )
+    assert current is not None
+
+    # The document is current; the request for it is terminally failed.
+    async with factory() as db, db.begin():
+        await db.execute(
+            update(IndexWorkItem)
+            .where(
+                IndexWorkItem.experience_id == experience.id,
+                IndexWorkItem.locale == "vi",
+            )
+            .values(
+                status="failed",
+                fingerprint=current,
+                attempts=indexing.MAX_ATTEMPTS,
+                error_detail="embedding failed",
+            )
+        )
+
+    async with factory() as db, db.begin():
+        await indexing.reconcile_index(db)
+
+    async with factory() as db:
+        item = await db.scalar(
+            select(IndexWorkItem).where(
+                IndexWorkItem.experience_id == experience.id,
+                IndexWorkItem.locale == "vi",
+            )
+        )
+    assert item is not None
+    assert item.status == "done"
+    assert item.error_detail is None
+
+
+async def test_the_repair_job_outwaits_a_live_lease(factory):
+    """The settle window is meaningless if it is shorter than a lease.
+
+    A worker holding a live lease is doing nothing wrong, and the repair job
+    cannot take that work until the lease expires. A window shorter than the
+    lease therefore fails the deployment for a replica that was merely slow -
+    which is what a request to an embedding provider with no explicit timeout
+    can be.
+    """
+    from app.catalog import indexing
+
+    assert indexing.run_reindex.__kwdefaults__ is not None
+    assert indexing.run_reindex.__kwdefaults__["settle_seconds"] > indexing.LEASE_SECONDS

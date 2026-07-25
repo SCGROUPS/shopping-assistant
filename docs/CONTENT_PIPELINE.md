@@ -1,9 +1,9 @@
 # Vietra — content pipeline: sourcing, authoring, translation, discovery
 
-Status: specification, revision 6. Supersedes the sourcing assumptions in
+Status: specification, revision 7. Supersedes the sourcing assumptions in
 `SYSTEM_DESIGN.md` §4.1.
 
-Revisions 2 to 6 each incorporate an independent design review. Where earlier
+Revisions 2 to 7 each incorporate an independent design review. Where earlier
 revisions were wrong about the existing system, §13 records what they claimed
 and what is actually true, because the corrections are more instructive than the
 final text — and because two of them turned out to describe live defects (§1.2,
@@ -1382,6 +1382,47 @@ embedding synchronously (`catalog/importer.py:293`).
 Publication requires a *current* document for the source locale (§5.3); other
 locales converge asynchronously and their absence is fallback, not failure.
 
+#### Every mutation of an indexed input enqueues the experiences it affects
+
+This is the invariant the whole subsystem rests on, and it is stated here
+because it is the one a future change is most likely to break without noticing.
+A document's text is assembled from more than the `Experience` row:
+`resolved_document_text` also reads `Destination.name`. Any writer that changes
+*any* input to that function must, in the same transaction, enqueue every
+experience whose document that input feeds. Reconciliation is a safety net for
+crashes, not a substitute — it runs on a schedule, so between the mutation and
+the next pass, search answers from text the catalogue no longer contains.
+
+The consequence today is that **destinations are immutable**. `_ensure_destination`
+only inserts, so no code path can rename one, and the invariant holds by absence
+rather than by design. A rename operation is not a `Destination` update: it is a
+rename *plus* a fan-out enqueue of every experience in that destination, in one
+transaction. Until such an operation exists, nothing may issue an `UPDATE` on
+`Destination.name`. The same reasoning applies to any field later promoted into
+the document — promoting it into the text is only half the change.
+
+#### A deterministic vector never replaces a real one
+
+A fallback vector is worth having when the alternative is no document at all,
+and never worth having in place of an embedding. The importer therefore skips
+its own write when the stored document already carries the production
+fingerprint for the text it is about to write — because that combination means
+the document is already correct, the fan-out found nothing to enqueue, and
+overwriting it would remove the product from semantic search with no work item
+anywhere to bring it back. Every other combination is already safe: if the text
+changed, or no document exists, or the stored document was itself a fallback,
+the fingerprints disagree, the enqueue fires under a row lock, and
+`mark_locale_indexed` correctly declines to retire a request a fallback did not
+satisfy.
+
+#### Imports visit products in a fixed order
+
+Two imports running concurrently take the same row locks. Visiting products in
+different orders is the textbook deadlock — each holds what the other needs
+next — and Postgres resolves it by killing one, producing an import failure
+nobody can reproduce. `upsert_catalog` sorts by `external_id` before doing
+anything, which costs nothing and removes the cycle by construction.
+
 ---
 
 ## 10. Evaluation, and why it comes first
@@ -1656,6 +1697,11 @@ first, then revision 2's.
 | **Lease deadlines can be stamped by the application clock** | Replicas disagree about the time, so one running fast expires leases another is still working. Both the deadline and the sweep are evaluated in the database (§9.4) |
 | **A non-empty backlog means the repair failed** | The in-process worker holds part of it whenever the app is awake, so the deploy job would fail because indexing was working. In-flight work is waited on to a bound; only `failed` is immediate (§9.4) |
 | **`information_schema.data_type` compares column types** | It reports every `varchar(n)` as "character varying" and every `vector(n)` as "USER-DEFINED", so a migration creating `vector(1536)` against a model wanting `vector(512)` compared equal. `format_type` is what compares (§13) |
+| **A fallback vector is always better than the alternative** | On an unchanged re-import during a provider outage the text still matches, so nothing is enqueued — and the import overwrote a healthy embedding with a deterministic vector that no query can match, with no work item left to repair it. The write is skipped when the stored document is already current (§9.4) |
+| **A settle window of 90s is patient enough** | A lease is 300s and the embedding client has no explicit request timeout, so a worker doing legitimate slow work failed the deployment. The window must outlast a lease (§9.4) |
+| **A `failed` row is always evidence of work still owed** | The document can be made current by another path while a request for it is failing; reconciliation then walks past it forever because there is nothing to enqueue, and every future deploy fails on a healthy index. Satisfied requests are retired (§9.4) |
+| **Import order is an implementation detail** | Two concurrent imports taking the same row locks in different orders deadlock, and Postgres resolves it by killing one — an unreproducible failure. Products are visited in `external_id` order (§9.4) |
+| **Only `Experience` fields feed the document** | `resolved_document_text` also reads `Destination.name`, and nothing enqueues on a rename. Latent only because destinations are insert-only today; "every mutation of an indexed input enqueues the experiences it affects" is now an explicit invariant (§9.4) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,
 migration entirely, the `language`/`locale` collision, audit attribution for

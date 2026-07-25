@@ -41,6 +41,7 @@ from app.common.models import (
     ExperienceMedia,
     ExperienceOption,
     ExperienceOverride,
+    ExperienceSearchDocument,
     OptionPrice,
     Supplier,
 )
@@ -298,6 +299,12 @@ async def upsert_catalog(
     if not catalog:
         return {"created": 0, "updated": 0, "needs_review": 0}
 
+    # A fixed order, because two imports running at once take the same row
+    # locks. Visiting products in different orders is the textbook deadlock:
+    # each holds what the other needs next, and Postgres resolves it by killing
+    # one of them - an import that fails for no reason anybody can reproduce.
+    catalog = sorted(catalog, key=lambda product: str(product["external_id"]))
+
     provider = ai_provider or build_ai_provider()
     documents = [_document_text(product) for product in catalog]
     embeddings: list[list[float]] = []
@@ -374,27 +381,41 @@ async def upsert_catalog(
             # describing the previous version.
             await enqueue_experience_reindex(session, experience.id)
 
-            embedding_model = (
-                FALLBACK_EMBEDDING_MODEL if is_fallback else indexing.EMBEDDING_MODEL
+            healthy_fingerprint = indexing.index_fingerprint(document, "en")
+            stored_fingerprint = await session.scalar(
+                select(ExperienceSearchDocument.index_fingerprint).where(
+                    ExperienceSearchDocument.experience_id == experience.id,
+                    ExperienceSearchDocument.locale == "en",
+                )
             )
-            await upsert_search_document(
-                session,
-                experience_id=experience.id,
-                locale="en",
-                document_text=document,
-                embedding=embedding,
-                embedding_model=embedding_model,
-            )
-            # English is written here because the import already paid for its
-            # embedding, so the request it just enqueued is already satisfied -
-            # unless the vector was a fallback, in which case the fingerprints
-            # disagree and the request correctly survives.
-            await mark_locale_indexed(
-                session,
-                experience.id,
-                "en",
-                indexing.index_fingerprint(document, "en", embedding_model),
-            )
+            # A deterministic vector is worth having when the alternative is no
+            # document at all, and never worth having in place of a real one. An
+            # unchanged re-import during a provider outage would otherwise
+            # replace a healthy embedding with numbers unrelated to any query -
+            # and because the text did not change, the fan-out above found
+            # nothing to enqueue, so nothing would ever put it back.
+            if not (is_fallback and stored_fingerprint == healthy_fingerprint):
+                embedding_model = (
+                    FALLBACK_EMBEDDING_MODEL if is_fallback else indexing.EMBEDDING_MODEL
+                )
+                await upsert_search_document(
+                    session,
+                    experience_id=experience.id,
+                    locale="en",
+                    document_text=document,
+                    embedding=embedding,
+                    embedding_model=embedding_model,
+                )
+                # English is written here because the import already paid for
+                # its embedding, so the request it just enqueued is already
+                # satisfied - unless the vector was a fallback, in which case
+                # the fingerprints disagree and the request correctly survives.
+                await mark_locale_indexed(
+                    session,
+                    experience.id,
+                    "en",
+                    indexing.index_fingerprint(document, "en", embedding_model),
+                )
 
         await session.commit()
 
