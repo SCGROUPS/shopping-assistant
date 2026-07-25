@@ -504,6 +504,7 @@ class _StubEmbedder:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
         self.calls = 0
+        self.batches = 0
 
     async def embed(self, text: str) -> list[float]:
         self.calls += 1
@@ -512,6 +513,7 @@ class _StubEmbedder:
         return [0.03] * 512
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        self.batches += 1
         return [await self.embed(text) for text in texts]
 
 
@@ -885,9 +887,11 @@ async def test_one_broken_record_does_not_strand_the_rest_of_the_batch(factory):
     original = indexing.resolved_document_text
     seen: list[str] = []
 
+    broken = SUPPORTED_LOCALES[-1]
+
     async def exploding(session, exp, destination_name, locale):
         seen.append(locale)
-        if len(seen) == 1:
+        if locale == broken:
             raise RuntimeError("data error while building the document")
         return await original(session, exp, destination_name, locale)
 
@@ -938,7 +942,7 @@ async def test_a_repair_run_does_not_stop_halfway_through_the_backlog(factory, m
                 FACETS,
                 days=3,
             )
-            for n in range(1, 7)
+            for n in range(1, 13)
         ],
         supplier_external_id="TRIPPASS",
         supplier_name="Trippass",
@@ -1634,3 +1638,33 @@ async def test_a_re_import_does_not_undo_an_operator_correction_in_search(factor
     assert "Operator Corrected Title" in document.document_text
     assert RAW["name"] not in document.document_text
     assert outstanding == []
+
+
+async def test_the_worker_embeds_a_batch_in_one_request(factory):
+    """One round trip per document is what makes the first backfill impossible.
+
+    A catalogue of a few hundred listings across eight locales is a few thousand
+    documents, and at a round trip each the deployment job runs out of time long
+    before the queue runs out of work - which is exactly how this was found, on
+    a real deploy. Providers embed a list as cheaply as a string, which is why
+    the importer has always batched.
+    """
+    from app.catalog import indexing
+
+    await _import()
+    experience = await _only(factory)
+
+    async with factory() as db, db.begin():
+        await db.execute(
+            update(Experience).where(Experience.id == experience.id).values(title="Rebuilt")
+        )
+        await indexing.enqueue_experience_reindex(db, experience.id)
+
+    embedder = _StubEmbedder()
+    built = await indexing.process_index_work(factory, embedder, limit=indexing.DRAIN_BATCH)
+
+    assert built >= len(indexing.SUPPORTED_LOCALES)
+    # Every locale resolves through the same text until it is translated, so the
+    # whole batch is one request carrying one distinct document.
+    assert embedder.batches == 1
+    assert embedder.calls == 1

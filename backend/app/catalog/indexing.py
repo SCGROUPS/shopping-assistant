@@ -60,6 +60,10 @@ EMBEDDING_VERSION = "1"
 FALLBACK_EMBEDDING_MODEL = "deterministic-fallback"
 # Experiences per reconciliation transaction.
 RECONCILE_PAGE_SIZE = 200
+# Sized so one batch is one embedding request. Every locale of a listing
+# resolves to the same text until it is translated, so 64 work items collapse to
+# roughly eight distinct documents - a single call, well inside a lease.
+DRAIN_BATCH = 64
 
 LEASE_SECONDS = 300
 MAX_ATTEMPTS = 5
@@ -535,6 +539,7 @@ async def process_index_work(
 
     completed = 0
     embeddings: dict[str, Any] = {}
+    await _prewarm_embeddings(session_factory, provider, leases, embeddings)
     remaining = list(leases)
     try:
         for index, (experience_id, locale, token) in enumerate(leases):
@@ -636,6 +641,71 @@ async def _release(session_factory: Any, leases: Sequence[tuple[Any, str, Any]])
                         updated_at=datetime.now(UTC),
                     )
                 )
+
+
+async def _prewarm_embeddings(
+    session_factory: Any,
+    provider: AIProvider,
+    leases: list[tuple[Any, ...]],
+    embeddings: dict[str, Any],
+) -> None:
+    """Embed a whole batch in one request rather than one call per document.
+
+    The first backfill is the case that matters: a catalogue of several hundred
+    listings across eight locales is a few thousand documents, and at one
+    round trip each the deployment job runs out of time long before the queue
+    runs out of work. Providers embed a list as cheaply as a string, which is
+    why the importer has always batched; the worker had not.
+
+    Strictly an optimisation, and written so that it cannot be anything else.
+    The text is recomputed inside `_process_one` under the item's own lock and
+    is only served from here when the hash of that text matches, so an entry
+    that is stale, missing, or never populated at all costs an extra call and
+    changes nothing else. A failure is swallowed for the same reason: the
+    per-item path records failures against the right work item, and this one
+    could only record them against all of them.
+    """
+    texts: list[str] = []
+    seen: set[str] = set()
+    try:
+        async with session_factory() as session:
+            for experience_id, locale, _token in leases:
+                # Per item, so that one record whose text cannot be built costs
+                # the batch one document rather than its batching. The item
+                # itself still fails properly in `_process_one`, which is the
+                # only place that knows which work item to fail.
+                try:
+                    row = (
+                        await session.execute(
+                            select(Experience, Destination.name)
+                            .join(Destination, Destination.id == Experience.destination_id)
+                            .where(Experience.id == experience_id)
+                        )
+                    ).first()
+                    if row is None:
+                        continue
+                    experience, destination_name = row
+                    text = await resolved_document_text(
+                        session, experience, destination_name, locale
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - `_process_one` will fail it properly
+                    continue
+                key = hashlib.sha256(text.encode()).hexdigest()
+                if key not in seen:
+                    seen.add(key)
+                    texts.append(text)
+        if not texts:
+            return
+        vectors = await provider.embed_many(texts)
+        for text, vector in zip(texts, vectors, strict=True):
+            embeddings[hashlib.sha256(text.encode()).hexdigest()] = vector
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a cache that did not fill is still a cache
+        logger.warning("Batch embedding failed; falling back to one call per document")
+        embeddings.clear()
 
 
 async def _process_one(
@@ -884,7 +954,7 @@ async def drain_index_queue(*, limit: int | None = 500) -> int:
     provider = build_ai_provider()
     total = 0
     while True:
-        done = await process_index_work(session_factory, provider, limit=25)
+        done = await process_index_work(session_factory, provider, limit=DRAIN_BATCH)
         total += done
         if done == 0:
             return total

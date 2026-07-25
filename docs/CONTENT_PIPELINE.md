@@ -1441,6 +1441,28 @@ theoretical while imports are a scheduled job that does not overlap itself. If
 overlapping imports ever become normal, the lock has to move ahead of the fetch,
 or imports need a generation number that lets a newer one reject an older.
 
+#### The worker embeds a batch, not a document
+
+The first backfill is the case that decides whether any of this is deployable.
+A catalogue of a few hundred listings across eight locales is a few thousand
+documents, and the worker embedded them one round trip at a time — so the first
+production deploy of this subsystem ran the catalogue job past its bound with
+roughly a third of the queue still to go. Providers embed a list as cheaply as a
+string, which is why the importer had always batched and why the worker now
+does: each lease batch is sized so that the documents it covers are one request.
+
+The batch is a pure optimisation and is written so that it cannot be anything
+else. Text is recomputed inside the item's own transaction and served from the
+cache only when its hash matches, so an entry that is stale, missing, or never
+populated costs an extra call and changes nothing. A record whose text cannot be
+built is skipped rather than aborting the batch, because the only place that
+knows which work item to fail is the per-item path.
+
+This compounds with the observation the cache was built on: until a listing is
+translated, every locale resolves to the same text, so eight work items carry
+one distinct document. The two together turn the backfill from thousands of
+requests into hundreds.
+
 #### A deterministic vector never replaces a real one
 
 A fallback vector is worth having when the alternative is no document at all,
@@ -1744,6 +1766,7 @@ first, then revision 2's.
 | **Only `Experience` fields feed the document** | `resolved_document_text` also reads `Destination.name`, and nothing enqueues on a rename. Latent only because destinations are insert-only today; "every mutation of an indexed input enqueues the experiences it affects" is now an explicit invariant (§9.4) |
 | **The document the import embedded is the document to store** | It is built from the supplier's fields, but `_apply` skips every field an operator has corrected — so writing it reverted the correction in search while the listing page still showed it, with nothing enqueued to notice. The shortcut is taken only when the canonical text matches (§9.4) |
 | **Deterministic ordering makes concurrent imports safe** | It removes the deadlock, not the race: suppliers, destinations and experiences are created select-then-insert, so two runs meeting the same new entity race to insert it. Imports of a supplier take an advisory lock (§9.4) |
+| **Correctness was the only thing standing between this and production** | The first real deploy failed on throughput, not on a race: the worker embedded one document per round trip, so the backfill of 379 listings across eight locales outran the catalogue job's bound. Batching was the difference between a subsystem that is right and one that can be shipped (§9.4) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,
 migration entirely, the `language`/`locale` collision, audit attribution for
