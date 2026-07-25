@@ -166,11 +166,12 @@ backend/app/
 ├── assistant/      service.py · provider.py        L5 orchestration + LLM
 ├── catalog/        seed.py · ingest                products, embeddings
 ├── commerce/       cart · booking · voucher        simulated purchase
-└── common/         ranking.py · persistence.py · config.py
+└── common/         ranking.py · features.py · persistence.py · config.py
 
 frontend/src/
 ├── App.tsx                     storefront shell, filter state, cart
 ├── components/AssistantPanel   assistant surface
+├── lib/presence.ts             assistant presence and friction rules
 ├── lib/api.ts                  API client, SSE, normalization
 └── types.ts                    shared contracts
 ```
@@ -204,122 +205,123 @@ constraints, drops list-valued `category`, and clears `needs_clarification`.
 **Treat generated constraints as untrusted input**; the sanitizer is a required
 safety layer, not a workaround.
 
-### 5.2 As-built score
+### 5.2 Scoring: expected value
 
-```python
-score = (0.55 * normalized_rrf
-       + 0.15 * preference        # 1.0 if family_friendly matches else 0.7
-       + 0.10                     # ← availability_fit, never implemented
-       + 0.08 * bayesian_rating
-       + 0.07 * popularity_score
-       + 0.05)                    # ← commercial_quality, never implemented
-```
-
-Two defects:
-
-1. **15% of the weight budget is inert.** The `+0.10` and `+0.05` are constants
-   added to every candidate, so they cannot change any ordering. They are
-   placeholders for the spec's `availability_fit` and `commercial_quality`
-   terms, which were never built.
-2. **`preference` is nearly binary**, keyed only on `family_friendly`. The
-   spec's richer `preference_fit` is not implemented.
-
-Weights are hardcoded, though `POC_SPEC.md` §11.3 requires them in configuration.
-
-### 5.3 MVP target: rank on expected value
-
-Similarity ranking answers "what is most like the query." A marketplace should
-rank on **what the shopper is most likely to book**:
+Similarity ranking answers "what is most like the query." A marketplace must
+rank on **what the shopper is most likely to book, weighted by what that
+booking is worth**:
 
 ```text
-score = P(book | query, context, item) × value(item)
+score ≈ P(book | query, context, item) × value(item)
 ```
 
-MVP-realistic approximation, all terms normalized to `[0,1]` and weights in
-configuration:
+Implemented as a linear blend of `[0,1]` features, with every weight in
+configuration (`common/config.py`, `search_weight_*`, summing to 1.0):
 
-| Term | Signal | Why it matters for tourists |
-|---|---|---|
-| `relevance` | normalized RRF | baseline query match |
-| `preference_fit` | party, interests, accessibility, language | real constraint satisfaction, not one flag |
-| `availability_fit` | slot supply on requested date | never rank an item they cannot book |
-| `price_fit` | distance from inferred budget band | strongest observed conversion driver |
-| `quality` | Bayesian rating + review volume | trust substitute for an unknown brand |
-| `conversion_rate` | observed book/impression, smoothed | learns what actually sells |
-| `margin` | commercial value per booking | aligns ranking with revenue |
+| Term | Weight | Signal | Why it matters for tourists |
+|---|---|---|---|
+| `relevance` | 0.45 | normalized RRF | baseline query match |
+| `preference_fit` | 0.14 | party, duration, rating, indoor/outdoor, instant confirmation, free cancellation, language breadth | real constraint satisfaction, not one flag |
+| `availability_fit` | 0.12 | usable slots and capacity headroom on the requested dates | never rank an item they can barely book |
+| `price_fit` | 0.11 | distance from the budget band | strongest observed conversion driver |
+| `quality` | 0.07 | Bayesian rating + review volume | trust substitute for an unknown brand |
+| `conversion_rate` | 0.06 | observed bookings ÷ exposure, Bayesian-smoothed | learns what actually sells |
+| `margin` | 0.05 | category take rate (proxy, §16) | aligns ranking with revenue |
 
-Rules: keep hard constraints at L1; smooth `conversion_rate` with a Bayesian
-prior so new inventory is not starved; log every scoring input so the objective
-can be retrained; never let commercial terms override a hard constraint.
+Design rules that the implementation enforces:
+
+- **Hard constraints stay at L1.** Commercial terms can reorder candidates but
+  can never resurrect one the shopper cannot book.
+- **`availability_fit` measures margin above the bare minimum.** Eligibility
+  already guarantees one bookable slot; a single remaining seat at one fixed
+  time converts far worse than open choice, so supply breadth (saturating at
+  four usable slots) and capacity headroom are scored, not just presence.
+- **`price_fit` peaks below the ceiling**, at ~75% of budget. An option that
+  consumes the entire budget leaves nothing for the rest of the trip. With no
+  stated budget the median party total of the eligible set is the reference.
+- **`conversion_rate` is smoothed** toward a prior (`conversion_prior_rate`
+  0.02, strength 40) so new inventory is not starved and a single lucky
+  booking cannot outrank a well-measured item. It is then mapped through
+  `rate / (rate + prior)`, which puts the prior at 0.5 — dividing by the prior
+  and clamping would park every unobserved item at the ceiling and recreate the
+  inert-constant defect this term exists to remove.
+- **Relevance still dominates at 45%.** Commercial terms together carry 11%:
+  enough to break ties toward what sells, never enough to float an irrelevant
+  result above a relevant one.
+
+Features live in `common/features.py` so both engines compute "fit" identically;
+if they diverged, the grid and the recommendation rail would argue with each
+other.
+
+> **Historical note.** The POC score was
+> `0.55·rrf + 0.15·preference + 0.10 + 0.08·rating + 0.07·popularity + 0.05`.
+> The `+0.10` and `+0.05` were constants added to every candidate — stubs for
+> the spec's `availability_fit` and `commercial_quality` — so 15% of the weight
+> budget could not change any ordering, and `preference` keyed only on
+> `family_friendly`.
 
 ---
 
 ## 6. Recommendation engine design
 
-### 6.1 As-built score
+### 6.1 Scoring
 
-```python
-score = (0.30 * session_similarity
-       + 0.20 * context_fit
-       + 0.15 * item_similarity
-       + 0.12                       # ← availability_fit, never implemented
-       + 0.10 * popularity_score
-       + 0.08 * bayesian_rating
-       + 0.05 * (1 - popularity_score)   # "novelty"
-       + 0.12 if complementary and placement in {complete_your_day, complementary})
-```
+The rail answers a different question from search — "what else, given who this
+shopper is" — so it keeps its own objective, but draws its features from the
+same `common/features.py` module. Weights are in configuration
+(`recommendation_weight_*`):
 
-The session vector is a weighted centroid of embeddings of items the shopper
-interacted with, weighted by intent strength:
+| Term | Weight | Signal |
+|---|---|---|
+| `session_similarity` | 0.30 | cosine against the time-decayed session vector |
+| `context_fit` | 0.18 | blend of availability, preference and price fit |
+| `item_similarity` | 0.15 | cosine against the item being viewed |
+| `popularity` | 0.15 | observed demand, review-count proxy only until demand exists |
+| `availability_fit` | 0.12 | usable slots and capacity headroom |
+| `quality` | 0.10 | Bayesian rating |
+| complement bonus | +0.12 | category complements the current item, on `complete_your_day` / `complementary` |
+
+**The session vector** is a weighted centroid of embeddings of items the shopper
+engaged with, weighted by intent strength and multiplied by exponential recency
+decay (`behaviour_half_life_seconds`, default 30 minutes):
 
 ```text
 impression 0.1 · view 1.0 · reco click 1.5 · assistant click 2.0
          · add to cart 4.0 · booking 8.0
 ```
 
-That weighting is sound. The problems are around it.
+Decay matters because tourists book same-day: a view from ten minutes ago and
+one from three days ago carry very different intent, and treating them as equal
+makes the rail chase stale interests.
 
-### 6.2 As-built gaps
+**Cold start is handled explicitly.** With no history, `session_similarity`
+would be dead weight, so its 0.30 is redistributed to the terms that still
+discriminate for a first-time visitor — context fit (40%), popularity (30%),
+quality (20%), availability (10%) — as `POC_SPEC.md` §12.4 requires.
 
-**Three of seven terms do not function:**
+**Popularity is a measurement, not a seed.** `demand_stats()` aggregates
+impressions, views, cart adds and bookings per experience. The seeded
+`popularity_score` is now only a cold-start prior: as observed demand for an
+item accumulates, confidence shifts the term onto real behaviour.
 
-- `+0.12` is a constant — inert, a stub for `availability_fit`.
-- `context_fit` is dead. Candidates are hard-filtered by destination two lines
-  earlier, so it is `1.0` for every survivor when a destination is set and
-  `0.65` for every survivor when it is not. It never discriminates.
-- Popularity **cancels itself**: `0.10·p + 0.05·(1−p)` reduces to
-  `0.05 + 0.05·p`. Effective popularity weight is half the intended value, and
-  the "novelty" term contributes nothing but a constant.
+**Eligibility is shared.** Recommendations run through the same L1 gate as
+search (§9), with two-tier relaxation that never relaxes bookability,
+accessibility or exclusions — so a "Curated for you" card is always something
+the shopper can actually buy.
 
-**Recommendations can surface unbookable items.** The service filters only on
-`status` and `destination` — no date, party size, capacity, or budget. A
-"Curated for you" card can therefore be sold out or unaffordable. Every such
-click is a dead end at the moment of highest intent.
+**Diversity is MMR's job**, not a scoring term. The POC added
+`0.05·(1 − popularity)` as "novelty", which collapses algebraically into
+`0.05 + 0.05·popularity` — halving the intended popularity weight and adding a
+constant.
 
-**Cold start is unhandled.** `session_similarity` carries the largest weight
-(0.30) but is `0` with no history — i.e. for most first-time tourists, nearly a
-third of the scoring budget is inert on top of the constants.
-`POC_SPEC.md` §12.4 requires redistributing that weight; it is not implemented.
-
-**No recency decay.** `event_history()` (`common/persistence.py:239`) returns
-`(event_type, experience_id)` pairs with the timestamp discarded. A view from
-ten days ago counts exactly as much as one ten seconds ago — badly wrong for
-same-day tourist booking, where the last few minutes are nearly all the signal.
-
-**Popularity is not behavioural.** `popularity_score` is a static function of
-seeded review count (`catalog/seed.py:969`), not observed demand.
-
-### 6.3 MVP target
-
-- Route recommendations through the **same L1 eligibility gate** as search.
-- Delete the inert constant; implement real `availability_fit`.
-- Collapse popularity/novelty into one honest popularity term; express
-  diversity through MMR, which already does that job properly.
-- Replace dead `context_fit` with features that vary across survivors
-  (date fit, party fit, budget fit, time-of-day compatibility).
-- Add **exponential time decay** to event weights.
-- Compute popularity and conversion rate from real bookings per destination.
-- Redistribute session weight to context/quality/popularity on cold start.
+> **Historical note.** The POC score was
+> `0.30·session + 0.20·context_fit + 0.15·item + 0.12 + 0.10·pop + 0.08·rating + 0.05·(1−pop)`.
+> Three of seven terms did not function: `+0.12` was an `availability_fit` stub;
+> `context_fit` was a destination check applied *after* destination filtering,
+> so it was constant across all survivors; and popularity self-cancelled as
+> above. Recommendations also bypassed the eligibility gate entirely, discarded
+> event timestamps, and left the 0.30 session weight inert for every first-time
+> visitor.
 
 ---
 
@@ -561,18 +563,26 @@ surface cost per session and per booking.
 
 ## 12. Divergences from POC_SPEC.md
 
+Resolved during the MVP build:
+
+| # | Spec | Resolution | Phase |
+|---|---|---|---|
+| 1 | §11.3 `availability_fit`, `commercial_quality` scoring terms | both implemented as real features; inert constants removed | 4 |
+| 2 | §11.3 weights in configuration | all `search_weight_*` / `recommendation_weight_*` in `config.py` | 4 |
+| 3 | §12.4 `availability_fit` | real slot-supply and capacity-headroom feature | 4 |
+| 4 | §12.4 `context_fit` over date/party/budget/language | blend of availability, preference and price fit | 4 |
+| 5 | §12.4 cold-start weight redistribution | session weight redistributed when no history exists | 4 |
+| 7 | §13.1 "the model selects tools" | planner now outranks keyword matching | 1 |
+| 10 | §11.3 "availability is an eligibility gate" | recommendations share `is_eligible` with search | 1 |
+
+Outstanding:
+
 | # | Spec | Implementation | Impact |
 |---|---|---|---|
-| 1 | §11.3 `availability_fit`, `commercial_quality` scoring terms | bare `+0.10`, `+0.05` constants | 15% of search weight inert |
-| 2 | §11.3 weights in configuration | hardcoded | not tunable |
-| 3 | §12.4 `availability_fit` | bare `+0.12` constant | inert; unbookable items rank |
-| 4 | §12.4 `context_fit` over date/party/budget/language | destination-only, constant post-filter | never discriminates |
-| 5 | §12.4 cold-start weight redistribution | absent | 30% inert for new visitors |
 | 6 | §11.4 persistent LRU `query_embedding_cache` table | process-local dict | cost scales with replicas |
-| 7 | §13.1 "the model selects tools" | keyword match overrides planner | misrouted turns |
 | 8 | §13.3 ten tools incl. `get_experience_details`, `get_cart`, `remove_from_cart` | seven-value enum, subset implemented | reduced capability |
 | 9 | §13.7 cost controls | `openai_daily_budget` unenforced | no cost ceiling |
-| 10 | §11.3 "availability is an eligibility gate" | honoured in search, **not** in recommendations | dead-end clicks |
+| 11 | §11.3 margin term | category take-rate proxy; no real margin data | ranking approximates revenue (§16) |
 
 ---
 
@@ -615,21 +625,21 @@ is unfalsifiable, and therefore untunable.
 Ordered by conversion impact per unit of effort. Funnel leaks precede ranking
 work deliberately: better ranking into a leaking funnel returns little.
 
-**Phase 1 — foundations (unblocks the rest)**
+**Phase 1 — foundations (unblocks the rest)** ✅
 1. Unify storefront/assistant state with bidirectional sync.
 2. Route recommendations through the shared eligibility gate.
 3. Fix keyword-over-planner routing precedence.
 
-**Phase 2 — stop the leaks**
+**Phase 2 — stop the leaks** ✅
 4. Graceful constraint relaxation with "we relaxed X" messaging.
 5. Fix the cart to allow repeat purchases across dates and slots.
 6. Replace stub search controls; render facets and pagination.
 
-**Phase 3 — the assistant experience**
+**Phase 3 — the assistant experience** ✅
 7. Presence and engagement model (§8), including friction triggers, contextual
    cold opens, local entry points, and conversational-query auto-handoff.
 
-**Phase 4 — ranking on revenue**
+**Phase 4 — ranking on revenue** ✅
 8. Remove inert terms; implement `availability_fit` and `preference_fit`.
 9. Time-decayed behavioural signals and real popularity/conversion aggregates.
 10. Expected-value objective with margin and conversion rate.

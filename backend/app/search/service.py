@@ -18,12 +18,22 @@ from app.assistant.provider import AIProvider, build_ai_provider, deterministic_
 from app.catalog.service import product_card, starting_price
 from app.common.config import get_settings
 from app.common.database import session_factory
-from app.common.persistence import catalog_products
+from app.common.features import (
+    availability_fit,
+    conversion_lift,
+    margin_fit,
+    median_party_total,
+    party_total,
+    preference_fit,
+    price_fit,
+    quality,
+)
+from app.common.persistence import catalog_products, demand_stats
 from app.common.ranking import (
-    bayesian_rating,
     cosine_similarity,
     minmax,
     reciprocal_rank_fusion,
+    smoothed_rate,
     tokenize,
 )
 from app.common.store import DemoStore, store
@@ -203,14 +213,6 @@ def _expanded_tokens(query: str) -> list[str]:
     return tokens + [synonym for token in tokens for synonym in tokenize(SYNONYMS.get(token, ""))]
 
 
-def _party_total(product: dict[str, Any], party: Sequence[Participant]) -> float:
-    option = product["options"][0]
-    prices = {price["participant_type"]: price["amount"] for price in option["prices"]}
-    if not party:
-        return float(prices.get("adult", 0))
-    return float(sum(prices.get(person.type, 0) * person.count for person in party))
-
-
 def is_eligible(
     product: dict[str, Any],
     filters: SearchFilters,
@@ -268,7 +270,7 @@ def is_eligible(
         return False
     if (
         filters.max_total_price is not None
-        and _party_total(product, party) > filters.max_total_price
+        and party_total(product, party) > filters.max_total_price
     ):
         return False
     if filters.currency:
@@ -574,18 +576,33 @@ class SearchService:
         products = {str(product["id"]): product for product in eligible}
         ordered = [item_id for item_id in ordered if item_id in products]
         rrf_values = minmax([fused[item_id] for item_id in ordered])
+        reference_total = median_party_total(eligible, request.party)
+        demand = await demand_stats(self.data)
+        settings = self.settings
         final: list[tuple[dict[str, Any], float]] = []
         for item_id, normalized_rrf in zip(ordered, rrf_values, strict=True):
             product = products[item_id]
-            preference = 1.0 if filters.family_friendly and product["family_friendly"] else 0.7
-            rating = bayesian_rating(product["rating"], product["review_count"]) / 5
+            stats = demand.get(product["id"], {})
+            conversion = conversion_lift(
+                smoothed_rate(
+                    stats.get("bookings", 0.0),
+                    stats.get("impressions", 0.0) + stats.get("views", 0.0),
+                    settings.conversion_prior_rate,
+                    settings.conversion_prior_strength,
+                ),
+                settings.conversion_prior_rate,
+            )
             score = (
-                0.55 * normalized_rrf
-                + 0.15 * preference
-                + 0.10
-                + 0.08 * rating
-                + 0.07 * product["popularity_score"]
-                + 0.05
+                settings.search_weight_relevance * normalized_rrf
+                + settings.search_weight_preference_fit
+                * preference_fit(product, filters, request.party)
+                + settings.search_weight_availability_fit
+                * availability_fit(product, filters, request.party)
+                + settings.search_weight_price_fit
+                * price_fit(product, filters, request.party, reference_total)
+                + settings.search_weight_quality * quality(product)
+                + settings.search_weight_conversion * conversion
+                + settings.search_weight_margin * margin_fit(product)
             )
             final.append((product, score))
         sorters = {

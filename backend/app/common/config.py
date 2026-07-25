@@ -29,6 +29,32 @@ class Settings(BaseSettings):
     search_semantic_candidates: int = 50
     search_rrf_k: int = 60
     recommendation_mmr_lambda: float = 0.75
+
+    # Ranking weights (POC_SPEC.md §11.3 requires these in configuration).
+    # Search ranks on expected value: P(book | query, context, item) x value.
+    search_weight_relevance: float = 0.45
+    search_weight_preference_fit: float = 0.14
+    search_weight_availability_fit: float = 0.12
+    search_weight_price_fit: float = 0.11
+    search_weight_quality: float = 0.07
+    search_weight_conversion: float = 0.06
+    search_weight_margin: float = 0.05
+
+    recommendation_weight_session: float = 0.30
+    recommendation_weight_context_fit: float = 0.18
+    recommendation_weight_item_similarity: float = 0.15
+    recommendation_weight_availability_fit: float = 0.12
+    recommendation_weight_popularity: float = 0.15
+    recommendation_weight_quality: float = 0.10
+    recommendation_complement_bonus: float = 0.12
+
+    # Recent behaviour dominates same-day tourist booking, so session signal
+    # decays fast. Half-life is in seconds.
+    behaviour_half_life_seconds: float = 1800.0
+    # Bayesian prior keeps new inventory from being starved by zero bookings.
+    conversion_prior_rate: float = 0.02
+    conversion_prior_strength: float = 40.0
+
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
 
     @property

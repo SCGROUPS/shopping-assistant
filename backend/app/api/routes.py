@@ -384,7 +384,7 @@ async def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
         store.events.append(event)
         if request.experience_id:
             store.event_experiences[session_id].append(
-                (request.event_type, request.experience_id)
+                (request.event_type, request.experience_id, event["occurred_at"])
             )
         return {"accepted": True, "event_id": event["id"]}
 

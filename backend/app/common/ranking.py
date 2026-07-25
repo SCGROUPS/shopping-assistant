@@ -77,3 +77,25 @@ def mmr_diversify(
         selected.append(choice)
         remaining.remove(choice)
     return [item[0] for item in selected]
+
+
+def time_decay(age_seconds: float, half_life_seconds: float) -> float:
+    """Exponential decay used to age behavioural signals.
+
+    Tourists book for today or tomorrow, so a view from ten minutes ago says far
+    more about intent than one from yesterday.
+    """
+    if half_life_seconds <= 0:
+        return 1.0
+    return 0.5 ** (max(age_seconds, 0.0) / half_life_seconds)
+
+
+def smoothed_rate(
+    successes: float, trials: float, prior_rate: float, prior_strength: float
+) -> float:
+    """Bayesian-smoothed rate so unproven inventory is not starved.
+
+    With no observations this returns the prior, which means a brand new
+    experience ranks as an average performer rather than the worst one.
+    """
+    return (successes + prior_rate * prior_strength) / (trials + prior_strength)

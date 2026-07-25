@@ -1,15 +1,38 @@
+import math
 from collections import Counter
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 from app.api.schemas import Participant, RecommendationResponse, SearchFilters
 from app.catalog.service import get_product_async, product_card
 from app.common.config import get_settings
-from app.common.persistence import catalog_products, event_history
-from app.common.ranking import bayesian_rating, cosine_similarity, mmr_diversify
+from app.common.features import (
+    availability_fit,
+    context_fit,
+    median_party_total,
+    quality,
+)
+from app.common.persistence import catalog_products, demand_stats, event_history
+from app.common.ranking import cosine_similarity, mmr_diversify, time_decay
 from app.common.store import DemoStore, store
 from app.search.service import is_eligible
+
+# Intent strength per event type. Booking is the only unambiguous signal, so it
+# dominates; an impression barely counts.
+EVENT_WEIGHTS = {
+    "experience_impression": 0.1,
+    "experience_viewed": 1.0,
+    "recommendation_clicked": 1.5,
+    "assistant_action_clicked": 2.0,
+    "cart_item_added": 4.0,
+    "booking_completed": 8.0,
+}
+
+# Demand weighting: a booking says far more about an item than a browse.
+DEMAND_WEIGHTS = {"views": 1.0, "cart_adds": 3.0, "bookings": 6.0}
+POPULARITY_SATURATION = 40.0
 
 COMPLEMENTS = {
     "Museum or cultural venue": {"Food experience", "Cruise", "Guided tour"},
@@ -64,10 +87,88 @@ def _eligible_ids(
     return set()
 
 
+def _aware(moment: datetime) -> datetime:
+    """Client-supplied timestamps may arrive naive; treat those as UTC."""
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def _popularity(product: dict[str, Any], stats: dict[str, float] | None) -> float:
+    """One honest popularity term, measured where possible.
+
+    The seeded review-count proxy is only a cold-start prior: as soon as real
+    demand exists for an item, observed behaviour takes over. Diversity is left
+    to MMR rather than being faked with a "novelty" term that only ever added a
+    constant.
+    """
+    seeded = float(product["popularity_score"])
+    if not stats:
+        return seeded
+    observed = sum(stats.get(key, 0.0) * weight for key, weight in DEMAND_WEIGHTS.items())
+    if observed <= 0:
+        return seeded
+    measured = math.log1p(observed) / math.log1p(POPULARITY_SATURATION)
+    confidence = min(1.0, observed / POPULARITY_SATURATION)
+    return min(1.0, (1 - confidence) * seeded + confidence * measured)
+
+
 class RecommendationService:
     def __init__(self, data: DemoStore = store) -> None:
         self.data = data
         self.settings = get_settings()
+
+    def _session_vector(
+        self,
+        history: Sequence[tuple[str, UUID, datetime]],
+        products_by_id: dict[UUID, dict[str, Any]],
+    ) -> list[float] | None:
+        """Time-decayed centroid of what this shopper has engaged with."""
+        now = datetime.now(UTC)
+        half_life = self.settings.behaviour_half_life_seconds
+        positive: list[tuple[float, dict[str, Any]]] = []
+        for event, product_id, occurred_at in history:
+            intent = EVENT_WEIGHTS.get(event, 0.0)
+            product = products_by_id.get(product_id)
+            if intent <= 0 or product is None:
+                continue
+            age = (now - _aware(occurred_at)).total_seconds()
+            positive.append((intent * time_decay(age, half_life), product))
+
+        total_weight = sum(weight for weight, _ in positive)
+        if not total_weight:
+            return None
+        dimensions = len(positive[0][1]["embedding"])
+        return [
+            sum(weight * product["embedding"][i] for weight, product in positive) / total_weight
+            for i in range(dimensions)
+        ]
+
+    def _weights(self, has_session: bool) -> dict[str, float]:
+        """Weights from configuration, with cold-start redistribution.
+
+        With no history the session term is dead weight, so its budget goes to
+        the terms that still discriminate for a first-time visitor
+        (POC_SPEC.md §12.4).
+        """
+        weights = {
+            "session": self.settings.recommendation_weight_session,
+            "context_fit": self.settings.recommendation_weight_context_fit,
+            "item_similarity": self.settings.recommendation_weight_item_similarity,
+            "availability_fit": self.settings.recommendation_weight_availability_fit,
+            "popularity": self.settings.recommendation_weight_popularity,
+            "quality": self.settings.recommendation_weight_quality,
+        }
+        if has_session:
+            return weights
+        spare = weights["session"]
+        weights["session"] = 0.0
+        for field, share in (
+            ("context_fit", 0.4),
+            ("popularity", 0.3),
+            ("quality", 0.2),
+            ("availability_fit", 0.1),
+        ):
+            weights[field] += spare * share
+        return weights
 
     async def recommend(
         self,
@@ -94,33 +195,15 @@ class RecommendationService:
             gate.destination = destination
         eligible_ids = _eligible_ids(products, gate, party, current)
         history = await event_history(session_id, data=self.data)
-        weights = {
-            "experience_impression": 0.1,
-            "experience_viewed": 1.0,
-            "recommendation_clicked": 1.5,
-            "assistant_action_clicked": 2.0,
-            "cart_item_added": 4.0,
-            "booking_completed": 8.0,
-        }
-        positive = [
-            (weights.get(event, 0), products_by_id[product_id])
-            for event, product_id in history
-            if weights.get(event, 0) > 0 and product_id in products_by_id
-        ]
-        total_weight = sum(weight for weight, _ in positive)
-        session_vector = None
-        if total_weight:
-            dimensions = len(positive[0][1]["embedding"])
-            session_vector = [
-                sum(weight * product["embedding"][i] for weight, product in positive) / total_weight
-                for i in range(dimensions)
-            ]
+        demand = await demand_stats(self.data)
+        session_vector = self._session_vector(history, products_by_id)
+        eligible = [product for product in products if product["id"] in eligible_ids]
+        reference_total = median_party_total(eligible, party)
+        weights = self._weights(session_vector is not None)
 
         candidates: list[tuple[dict[str, Any], float, str, str]] = []
-        for product in products:
-            if product["id"] not in eligible_ids:
-                continue
-            context_fit = 1.0 if destination and product["destination"] == destination else 0.65
+        for product in eligible:
+            situation = context_fit(product, gate, party, reference_total)
             item_similarity = (
                 cosine_similarity(current["embedding"], product["embedding"]) if current else 0.0
             )
@@ -131,15 +214,14 @@ class RecommendationService:
                 current and product["category"] in COMPLEMENTS.get(current["category"], set())
             )
             score = (
-                0.30 * max(session_similarity, 0)
-                + 0.20 * context_fit
-                + 0.15 * max(item_similarity, 0)
-                + 0.12
-                + 0.10 * product["popularity_score"]
-                + 0.08 * bayesian_rating(product["rating"], product["review_count"]) / 5
-                + 0.05 * (1 - product["popularity_score"])
+                weights["session"] * max(session_similarity, 0)
+                + weights["context_fit"] * situation
+                + weights["item_similarity"] * max(item_similarity, 0)
+                + weights["availability_fit"] * availability_fit(product, gate, party)
+                + weights["popularity"] * _popularity(product, demand.get(product["id"]))
+                + weights["quality"] * quality(product)
                 + (
-                    0.12
+                    self.settings.recommendation_complement_bonus
                     if placement in {"complete_your_day", "complementary"} and complementary
                     else 0
                 )
@@ -190,7 +272,7 @@ async def session_interest_tags(
     }
     tags = Counter(
         tag
-        for _, product_id in await event_history(session_id, data=data)
+        for _, product_id, _occurred_at in await event_history(session_id, data=data)
         for tag in products.get(product_id, {}).get("interest_tags", [])
     )
     return [tag for tag, _ in tags.most_common(5)]
