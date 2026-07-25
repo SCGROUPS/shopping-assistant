@@ -222,6 +222,7 @@ const normalizeCart = async (
       option_id: String(item.option_id),
       option_name: String(item.option_name ?? ''),
       slot_id: item.slot_id ? String(item.slot_id) : undefined,
+      starts_at: startsAt?.toISOString(),
       date: startsAt?.toISOString().slice(0, 10) ?? '',
       time: startsAt?.toLocaleTimeString([], {
         hour: '2-digit',

@@ -103,6 +103,7 @@ export type CartItem = {
   option_id?: string
   option_name?: string
   slot_id?: string
+  starts_at?: string
   date: string
   time?: string
   adults: number

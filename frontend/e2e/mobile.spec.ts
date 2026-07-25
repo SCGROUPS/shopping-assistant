@@ -34,7 +34,9 @@ test('mobile search, assistant drawer, cart, and removal remain responsive', asy
   await assistant.getByRole('button', { name: 'Close assistant' }).click()
 
   const search = page.getByLabel('What would make this trip memorable?')
-  await search.fill('Family day near Da Nang')
+  // Conversational queries hand off to the assistant (docs/SYSTEM_DESIGN.md
+  // §8.2); short keyword queries deliberately stay in the grid.
+  await search.fill('A relaxed family day near Da Nang with food and culture')
   await search.press('Enter')
   await expect(assistant).toBeVisible({ timeout: 120_000 })
   await assistant.getByRole('button', { name: 'Close assistant' }).click()

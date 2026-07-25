@@ -11,6 +11,7 @@ import {
   Heart,
   MapPin,
   Menu,
+  MessageCircle,
   Minus,
   Plus,
   Search,
@@ -33,6 +34,13 @@ import { ProductCard } from './components/ProductCard'
 import { VoiceInputButton } from './components/VoiceInputButton'
 import { categories, demoExperiences } from './data/demo'
 import { api } from './lib/api'
+import {
+  detectFriction,
+  findScheduleClash,
+  isConversationalQuery,
+  type FrictionSignal,
+  type Nudge,
+} from './lib/presence'
 import type {
   AssistantAction,
   AssistantContext,
@@ -167,6 +175,10 @@ function App() {
   )
   const [filterPanelOpen, setFilterPanelOpen] = useState(false)
   const [advanced, setAdvanced] = useState<AdvancedFilters>(emptyAdvanced)
+  const [refinements, setRefinements] = useState(0)
+  const [viewedCount, setViewedCount] = useState(0)
+  const [dismissedNudges, setDismissedNudges] = useState<FrictionSignal[]>([])
+  const [openedSignals, setOpenedSignals] = useState<FrictionSignal[]>([])
 
   const liveFilters = (): SearchFilters => {
     const filters: SearchFilters = {
@@ -266,11 +278,59 @@ function App() {
 
   const cartTotal = cartItems.reduce((sum, item) => sum + item.total, 0)
 
+  const conversationStarted = messages.some(
+    (message) => message.role === 'user',
+  )
+
   const viewProduct = (product: Experience | null) => {
     if (product && !viewedIds.current.includes(product.id)) {
       viewedIds.current = [...viewedIds.current, product.id].slice(-20)
+      setViewedCount((count) => count + 1)
     }
+    // Opening a result counts as engagement, so the refinement-loop nudge
+    // only fires for shoppers who are cycling filters without ever clicking.
+    if (product) setRefinements(0)
     setSelectedProduct(product)
+  }
+
+  const nudge = useMemo<Nudge | null>(() => {
+    if (assistantOpen) return null
+    const detected = detectFriction({
+      hasSearched,
+      resultCount: products.length,
+      refinementsSinceEngagement: refinements,
+      viewedCount,
+      cartItems,
+      checkoutOpen,
+    })
+    if (!detected || dismissedNudges.includes(detected.signal)) return null
+    return detected
+  }, [
+    assistantOpen,
+    cartItems,
+    checkoutOpen,
+    dismissedNudges,
+    hasSearched,
+    products.length,
+    refinements,
+    viewedCount,
+  ])
+
+  const openAssistant = (reason?: Nudge) => {
+    setAssistantOpen(true)
+    if (!reason || openedSignals.includes(reason.signal)) return
+    setOpenedSignals((current) => [...current, reason.signal])
+    // Reflect the observed context once. Repeating it reads as surveillance.
+    setMessages((current) => [
+      ...current,
+      {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        text: reason.opener,
+        timestamp: new Date(),
+      },
+    ])
+    if (reason.prompt) void sendAssistantMessage(reason.prompt)
   }
 
   const runSearch = async (
@@ -293,16 +353,23 @@ function App() {
       })
       setConversationId(undefined)
       setAppError('')
+      if (announce) setRefinements((count) => count + 1)
 
-      if (announce && searchQuery.trim().split(/\s+/).length >= 4) {
+      // The one sanctioned auto-open: a conversational query is an explicit
+      // request for help, not an unprompted interruption. Keyword queries
+      // always stay in the grid.
+      if (announce && isConversationalQuery(searchQuery)) {
         const best = result.items.slice(0, 3)
+        const relaxed = result.relaxedPreferences.length
+          ? ` I relaxed ${result.relaxedPreferences.join(', ')} to keep these bookable.`
+          : ''
         setMessages((current) => [
           ...current,
           {
             id: crypto.randomUUID(),
             role: 'assistant',
             text: best.length
-              ? `I translated “${searchQuery}” into a few practical preferences. These have the strongest overall fit; I can compare them or shape them into a half-day plan.`
+              ? `I translated “${searchQuery}” into a few practical preferences. These have the strongest overall fit; I can compare them or shape them into a half-day plan.${relaxed}`
               : `I could not find a live match for “${searchQuery}”. Try relaxing the destination, date, or activity preferences and I will search again.`,
             products: best,
             actions: best[0]
@@ -482,6 +549,21 @@ function App() {
     }
   }
 
+  // Subject-carrying entry points (§8.4): the question already has an object,
+  // so the assistant never has to ask "which one?".
+  const askAboutProduct = (product: Experience) => {
+    setAssistantOpen(true)
+    void sendAssistantMessage(`Tell me more about ${product.title}.`, product)
+  }
+
+  const checkMyPlan = () => {
+    setCartOpen(false)
+    setAssistantOpen(true)
+    void sendAssistantMessage(
+      'Check my plan: does the timing work, and is anything missing?',
+    )
+  }
+
   const handleAssistantAction = async (
     action: AssistantAction,
     actionProducts: Experience[] = [],
@@ -590,7 +672,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${assistantOpen ? 'assistant-docked' : ''}`}>
       {appError && (
         <div className="service-error" role="alert">
           {appError}
@@ -1051,6 +1133,7 @@ function App() {
                   product={product}
                   onView={viewProduct}
                   onAdd={(item) => void addToCart(item)}
+                  onAsk={askAboutProduct}
                 />
               ))}
             </div>
@@ -1064,7 +1147,9 @@ function App() {
                 Mai can relax a preference while keeping your important
                 constraints intact.
               </p>
-              <button onClick={() => setAssistantOpen(true)}>Ask Mai to help</button>
+              <button onClick={() => openAssistant(nudge ?? undefined)}>
+                Ask Mai to help
+              </button>
             </div>
           )}
         </section>
@@ -1205,19 +1290,39 @@ function App() {
       </footer>
 
       {!assistantOpen && (
-        <button
-          className="assistant-fab"
-          onClick={() => setAssistantOpen(true)}
-        >
-          <span>
-            <Sparkles size={20} />
-          </span>
-          <div>
-            <small>Need a thoughtful recommendation?</small>
-            <strong>Ask Mai</strong>
-          </div>
-          <ArrowRight size={18} />
-        </button>
+        <div className={`assistant-fab-dock ${nudge ? 'nudged' : ''}`}>
+          {nudge && (
+            <div className="assistant-nudge" role="status">
+              <p>{nudge.label}</p>
+              <button
+                className="nudge-dismiss"
+                aria-label="Dismiss suggestion"
+                onClick={() =>
+                  setDismissedNudges((current) => [...current, nudge.signal])
+                }
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
+          <button
+            className="assistant-fab"
+            onClick={() => openAssistant(nudge ?? undefined)}
+          >
+            <span>
+              <Sparkles size={20} />
+            </span>
+            <div>
+              <small>
+                {conversationStarted
+                  ? 'Pick up where you left off'
+                  : 'Need a thoughtful recommendation?'}
+              </small>
+              <strong>{conversationStarted ? 'Continue with Mai' : 'Ask Mai'}</strong>
+            </div>
+            <ArrowRight size={18} />
+          </button>
+        </div>
       )}
 
       <AssistantPanel
@@ -1242,6 +1347,8 @@ function App() {
           setCartOpen(false)
           setCheckoutOpen(true)
         }}
+        onCheckPlan={checkMyPlan}
+        clashing={findScheduleClash(cartItems) !== null}
       />
 
       <CheckoutModal
@@ -1356,6 +1463,17 @@ function App() {
                   </strong>
                   <small>for {travellers} guests</small>
                 </div>
+                <button
+                  className="ask-about-button"
+                  onClick={() => {
+                    const focus = selectedProduct
+                    setSelectedProduct(null)
+                    askAboutProduct(focus)
+                  }}
+                >
+                  <MessageCircle size={18} />
+                  Ask about this
+                </button>
                 <button
                   className="checkout-button"
                   onClick={() => void addToCart(selectedProduct)}

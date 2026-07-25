@@ -1,6 +1,7 @@
 import {
   ArrowRight,
   CalendarDays,
+  MessageCircle,
   Minus,
   ShieldCheck,
   ShoppingBag,
@@ -22,6 +23,8 @@ type CartDrawerProps = {
   onClose: () => void
   onRemove: (id: string) => void
   onCheckout: () => void
+  onCheckPlan: () => void
+  clashing: boolean
 }
 
 export function CartDrawer({
@@ -29,6 +32,8 @@ export function CartDrawer({
   items,
   onClose,
   onRemove,
+  onCheckPlan,
+  clashing,
   onCheckout,
 }: CartDrawerProps) {
   const total = items.reduce((sum, item) => sum + item.total, 0)
@@ -106,6 +111,13 @@ export function CartDrawer({
                 </article>
               ))}
             </div>
+
+            <button className="cart-plan-check" onClick={onCheckPlan}>
+              <MessageCircle size={16} />
+              {clashing
+                ? 'Two items clash — ask Mai to re-time one'
+                : 'Check my plan with Mai'}
+            </button>
 
             <div className="cart-assurance">
               <ShieldCheck size={20} />

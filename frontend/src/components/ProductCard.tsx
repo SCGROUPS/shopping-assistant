@@ -4,6 +4,7 @@ import {
   Clock3,
   Heart,
   MapPin,
+  MessageCircle,
   ShoppingBag,
   Sparkles,
   Star,
@@ -16,6 +17,7 @@ type ProductCardProps = {
   compact?: boolean
   onView: (product: Experience) => void
   onAdd: (product: Experience) => void
+  onAsk?: (product: Experience) => void
 }
 
 const durationLabel = (minutes: number) => {
@@ -37,6 +39,7 @@ export function ProductCard({
   compact = false,
   onView,
   onAdd,
+  onAsk,
 }: ProductCardProps) {
   const [saved, setSaved] = useState(false)
 
@@ -118,6 +121,16 @@ export function ProductCard({
             <span>per guest</span>
           </div>
           <div className="product-actions">
+            {onAsk && (
+              <button
+                className="icon-action"
+                onClick={() => onAsk(product)}
+                aria-label={`Ask Mai about ${product.title}`}
+                title="Ask about this"
+              >
+                <MessageCircle size={18} />
+              </button>
+            )}
             <button
               className="icon-action"
               onClick={() => onView(product)}

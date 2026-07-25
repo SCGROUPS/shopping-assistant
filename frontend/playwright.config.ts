@@ -20,7 +20,7 @@ export default defineConfig({
   projects: [
     {
       name: 'desktop-chromium',
-      testMatch: /desktop\.spec\.ts/,
+      testMatch: /(desktop|presence)\.spec\.ts/,
       use: {
         ...devices['Desktop Chrome'],
         viewport: { width: 1440, height: 1000 },
