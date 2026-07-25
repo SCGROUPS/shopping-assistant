@@ -17,7 +17,6 @@ class DemoStore:
     events: list[dict[str, Any]] = field(default_factory=list)
     bookings: dict[UUID, dict[str, Any]] = field(default_factory=dict)
     idempotency: dict[tuple[str, str, str], Any] = field(default_factory=dict)
-    query_embeddings: dict[str, list[float]] = field(default_factory=dict)
     event_experiences: dict[str, list[tuple[str, UUID, datetime]]] = field(
         default_factory=lambda: defaultdict(list)
     )
@@ -67,7 +66,6 @@ class DemoStore:
         self.events.clear()
         self.bookings.clear()
         self.idempotency.clear()
-        self.query_embeddings.clear()
         self.event_experiences.clear()
         self.seed()
 

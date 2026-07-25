@@ -1,4 +1,3 @@
-import hashlib
 import logging
 import re
 from collections import Counter
@@ -18,6 +17,7 @@ from app.assistant.provider import AIProvider, build_ai_provider, deterministic_
 from app.catalog.service import product_card, starting_price
 from app.common.config import get_settings
 from app.common.database import session_factory
+from app.common.embedding_cache import embedding_cache
 from app.common.features import (
     availability_fit,
     conversion_lift,
@@ -28,9 +28,11 @@ from app.common.features import (
     price_fit,
     quality,
 )
+from app.common.llm_cost import BudgetExceeded
 from app.common.persistence import catalog_products, demand_stats
 from app.common.ranking import (
     cosine_similarity,
+    deterministic_embedding,
     minmax,
     reciprocal_rank_fusion,
     smoothed_rate,
@@ -422,6 +424,28 @@ class SearchService:
         self.ai = ai_provider or build_ai_provider()
         self.settings = get_settings()
 
+    async def _query_embedding(self, normalized: str) -> list[float]:
+        """Embed the query, hitting the shared cache first.
+
+        Tourist search traffic is head-heavy, so the same handful of queries
+        arrive constantly. Caching them across replicas and restarts
+        (POC_SPEC.md §11.4) is the single largest cost lever in the system.
+        """
+        model = self.settings.azure_openai_embedding_deployment
+        cached = await embedding_cache.get(normalized, model)
+        if cached is not None:
+            return cached
+        try:
+            vector = await self.ai.embed(normalized)
+        except BudgetExceeded as exhausted:
+            logger.warning("%s", exhausted)
+            return deterministic_embedding(normalized)
+        except Exception:
+            logger.exception("Query embedding failed; using deterministic embedding")
+            return deterministic_embedding(normalized)
+        await embedding_cache.put(normalized, model, vector)
+        return vector
+
     async def search(self, request: SearchRequest) -> SearchResponse:
         available_products = await catalog_products(self.data)
         if should_extract_intent(request):
@@ -489,16 +513,7 @@ class SearchService:
                 lexical_scored.append((str(product["id"]), float(score)))
         lexical_scored.sort(key=lambda item: item[1], reverse=True)
         normalized = " ".join(tokenize(intent.search_text or request.query))
-        cache_key = hashlib.sha256(normalized.encode()).hexdigest()
-        if cache_key not in self.data.query_embeddings:
-            try:
-                self.data.query_embeddings[cache_key] = await self.ai.embed(normalized)
-            except Exception:
-                logger.exception("Query embedding failed; using deterministic embedding")
-                from app.common.ranking import deterministic_embedding
-
-                self.data.query_embeddings[cache_key] = deterministic_embedding(normalized)
-        query_embedding = self.data.query_embeddings[cache_key]
+        query_embedding = await self._query_embedding(normalized)
         semantic_scored = sorted(
             (
                 (str(product["id"]), cosine_similarity(query_embedding, product["embedding"]))

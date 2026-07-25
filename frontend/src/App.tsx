@@ -179,6 +179,10 @@ function App() {
   const [viewedCount, setViewedCount] = useState(0)
   const [dismissedNudges, setDismissedNudges] = useState<FrictionSignal[]>([])
   const [openedSignals, setOpenedSignals] = useState<FrictionSignal[]>([])
+  // Holdout cohort: the control group for "does guided selling actually sell
+  // better than manual search". Assumed enabled until the server says
+  // otherwise, so a telemetry outage never silently removes the assistant.
+  const [assistantEnabled, setAssistantEnabled] = useState(true)
 
   const liveFilters = (): SearchFilters => {
     const filters: SearchFilters = {
@@ -211,10 +215,12 @@ function App() {
   useEffect(() => {
     void (async () => {
       try {
-        const [experiences, recommended] = await Promise.all([
+        const [experiences, recommended, cohort] = await Promise.all([
           api.listExperiences(),
           api.recommendations(),
+          api.sessionContext(),
         ])
+        setAssistantEnabled(cohort.assistantEnabled)
         if (experiences.length) setProducts(experiences)
         if (recommended.length) setRecommendations(recommended)
         setMessages((current) =>
@@ -282,10 +288,16 @@ function App() {
     (message) => message.role === 'user',
   )
 
-  const viewProduct = (product: Experience | null) => {
+  const viewProduct = (product: Experience | null, surface = 'grid') => {
     if (product && !viewedIds.current.includes(product.id)) {
       viewedIds.current = [...viewedIds.current, product.id].slice(-20)
       setViewedCount((count) => count + 1)
+    }
+    if (product) {
+      api.track('experience_viewed', {}, {
+        experienceId: product.id,
+        placement: surface,
+      })
     }
     // Opening a result counts as engagement, so the refinement-loop nudge
     // only fires for shoppers who are cycling filters without ever clicking.
@@ -294,7 +306,7 @@ function App() {
   }
 
   const nudge = useMemo<Nudge | null>(() => {
-    if (assistantOpen) return null
+    if (assistantOpen || !assistantEnabled) return null
     const detected = detectFriction({
       hasSearched,
       resultCount: products.length,
@@ -306,6 +318,7 @@ function App() {
     if (!detected || dismissedNudges.includes(detected.signal)) return null
     return detected
   }, [
+    assistantEnabled,
     assistantOpen,
     cartItems,
     checkoutOpen,
@@ -316,8 +329,15 @@ function App() {
     viewedCount,
   ])
 
+  useEffect(() => {
+    if (nudge) api.track('assistant_nudge_shown', { trigger: nudge.signal })
+  }, [nudge])
+
   const openAssistant = (reason?: Nudge) => {
+    if (!assistantEnabled) return
     setAssistantOpen(true)
+    api.track('assistant_opened', { trigger: reason?.signal ?? 'manual' })
+    if (reason) api.track('assistant_nudge_accepted', { trigger: reason.signal })
     if (!reason || openedSignals.includes(reason.signal)) return
     setOpenedSignals((current) => [...current, reason.signal])
     // Reflect the observed context once. Repeating it reads as surveillance.
@@ -343,6 +363,14 @@ function App() {
     const filters: SearchFilters = { ...liveFilters(), ...extraFilters }
     try {
       const result = await api.search(searchQuery, filters, travellers)
+      api.track('search_submitted', {
+        result_count: result.items.length,
+        conversational: isConversationalQuery(searchQuery),
+      })
+      if (result.items.length === 0) api.track('search_zero_results', {})
+      if (result.relaxedPreferences.length > 0) {
+        api.track('search_relaxed', { relaxed: result.relaxedPreferences })
+      }
       setProducts(result.items)
       setRelaxedPreferences(result.relaxedPreferences)
       setFacets(result.facets)
@@ -384,7 +412,7 @@ function App() {
             timestamp: new Date(),
           },
         ])
-        setAssistantOpen(true)
+        openAssistant()
       }
     } catch {
       setAppError('Search could not reach the live catalog. Your current results are unchanged.')
@@ -440,6 +468,14 @@ function App() {
         cartItems,
       )
       setCartItems(cart)
+      api.track(
+        'cart_item_added',
+        { total: product.price * travellers },
+        {
+          experienceId: product.id,
+          placement: fromAssistant ? 'assistant' : 'grid',
+        },
+      )
     } catch {
       setMessages((current) => [
         ...current,
@@ -450,7 +486,7 @@ function App() {
           timestamp: new Date(),
         },
       ])
-      setAssistantOpen(true)
+      openAssistant()
       return
     }
     setSelectedProduct(null)
@@ -552,13 +588,13 @@ function App() {
   // Subject-carrying entry points (§8.4): the question already has an object,
   // so the assistant never has to ask "which one?".
   const askAboutProduct = (product: Experience) => {
-    setAssistantOpen(true)
+    openAssistant()
     void sendAssistantMessage(`Tell me more about ${product.title}.`, product)
   }
 
   const checkMyPlan = () => {
     setCartOpen(false)
-    setAssistantOpen(true)
+    openAssistant()
     void sendAssistantMessage(
       'Check my plan: does the timing work, and is anything missing?',
     )
@@ -650,7 +686,7 @@ function App() {
           timestamp: new Date(),
         },
       ])
-      setAssistantOpen(true)
+      openAssistant()
     }
   }
 
@@ -659,6 +695,11 @@ function App() {
     email: string
   }) => {
     const confirmation = await api.confirmCheckout(cartItems, customer)
+    // Attribute the booking to the surface that sourced the cart, so
+    // "the assistant converts better" becomes a measurable claim.
+    api.track('booking_completed', { items: cartItems.length }, {
+      placement: conversationStarted ? 'assistant' : 'grid',
+    })
     setVoucher(confirmation)
     setMessages((current) => [
       ...current,
@@ -693,10 +734,12 @@ function App() {
         <nav className={mobileMenuOpen ? 'mobile-open' : ''}>
           <a href="#discover">Discover</a>
           <a href="#recommendations">Curated for you</a>
-          <button onClick={() => setAssistantOpen(true)}>
-            <Sparkles size={15} />
-            Ask Mai
-          </button>
+          {assistantEnabled && (
+            <button onClick={() => openAssistant()}>
+              <Sparkles size={15} />
+              Ask Mai
+            </button>
+          )}
         </nav>
 
         <div className="header-actions">
@@ -893,16 +936,18 @@ function App() {
                 experience might fit.
               </p>
             </div>
-            <button className="assistant-cta" onClick={() => setAssistantOpen(true)}>
-              <span>
-                <Sparkles size={18} />
-              </span>
-              <div>
-                <small>Not sure where to begin?</small>
-                <strong>Let Mai curate your day</strong>
-              </div>
-              <ArrowRight size={18} />
-            </button>
+            {assistantEnabled && (
+              <button className="assistant-cta" onClick={() => openAssistant()}>
+                <span>
+                  <Sparkles size={18} />
+                </span>
+                <div>
+                  <small>Not sure where to begin?</small>
+                  <strong>Let Mai curate your day</strong>
+                </div>
+                <ArrowRight size={18} />
+              </button>
+            )}
           </div>
 
           <div className="filter-toolbar">
@@ -1133,7 +1178,7 @@ function App() {
                   product={product}
                   onView={viewProduct}
                   onAdd={(item) => void addToCart(item)}
-                  onAsk={askAboutProduct}
+                  onAsk={assistantEnabled ? askAboutProduct : undefined}
                 />
               ))}
             </div>
@@ -1223,55 +1268,57 @@ function App() {
           </div>
         </section>
 
-        <section className="assistant-promo">
-          <div className="assistant-promo-art">
-            <div className="promo-phone">
-              <header>
-                <span className="assistant-avatar">
-                  <Sparkles size={16} />
-                </span>
-                <div>
-                  <strong>Mai</strong>
-                  <small>Your local curator</small>
-                </div>
-              </header>
+        {assistantEnabled && (
+          <section className="assistant-promo">
+            <div className="assistant-promo-art">
+              <div className="promo-phone">
+                <header>
+                  <span className="assistant-avatar">
+                    <Sparkles size={16} />
+                  </span>
+                  <div>
+                    <strong>Mai</strong>
+                    <small>Your local curator</small>
+                  </div>
+                </header>
+                <p>
+                  Since you prefer a slower pace, I would keep Ba Na Hills as the
+                  only big outing and pair it with an easy river evening.
+                </p>
+                <button>
+                  <Check size={14} />
+                  Apply this plan
+                </button>
+              </div>
+              <span className="floating-tag tag-one">Under your budget</span>
+              <span className="floating-tag tag-two">No schedule conflicts</span>
+            </div>
+            <div className="assistant-promo-copy">
+              <span className="eyebrow">More than a chatbot</span>
+              <h2>A local-minded assistant that can actually book.</h2>
               <p>
-                Since you prefer a slower pace, I would keep Ba Na Hills as the
-                only big outing and pair it with an easy river evening.
+                Mai remembers your filters, explains trade-offs, checks the latest
+                option and price, then turns recommendations into actions you can
+                trust.
               </p>
-              <button>
-                <Check size={14} />
-                Apply this plan
+              <ul>
+                <li>
+                  <Check size={16} /> Compares the details that matter to you
+                </li>
+                <li>
+                  <Check size={16} /> Builds plans without time conflicts
+                </li>
+                <li>
+                  <Check size={16} /> Guides you through voucher-ready checkout
+                </li>
+              </ul>
+              <button className="primary-button" onClick={() => openAssistant()}>
+                <Bot size={18} />
+                Start planning with Mai
               </button>
             </div>
-            <span className="floating-tag tag-one">Under your budget</span>
-            <span className="floating-tag tag-two">No schedule conflicts</span>
-          </div>
-          <div className="assistant-promo-copy">
-            <span className="eyebrow">More than a chatbot</span>
-            <h2>A local-minded assistant that can actually book.</h2>
-            <p>
-              Mai remembers your filters, explains trade-offs, checks the latest
-              option and price, then turns recommendations into actions you can
-              trust.
-            </p>
-            <ul>
-              <li>
-                <Check size={16} /> Compares the details that matter to you
-              </li>
-              <li>
-                <Check size={16} /> Builds plans without time conflicts
-              </li>
-              <li>
-                <Check size={16} /> Guides you through voucher-ready checkout
-              </li>
-            </ul>
-            <button className="primary-button" onClick={() => setAssistantOpen(true)}>
-              <Bot size={18} />
-              Start planning with Mai
-            </button>
-          </div>
-        </section>
+          </section>
+        )}
       </main>
 
       <footer className="site-footer">
@@ -1289,7 +1336,7 @@ function App() {
         <span>Hoi An · Da Nang · Hue</span>
       </footer>
 
-      {!assistantOpen && (
+      {assistantEnabled && !assistantOpen && (
         <div className={`assistant-fab-dock ${nudge ? 'nudged' : ''}`}>
           {nudge && (
             <div className="assistant-nudge" role="status">
@@ -1297,9 +1344,12 @@ function App() {
               <button
                 className="nudge-dismiss"
                 aria-label="Dismiss suggestion"
-                onClick={() =>
+                onClick={() => {
+                  api.track('assistant_nudge_dismissed', {
+                    trigger: nudge.signal,
+                  })
                   setDismissedNudges((current) => [...current, nudge.signal])
-                }
+                }}
               >
                 <X size={14} />
               </button>
@@ -1347,7 +1397,7 @@ function App() {
           setCartOpen(false)
           setCheckoutOpen(true)
         }}
-        onCheckPlan={checkMyPlan}
+        onCheckPlan={assistantEnabled ? checkMyPlan : undefined}
         clashing={findScheduleClash(cartItems) !== null}
       />
 

@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -8,7 +9,10 @@ from openai import AsyncAzureOpenAI
 
 from app.api.schemas import IntentValue, SearchIntent
 from app.common.config import Settings, get_settings
+from app.common.llm_cost import BudgetExceeded, ledger
 from app.common.ranking import deterministic_embedding
+
+logger = logging.getLogger(__name__)
 
 
 class AIProvider(Protocol):
@@ -160,26 +164,62 @@ class AzureOpenAIProvider:
         self.client = AsyncAzureOpenAI(**kwargs)
         self.settings = settings
 
+    def _guard(self, purpose: str) -> None:
+        """Refuse the call once the daily ceiling is reached.
+
+        Every caller has a deterministic fallback, so tripping the breaker
+        degrades quality rather than taking the storefront down.
+        """
+        if ledger.exhausted(self.settings.openai_daily_budget):
+            raise BudgetExceeded(
+                f"Daily OpenAI budget of ${self.settings.openai_daily_budget:.2f} reached; "
+                f"serving {purpose} from the deterministic fallback"
+            )
+
+    def _record(self, response: Any, model: str, purpose: str) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        ledger.record(
+            model,
+            float(getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0),
+            float(
+                getattr(usage, "output_tokens", 0)
+                or getattr(usage, "completion_tokens", 0)
+                or 0
+            ),
+            purpose,
+        )
+
     async def embed(self, text: str) -> list[float]:
+        self._guard("query embedding")
+        model = self.settings.azure_openai_embedding_deployment
         response = await self.client.embeddings.create(
-            model=self.settings.azure_openai_embedding_deployment,
+            model=model,
             input=text,
             dimensions=self.settings.openai_embedding_dimensions,
         )
+        self._record(response, model, "query_embedding")
         return response.data[0].embedding
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        # Deliberately unguarded: catalogue ingestion is an operator task with
+        # no fallback, and blocking it would leave the catalogue unsearchable.
+        # Its spend is still recorded so the ceiling reflects reality.
+        model = self.settings.azure_openai_embedding_deployment
         response = await self.client.embeddings.create(
-            model=self.settings.azure_openai_embedding_deployment,
+            model=model,
             input=texts,
             dimensions=self.settings.openai_embedding_dimensions,
         )
+        self._record(response, model, "catalog_embedding")
         return [
             item.embedding
             for item in sorted(response.data, key=lambda item: item.index)
         ]
 
     async def extract_intent(self, text: str) -> SearchIntent:
+        self._guard("intent extraction")
         constraint_value = {
             "anyOf": [
                 {"type": "string"},
@@ -286,11 +326,13 @@ class AzureOpenAIProvider:
             reasoning={"effort": "minimal"},
             max_output_tokens=800,
         )
+        self._record(response, self.settings.azure_openai_intent_deployment, "intent")
         if not response.output_text:
             return deterministic_intent(text)
         return SearchIntent.model_validate_json(response.output_text)
 
     async def plan_action(self, text: str, state: dict[str, Any]) -> str | None:
+        self._guard("tool planning")
         schema = {
             "type": "object",
             "properties": {
@@ -333,9 +375,11 @@ class AzureOpenAIProvider:
             },
             max_output_tokens=80,
         )
+        self._record(response, self.settings.azure_openai_chat_deployment, "tool_planning")
         return json.loads(response.output_text)["tool"]
 
     async def enhance_assistant(self, prompt: str, facts: list[dict[str, Any]]) -> str | None:
+        self._guard("assistant prose")
         schema = {
             "type": "object",
             "properties": {"message": {"type": "string"}},
@@ -369,6 +413,7 @@ class AzureOpenAIProvider:
             reasoning={"effort": "low"},
             max_output_tokens=self.settings.openai_max_output_tokens,
         )
+        self._record(response, self.settings.azure_openai_chat_deployment, "assistant_prose")
         return json.loads(response.output_text)["message"]
 
 

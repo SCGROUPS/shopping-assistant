@@ -25,6 +25,9 @@ class Settings(BaseSettings):
 
     assistant_max_tool_rounds: int = 3
     assistant_max_session_turns: int = 12
+    # Control group for the core thesis that guided selling beats manual search.
+    # Off by default: switch it on deliberately when running the experiment.
+    assistant_holdout_rate: float = 0.0
     search_lexical_candidates: int = 50
     search_semantic_candidates: int = 50
     search_rrf_k: int = 60

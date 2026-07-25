@@ -23,7 +23,7 @@ type CartDrawerProps = {
   onClose: () => void
   onRemove: (id: string) => void
   onCheckout: () => void
-  onCheckPlan: () => void
+  onCheckPlan?: () => void
   clashing: boolean
 }
 
@@ -112,12 +112,14 @@ export function CartDrawer({
               ))}
             </div>
 
-            <button className="cart-plan-check" onClick={onCheckPlan}>
-              <MessageCircle size={16} />
-              {clashing
-                ? 'Two items clash — ask Mai to re-time one'
-                : 'Check my plan with Mai'}
-            </button>
+            {onCheckPlan && (
+              <button className="cart-plan-check" onClick={onCheckPlan}>
+                <MessageCircle size={16} />
+                {clashing
+                  ? 'Two items clash — ask Mai to re-time one'
+                  : 'Check my plan with Mai'}
+              </button>
+            )}
 
             <div className="cart-assurance">
               <ShieldCheck size={20} />

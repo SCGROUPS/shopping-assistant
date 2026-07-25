@@ -294,6 +294,40 @@ export const filterDemoProducts = (
 export const api = {
   demoFallbackEnabled: ALLOW_DEMO_FALLBACK,
 
+  /**
+   * Fire-and-forget funnel telemetry.
+   *
+   * Never awaited and never allowed to throw: measurement must not be able to
+   * break the thing it measures.
+   */
+  track(
+    eventType: string,
+    properties: Record<string, unknown> = {},
+    options: { experienceId?: string; placement?: string } = {},
+  ): void {
+    void request('/events', {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        event_type: eventType,
+        experience_id: options.experienceId ?? null,
+        placement: options.placement ?? null,
+        properties,
+      }),
+    }).catch(() => undefined)
+  },
+
+  /** Cohort assignment, resolved before first paint. */
+  async sessionContext(): Promise<{ assistantEnabled: boolean }> {
+    try {
+      const payload = await request<Record<string, unknown>>('/session/context')
+      return { assistantEnabled: payload.assistant_enabled !== false }
+    } catch {
+      // A telemetry outage must not remove the assistant.
+      return { assistantEnabled: true }
+    }
+  },
+
   async listExperiences(): Promise<Experience[]> {
     try {
       return normalizeProducts(await request('/experiences'))

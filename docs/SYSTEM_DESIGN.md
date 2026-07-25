@@ -536,28 +536,55 @@ Model tiering is deliberate: `gpt-5-nano` for high-frequency structured
 extraction, `gpt-5.4-mini` reserved for user-visible prose, no frontier model
 in the normal path.
 
-### 11.2 As-built gaps
+### 11.2 Shared embedding cache
 
-- **`openai_daily_budget` (=10.0) is referenced nowhere outside config.** There
-  is no budget breaker and no token accounting. Verified: zero uses.
-- **The query embedding cache is a process-local dict**
-  (`self.data.query_embeddings`). It is lost on restart and not shared between
-  Container Apps replicas, so cost scales with replica count. `POC_SPEC.md`
-  §11.4 specifies a bounded `query_embedding_cache` **table** keyed by SHA-256
-  of normalized text with LRU eviction — not implemented.
+Tourist search traffic is head-heavy — the same few dozen queries arrive
+constantly — so caching query embeddings is the single largest cost lever in
+the system. `common/embedding_cache.py` implements two tiers:
+
+1. A bounded in-process LRU (512 entries) absorbs the hot head with no round
+   trip.
+2. The `query_embedding_cache` table (`POC_SPEC.md` §11.4) shares everything
+   else across replicas and survives restarts, keyed by SHA-256 of
+   `model + normalized text`.
+
+Normalization folds case and whitespace, so "Hoi An  Lantern Tour" and "hoi an
+lantern tour" are one entry rather than two paid calls. Cache failures are
+logged and swallowed: an optimization must never be able to break a search.
+
+### 11.3 Budget breaker
+
+`common/llm_cost.py` records estimated spend per call, keyed by UTC day and
+broken down by purpose. Once `openai_daily_budget` is reached, the provider
+raises `BudgetExceeded` **instead of** calling the model.
+
+This degrades rather than fails, which is only safe because every LLM call site
+already has a deterministic fallback: keyword intent parsing, hash embeddings,
+keyword tool routing and templated assistant prose. A storefront that still
+sells beats one that returns errors.
+
+Catalogue ingestion (`embed_many`) is deliberately exempt from the breaker —
+it is an operator task with no fallback, and blocking it would leave the
+catalogue unsearchable — but its spend is still recorded so the ceiling
+reflects reality.
+
+Current spend is exposed at `GET /api/v1/analytics/funnel` under `cost`.
+
+**Known limit:** the ledger is process-local, so with N replicas the effective
+ceiling is N × budget. An exact ceiling needs a shared counter in PostgreSQL or
+Redis. An approximate breaker that exists is worth far more than an exact one
+that does not.
+
+### 11.4 Remaining cost gaps
+
 - **Demo-path scoring is O(N)** Python cosine over the full catalog. Fine at
   360 products; not at MVP scale. The PostgreSQL path uses pgvector ANN and is
   the scale path.
+- **Semantic deduplication** of near-identical (not merely case-different)
+  queries is not implemented; it needs an embedding to decide, which is the
+  cost it would avoid. Worth revisiting only if cache-miss rate stays high.
 - Single replica cap and scale-to-zero-adjacent sizing keep infrastructure cost
   low but concentrate latency risk.
-
-### 11.3 MVP target
-
-Persist the embedding cache to the specified table; add a shared cache across
-replicas; add semantic deduplication of near-identical queries; enforce the
-daily budget with a circuit breaker that degrades to deterministic intent
-extraction rather than failing; record per-request token usage and cost, and
-surface cost per session and per booking.
 
 ---
 
@@ -572,33 +599,55 @@ Resolved during the MVP build:
 | 3 | §12.4 `availability_fit` | real slot-supply and capacity-headroom feature | 4 |
 | 4 | §12.4 `context_fit` over date/party/budget/language | blend of availability, preference and price fit | 4 |
 | 5 | §12.4 cold-start weight redistribution | session weight redistributed when no history exists | 4 |
+| 6 | §11.4 persistent LRU `query_embedding_cache` table | two-tier cache: in-process LRU over the shared table | 5 |
 | 7 | §13.1 "the model selects tools" | planner now outranks keyword matching | 1 |
+| 9 | §13.7 cost controls | daily budget breaker degrading to deterministic paths | 5 |
 | 10 | §11.3 "availability is an eligibility gate" | recommendations share `is_eligible` with search | 1 |
 
 Outstanding:
 
 | # | Spec | Implementation | Impact |
 |---|---|---|---|
-| 6 | §11.4 persistent LRU `query_embedding_cache` table | process-local dict | cost scales with replicas |
 | 8 | §13.3 ten tools incl. `get_experience_details`, `get_cart`, `remove_from_cart` | seven-value enum, subset implemented | reduced capability |
-| 9 | §13.7 cost controls | `openai_daily_budget` unenforced | no cost ceiling |
 | 11 | §11.3 margin term | category take-rate proxy; no real margin data | ranking approximates revenue (§16) |
+| 12 | §13.7 exact cost ceiling | per-process ledger | effective ceiling is N × budget |
 
 ---
 
 ## 13. Observability and experimentation
 
-Application Insights collects logs, metrics, and traces today. The MVP requires
-**funnel instrumentation**, which does not yet exist:
+Application Insights collects logs, metrics, and traces. On top of that,
+`common/analytics.py` computes the product funnel from behaviour events, served
+at `GET /api/v1/analytics/funnel`.
 
-- Impression → click → add-to-cart → checkout → booking, attributed per surface
-  (grid, assistant, each recommendation placement).
-- Assistant-touched vs. untouched session conversion.
-- Nudge accept/dismiss rate **per trigger type**; a trigger below roughly 10%
-  acceptance is noise and should be removed.
-- Zero-result rate and post-relaxation recovery rate.
-- Cost per session and per booking.
-- An **assistant holdout** cohort.
+### 13.1 What is measured
+
+| Metric | Why it exists |
+|---|---|
+| Impression → view → cart → checkout → booking, **per surface** | Without attribution we cannot tell whether the grid, the assistant, or a recommendation rail earned a booking, so we cannot decide where to invest. |
+| Assistant-touched vs. untouched session conversion | The direct read on the core thesis. |
+| Nudge shown / accepted / dismissed, **per trigger** | A nudge that is shown and never accepted is an interruption, not a service. Per-trigger granularity lets a single bad trigger be retired on evidence rather than the whole mechanism being abandoned. |
+| Zero-result rate and post-relaxation recovery rate | Measures whether §5.1 relaxation actually rescues dead-end searches. |
+| Daily LLM spend by purpose, against budget | Cost per session becomes observable rather than inferred. |
+
+Every stage carries a `placement`, set by the frontend at the point of action:
+`grid` or `assistant` today, extensible per recommendation rail.
+
+Rates are reported as `null`, never `0`, when there is no evidence — an
+unmeasured rate is unknown, and rendering it as 0% looks like failure.
+
+### 13.2 The assistant holdout
+
+`assistant_holdout_rate` (default `0.0`) assigns a share of sessions to a
+control group that never sees the assistant: no launcher, no nudges, no
+subject-carrying entry points, no promo section. Assignment is a deterministic
+hash of the session id, so a shopper's experience never flips mid-visit and the
+assignment survives a restart without being stored.
+
+The frontend resolves its cohort from `GET /api/v1/session/context` during
+bootstrap, before first paint, so a holdout session never briefly sees the very
+thing it is meant to be a control for. If that call fails, the assistant is
+assumed **enabled** — a telemetry outage must not silently remove the product.
 
 Without a holdout the core thesis — that the assistant beats manual search —
 is unfalsifiable, and therefore untunable.
@@ -644,9 +693,10 @@ work deliberately: better ranking into a leaking funnel returns little.
 9. Time-decayed behavioural signals and real popularity/conversion aggregates.
 10. Expected-value objective with margin and conversion rate.
 
-**Phase 5 — prove and control it**
+**Phase 5 — prove and control it** ✅
 11. Funnel telemetry, per-surface attribution, assistant holdout.
-12. Persistent shared embedding cache, semantic dedupe, budget breaker.
+12. Persistent shared embedding cache, budget breaker. (Semantic dedupe
+    deferred: it needs an embedding to decide, which is the cost it avoids.)
 
 **Phase 6 — commercial levers**
 13. Scarcity, social proof, multi-currency, cross-sell, email capture,

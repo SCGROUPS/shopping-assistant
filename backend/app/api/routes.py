@@ -36,8 +36,11 @@ from app.assistant.service import AssistantService
 from app.bookings.service import BookingService
 from app.cart.service import CartService
 from app.catalog.service import get_product_async, product_card, product_detail
+from app.common.analytics import assistant_holdout, funnel_report
+from app.common.config import get_settings
 from app.common.database import database_ready
 from app.common.errors import ApiError
+from app.common.llm_cost import ledger
 from app.common.models import BehaviorEvent
 from app.common.persistence import (
     catalog_products,
@@ -334,6 +337,38 @@ async def import_catalog(
     }
 
 
+@router.get("/session/context")
+async def session_context(session_id: SessionHeader = "demo-session") -> dict[str, Any]:
+    """Bootstrap the storefront: which cohort is this shopper in?
+
+    The frontend must know before first paint whether to render the assistant
+    at all, otherwise a holdout session briefly sees the very thing it is meant
+    to be a control for.
+    """
+    return {
+        "session_id": session_id,
+        "assistant_enabled": not assistant_holdout(session_id),
+        "assistant_holdout": assistant_holdout(session_id),
+    }
+
+
+@router.get("/analytics/funnel")
+async def analytics_funnel() -> dict[str, Any]:
+    """Funnel counts per surface, assistant lift, nudge quality, search health."""
+    settings = get_settings()
+    spend = ledger.snapshot()
+    report = await funnel_report()
+    report["cost"] = {
+        "day": spend.day.isoformat(),
+        "spent_usd": round(spend.total, 4),
+        "budget_usd": settings.openai_daily_budget,
+        "calls": spend.calls,
+        "by_purpose": {key: round(value, 4) for key, value in spend.by_purpose.items()},
+        "breaker_tripped": ledger.exhausted(settings.openai_daily_budget),
+    }
+    return report
+
+
 @router.get("/health")
 async def api_health() -> dict[str, Any]:
     products = await catalog_products()
@@ -349,14 +384,20 @@ async def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
     allowed = {
         "search_submitted",
         "search_results_viewed",
+        "search_zero_results",
+        "search_relaxed",
         "filter_applied",
         "experience_impression",
         "experience_viewed",
         "recommendation_impression",
         "recommendation_clicked",
+        "assistant_opened",
         "assistant_message_sent",
         "assistant_product_shown",
         "assistant_action_clicked",
+        "assistant_nudge_shown",
+        "assistant_nudge_accepted",
+        "assistant_nudge_dismissed",
         "availability_checked",
         "cart_item_added",
         "cart_item_removed",
