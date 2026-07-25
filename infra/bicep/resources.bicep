@@ -331,7 +331,7 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
             '-c'
           ]
           args: [
-            'uv run --no-sync alembic upgrade head && uv run --no-sync python -m app.catalog.cli seed-db'
+            'uv run --no-sync alembic upgrade head && uv run --no-sync python -m app.catalog.cli seed-db && uv run --no-sync python -m app.catalog.cli refresh-availability'
           ]
           env: [
             {

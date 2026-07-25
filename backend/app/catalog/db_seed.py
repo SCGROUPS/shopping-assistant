@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 
 from app.assistant.provider import AIProvider, build_ai_provider
 from app.catalog.seed import build_seed_catalog, stable_id
 from app.common.database import session_factory
 from app.common.models import (
     AvailabilitySlot,
+    Booking,
+    CartItem,
     Destination,
     Experience,
     ExperienceMedia,
@@ -210,3 +213,96 @@ async def seed_database(
 
         await session.commit()
     return len(catalog)
+
+
+async def refresh_availability() -> dict[str, int]:
+    """Reconcile seeded availability without destroying anything.
+
+    `seed_database` returns early when the catalogue already exists, so a change
+    to the seeded supply shape never reaches an environment that has been
+    seeded once. Forcing a reseed is not an acceptable alternative: it truncates
+    behaviour events, bookings and sessions, which is the measurement the whole
+    funnel depends on.
+
+    Slot ids are derived from the slug and start time, so re-running the seed on
+    a later date produces the same ids for dates that already exist and new ids
+    for dates that do not. Upserting on that id therefore both refreshes the
+    supply profile and extends the rolling window, while past slots are simply
+    left alone.
+
+    Capacity already consumed by confirmed bookings is subtracted, so this never
+    invents availability that has been sold — a scarcity badge computed from
+    resurrected capacity would be exactly the dishonest signal the feature is
+    designed to avoid.
+    """
+    if session_factory is None:
+        raise RuntimeError("DATABASE_URL is required for availability refresh.")
+
+    catalog = build_seed_catalog()
+    seeded: dict[uuid.UUID, tuple[uuid.UUID, dict]] = {
+        slot["id"]: (option["id"], slot)
+        for product in catalog
+        for option in product["options"]
+        for slot in option["slots"]
+    }
+
+    async with session_factory() as session:
+        booked_rows = (
+            await session.execute(
+                select(
+                    CartItem.slot_id,
+                    func.coalesce(func.sum(CartItem.quantity), 0),
+                )
+                .join(Booking, Booking.cart_id == CartItem.cart_id)
+                .where(CartItem.slot_id.is_not(None))
+                .group_by(CartItem.slot_id)
+            )
+        ).all()
+        booked: dict[uuid.UUID, int] = {
+            slot_id: int(quantity)
+            for slot_id, quantity in booked_rows
+            if slot_id is not None
+        }
+
+        existing = set(
+            (
+                await session.scalars(
+                    select(AvailabilitySlot.id).where(
+                        AvailabilitySlot.id.in_(list(seeded))
+                    )
+                )
+            ).all()
+        )
+
+        created = 0
+        updated = 0
+        for slot_id, (option_id, slot) in seeded.items():
+            consumed = booked.get(slot_id, 0)
+            remaining = max(0, slot["capacity_remaining"] - consumed)
+            if slot_id in existing:
+                await session.execute(
+                    update(AvailabilitySlot)
+                    .where(AvailabilitySlot.id == slot_id)
+                    .values(
+                        capacity_total=slot["capacity_total"],
+                        capacity_remaining=remaining,
+                    )
+                )
+                updated += 1
+            else:
+                session.add(
+                    AvailabilitySlot(
+                        id=slot_id,
+                        option_id=option_id,
+                        starts_at=slot["starts_at"],
+                        ends_at=slot["ends_at"],
+                        capacity_total=slot["capacity_total"],
+                        capacity_remaining=remaining,
+                        status=slot["status"],
+                        price_override=None,
+                    )
+                )
+                created += 1
+        await session.commit()
+
+    return {"created": created, "updated": updated}
