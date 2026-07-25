@@ -1432,6 +1432,15 @@ and one dies on the unique constraint. `upsert_catalog` takes a transaction-
 scoped advisory lock keyed on the supplier. It costs nothing — these are batch
 jobs, and a second run has nothing useful to do while the first is in flight.
 
+The lock is taken after the feed is fetched and embedded, so it serialises the
+*application* of two imports but not their ordering: an older import with slow
+embedding can still commit after a newer one and write the older feed. That is a
+supplier-freshness question rather than an index-correctness one — the index
+will faithfully describe whatever the catalogue ends up holding — and it stays
+theoretical while imports are a scheduled job that does not overlap itself. If
+overlapping imports ever become normal, the lock has to move ahead of the fetch,
+or imports need a generation number that lets a newer one reject an older.
+
 #### A deterministic vector never replaces a real one
 
 A fallback vector is worth having when the alternative is no document at all,
