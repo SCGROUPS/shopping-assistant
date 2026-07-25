@@ -557,7 +557,16 @@ async def process_index_work(
         # slow provider means every later item in the batch is racing a deadline
         # that was set before its embedding was even requested.
         await _renew(session_factory, remaining)
+        renew_after = time.monotonic() + LEASE_SECONDS / 2
         for index, (experience_id, locale, token) in enumerate(leases):
+            # Steady state, not the backfill: an edit that misses the cache
+            # costs a provider call per item, and a batch of those can outlast
+            # the lease they are all being written under. Renewed at half the
+            # lease rather than every iteration, which would be a write per
+            # document for no benefit.
+            if time.monotonic() >= renew_after:
+                await _renew(session_factory, remaining)
+                renew_after = time.monotonic() + LEASE_SECONDS / 2
             # The current item stays in `remaining` for the whole iteration,
             # including while its failure is being recorded. Dropping it first
             # meant a cancellation arriving during `_fail` released every later
@@ -704,7 +713,9 @@ def _is_transient(error: BaseException) -> bool:
     if any(token in name for token in ("RateLimit", "Timeout", "APIConnection", "InternalServer")):
         return True
     status = getattr(error, "status_code", None)
-    return isinstance(status, int) and (status == 429 or status >= 500)
+    # The same set the SDK itself retries. 408 and 409 are easy to forget and
+    # both mean "ask again", not "this document cannot be embedded".
+    return isinstance(status, int) and (status in {408, 409, 429} or status >= 500)
 
 
 async def _prewarm_embeddings(
