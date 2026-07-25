@@ -31,6 +31,25 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+
+    # The database code paths have a separate implementation from demo mode and
+    # were previously never executed by CI, so SQL-only defects could only be
+    # found by deploying. A throwaway PostgreSQL server makes them testable.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: vietra
+          POSTGRES_PASSWORD: vietra
+          POSTGRES_DB: vietra_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vietra"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +60,8 @@ jobs:
 
       - name: Validate backend
         working-directory: backend
+        env:
+          POSTGRES_TEST_DATABASE_URL: postgresql+psycopg://vietra:vietra@127.0.0.1:5432/vietra_test
         run: |
           uv sync --dev --locked
           uv run pytest -q

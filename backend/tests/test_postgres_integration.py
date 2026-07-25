@@ -10,9 +10,14 @@ from app.common.database import session_factory
 from app.common.models import BehaviorEvent, ConversationMessage, ShoppingSession
 from app.main import app
 
+# This suite drives the whole application against a PostgreSQL server that is
+# already seeded with the catalogue and reachable through DATABASE_URL, and it
+# streams a real assistant conversation. It therefore needs far more than a
+# bare database, and is gated separately from the analytics suite so that CI
+# can run the lightweight database tests without provisioning any of it.
 pytestmark = pytest.mark.skipif(
-    not os.getenv("POSTGRES_TEST_DATABASE_URL"),
-    reason="POSTGRES_TEST_DATABASE_URL is required",
+    not os.getenv("POSTGRES_SEEDED_TEST_DATABASE_URL"),
+    reason="POSTGRES_SEEDED_TEST_DATABASE_URL is required (seeded catalogue + LLM provider)",
 )
 
 
