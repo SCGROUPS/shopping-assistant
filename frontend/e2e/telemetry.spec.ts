@@ -7,8 +7,12 @@ import { expect, test } from '@playwright/test'
 test('search, view and cohort telemetry reach the backend', async ({
   page,
   request,
+  baseURL,
 }) => {
-  const funnel = 'http://localhost:8000/api/v1/analytics/funnel'
+  // Same-origin, so this resolves against the deployed app in CI and against
+  // the dev server's /api/v1 proxy locally. A hardcoded localhost backend
+  // would pass on a laptop and fail against anything real.
+  const funnel = new URL('/api/v1/analytics/funnel', baseURL).toString()
   const before = await (await request.get(funnel)).json()
 
   await page.goto('/')
