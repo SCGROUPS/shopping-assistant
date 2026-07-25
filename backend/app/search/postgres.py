@@ -4,6 +4,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.common.locales import text_search_config
+
 HYBRID_SEARCH_SQL = text(
     """
     WITH eligible AS (
@@ -157,19 +159,23 @@ HYBRID_SEARCH_SQL = text(
         row_number() OVER (
           ORDER BY ts_rank_cd(
             d.search_vector,
-            websearch_to_tsquery('english', unaccent(:query))
+            websearch_to_tsquery(CAST(:text_config AS regconfig), unaccent(:query))
           ) DESC
         ) AS rank
       FROM eligible e
-      JOIN experience_search_documents d ON d.experience_id = e.id
-      WHERE d.search_vector @@ websearch_to_tsquery('english', unaccent(:query))
+      JOIN experience_search_documents d
+        ON d.experience_id = e.id AND d.locale = :locale
+      WHERE d.search_vector
+            @@ websearch_to_tsquery(CAST(:text_config AS regconfig), unaccent(:query))
+      ORDER BY rank
       LIMIT :lexical_limit
     ),
     semantic AS (
       SELECT e.id,
         row_number() OVER (ORDER BY d.embedding <=> CAST(:embedding AS vector)) AS rank
       FROM eligible e
-      JOIN experience_search_documents d ON d.experience_id = e.id
+      JOIN experience_search_documents d
+        ON d.experience_id = e.id AND d.locale = :locale
       ORDER BY d.embedding <=> CAST(:embedding AS vector)
       LIMIT :semantic_limit
     ),
@@ -217,11 +223,14 @@ async def hybrid_search(
     semantic_limit: int = 50,
     rrf_k: int = 60,
     page_size: int = 20,
+    locale: str = "en",
 ) -> list[dict[str, Any]]:
     result = await session.execute(
         HYBRID_SEARCH_SQL,
         {
             "query": query,
+            "locale": locale,
+            "text_config": text_search_config(locale),
             "embedding": str(embedding),
             "destination_id": destination_id,
             "destination": destination,

@@ -10,7 +10,6 @@ owns.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -20,7 +19,13 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assistant.provider import AIProvider, build_ai_provider
+from app.catalog import indexing
 from app.catalog.db_seed import _document_text
+from app.catalog.indexing import (
+    FALLBACK_EMBEDDING_MODEL,
+    enqueue_experience_reindex,
+    upsert_search_document,
+)
 from app.catalog.seed import stable_id
 from app.catalog.trippass import (
     TRIPPASS_SUPPLIER_EXTERNAL_ID,
@@ -35,7 +40,6 @@ from app.common.models import (
     ExperienceMedia,
     ExperienceOption,
     ExperienceOverride,
-    ExperienceSearchDocument,
     OptionPrice,
     Supplier,
 )
@@ -84,15 +88,18 @@ async def _ensure_destination(session: AsyncSession, product: dict) -> Any:
     return destination
 
 
-async def _replace_media_and_document(session: AsyncSession, experience_id: Any) -> None:
-    """Media and the search document are derived, so they are safe to rebuild."""
+async def _replace_media(session: AsyncSession, experience_id: Any) -> None:
+    """Media is derived from the feed, so it is safe to rebuild wholesale.
+
+    Search documents deliberately are not. This used to delete every document
+    for the experience before recreating one, which is fine while English is
+    the only locale and destructive the moment it is not: one run of this
+    importer would erase every translated document and leave English behind,
+    degrading search silently rather than failing. Documents are now upserted
+    per locale by `catalog.indexing`.
+    """
     await session.execute(
         delete(ExperienceMedia).where(ExperienceMedia.experience_id == experience_id)
-    )
-    await session.execute(
-        delete(ExperienceSearchDocument).where(
-            ExperienceSearchDocument.experience_id == experience_id
-        )
     )
 
 
@@ -293,19 +300,29 @@ async def upsert_catalog(
     provider = ai_provider or build_ai_provider()
     documents = [_document_text(product) for product in catalog]
     embeddings: list[list[float]] = []
+    # Tracked per document, because a deterministic vector is not an embedding:
+    # it is unrelated to the vectors a shopper's query produces, so a document
+    # holding one is absent from semantic search while looking perfectly
+    # healthy. Recording which model actually produced each vector is what lets
+    # reconciliation find and replace them once the provider recovers.
+    fallbacks: list[bool] = []
     for start in range(0, len(documents), 64):
         batch = documents[start : start + 64]
         try:
             embeddings.extend(await provider.embed_many(batch))
+            fallbacks.extend(False for _ in batch)
         except Exception:
             logger.exception("Embedding batch failed; falling back to deterministic vectors")
             embeddings.extend(deterministic_embedding(document) for document in batch)
+            fallbacks.extend(True for _ in batch)
 
     created = updated = 0
     async with session_factory() as session:
         supplier = await _ensure_supplier(session, supplier_external_id, supplier_name)
 
-        for product, document, embedding in zip(catalog, documents, embeddings, strict=True):
+        for product, document, embedding, is_fallback in zip(
+            catalog, documents, embeddings, fallbacks, strict=True
+        ):
             destination = await _ensure_destination(session, product)
             experience = await session.scalar(
                 select(Experience).where(Experience.external_id == product["external_id"])
@@ -316,7 +333,7 @@ async def upsert_catalog(
                 created += 1
                 protected = frozenset()
             else:
-                await _replace_media_and_document(session, experience.id)
+                await _replace_media(session, experience.id)
                 updated += 1
                 protected = await _protected_fields(session, experience.id)
             _apply(experience, product, supplier.id, destination.id, protected)
@@ -341,17 +358,23 @@ async def upsert_catalog(
                 {option_data["external_id"] for option_data in product["options"]},
             )
 
-            session.add(
-                ExperienceSearchDocument(
-                    experience_id=experience.id,
-                    document_text=document,
-                    embedding=embedding,
-                    embedding_model="text-embedding-3-small",
-                    embedding_version="1",
-                    content_hash=hashlib.sha256(document.encode()).hexdigest(),
-                    embedded_at=datetime.now(UTC),
-                )
+            await upsert_search_document(
+                session,
+                experience_id=experience.id,
+                locale="en",
+                document_text=document,
+                embedding=embedding,
+                embedding_model=(
+                    FALLBACK_EMBEDDING_MODEL if is_fallback else indexing.EMBEDDING_MODEL
+                ),
             )
+            # English is written directly because the import already computed
+            # its embedding, but the other locales resolve *through* this text
+            # until they are translated - so a source change that only touched
+            # `en` would leave seven documents describing the previous version.
+            # Enqueueing every locale is safe: the ones already carrying this
+            # fingerprint are skipped rather than requeued.
+            await enqueue_experience_reindex(session, experience.id)
 
         await session.commit()
 

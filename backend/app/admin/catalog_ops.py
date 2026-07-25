@@ -29,6 +29,7 @@ from sqlalchemy.orm import selectinload
 
 from app.admin import audit
 from app.admin.auth import Principal
+from app.catalog.indexing import enqueue_experience_reindex
 from app.common.database import session_factory
 from app.common.errors import ApiError
 from app.common.models import (
@@ -406,6 +407,13 @@ async def update_experience(
             summary=f"Edited {', '.join(sorted(cleaned))} on '{experience.title}'",
             changes=audit.diff(before, after),
         )
+
+        # Without this the console can change what a product says and nothing
+        # about what search matches: only the importer ever wrote a search
+        # document, and a manually authored record is one no importer may
+        # touch. Enqueued in this transaction so the intent cannot outlive a
+        # rollback, nor be lost if the process dies before a follow-up call.
+        await enqueue_experience_reindex(session, experience.id)
     return await get_experience(experience_id)
 
 
@@ -445,6 +453,7 @@ async def clear_override(
             summary=f"Released {field} on '{experience.title}' back to the supplier feed",
             changes={field: {"from": "operator-managed", "to": "supplier-managed"}},
         )
+        await enqueue_experience_reindex(session, experience.id)
     return await get_experience(experience_id)
 
 

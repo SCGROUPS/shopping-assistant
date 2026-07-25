@@ -1,3 +1,4 @@
+import re
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -7,11 +8,13 @@ from app.api.schemas import Participant, SearchFilters
 from app.common.features import availability_fit, conversion_lift, price_fit
 from app.common.ranking import (
     bayesian_rating,
+    cosine_similarity,
     deterministic_embedding,
     mmr_diversify,
     reciprocal_rank_fusion,
     smoothed_rate,
     time_decay,
+    tokenize,
 )
 
 
@@ -111,12 +114,16 @@ def test_availability_fit_prefers_open_choice():
 def test_price_fit_peaks_below_the_ceiling():
     filters = SearchFilters(max_total_price=200)
     party = [Participant(type="adult", count=1)]
-    sweet = _product(options=[{**_product()["options"][0], "prices": [
-        {"participant_type": "adult", "amount": 150.0}
-    ]}])
-    at_ceiling = _product(options=[{**_product()["options"][0], "prices": [
-        {"participant_type": "adult", "amount": 200.0}
-    ]}])
+    sweet = _product(
+        options=[
+            {**_product()["options"][0], "prices": [{"participant_type": "adult", "amount": 150.0}]}
+        ]
+    )
+    at_ceiling = _product(
+        options=[
+            {**_product()["options"][0], "prices": [{"participant_type": "adult", "amount": 200.0}]}
+        ]
+    )
     assert price_fit(sweet, filters, party) > price_fit(at_ceiling, filters, party)
 
 
@@ -131,3 +138,78 @@ def test_conversion_lift_keeps_the_prior_at_the_midpoint():
     assert conversion_lift(4 * prior, prior) > 0.5
     assert conversion_lift(prior / 4, prior) < 0.5
     assert conversion_lift(0.0, prior) == 0.0
+
+
+def test_ascii_tokenisation_is_unchanged():
+    """The Latin path must not shift, or every existing ranking result moves."""
+    assert tokenize("Sunset Cruise 2024") == ["sunset", "cruise", "2024"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("日落游船", ["日落", "落游", "游船"]),
+        ("일몰 크루즈", ["일몰", "크루", "루즈"]),
+        ("du thuyền hoàng hôn", ["du", "thuyen", "hoang", "hon"]),
+        ("croisière", ["croisiere"]),
+    ],
+)
+def test_non_latin_text_produces_tokens(text: str, expected: list[str]):
+    """Regression guard for a tokenizer that emitted nothing at all for CJK.
+
+    While ``[a-z0-9]+`` was the pattern, Chinese produced an empty token list
+    and therefore a zero vector, so a multilingual eval case could only pass by
+    degenerating into browsing - a green suite over a broken feature.
+    """
+    assert tokenize(text) == expected
+
+
+def test_cjk_embeddings_separate_related_from_unrelated():
+    related = cosine_similarity(
+        deterministic_embedding("会安 日落游船"), deterministic_embedding("日落游船")
+    )
+    unrelated = cosine_similarity(
+        deterministic_embedding("日落游船"), deterministic_embedding("烹饪课程")
+    )
+    assert related > 0.5
+    assert unrelated < 0.2
+
+
+def test_diacritics_fold_so_accentless_typing_still_matches():
+    """Applied to document and query alike, so recall rises without asymmetry."""
+    accented = deterministic_embedding("du thuyền hoàng hôn")
+    plain = deterministic_embedding("du thuyen hoang hon")
+    assert cosine_similarity(accented, plain) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("accented", "plain"),
+    [
+        ("Đà Nẵng", "da nang"),
+        ("Đầm Sen", "dam sen"),
+        ("đường phố", "duong pho"),
+    ],
+)
+def test_stroke_letters_fold_like_postgres_unaccent(accented: str, plain: str):
+    """``đ`` carries a stroke, not a combining mark, so NFD alone leaves it.
+
+    PostgreSQL's ``unaccent`` maps it to ``d``. If Python disagreed, the lexical
+    vector and the database index would tokenise Vietnam's second city two
+    different ways and a shopper typing "da nang" would miss "Đà Nẵng".
+    """
+    assert tokenize(accented) == tokenize(plain)
+
+
+def test_post_create_entries_are_single_statements():
+    """Guards against Python's implicit string concatenation in the list.
+
+    A missing comma between two adjacent triple-quoted members silently fuses
+    them into one string. The result is still a valid list, so nothing fails
+    until PostgreSQL rejects the second ``CREATE``, and only on a fresh
+    database - which is to say, in front of a real deployment.
+    """
+    from app.common.schema import POST_CREATE
+
+    for statement in POST_CREATE:
+        keywords = re.findall(r"\bCREATE\b(?!\s+OR\s+REPLACE)", statement, flags=re.IGNORECASE)
+        assert len(keywords) <= 1, f"fused POST_CREATE entry: {statement[:120]!r}"

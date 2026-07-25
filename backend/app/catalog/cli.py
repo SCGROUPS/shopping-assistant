@@ -5,6 +5,7 @@ import json
 from app.admin.cli import create_operator, list_operators
 from app.catalog.db_seed import refresh_availability, seed_database
 from app.catalog.importer import import_trippass
+from app.catalog.indexing import drain_index_queue, run_reconcile
 from app.catalog.seed import build_seed_catalog
 from app.common.store import store
 
@@ -18,6 +19,7 @@ def main() -> None:
             "seed-db",
             "refresh-availability",
             "import-trippass",
+            "reindex",
             "summary",
             "create-operator",
             "list-operators",
@@ -67,16 +69,20 @@ def main() -> None:
             f"{result['needs_review']} need review"
         )
         return
+    if args.command == "reindex":
+        # Reconcile first: a release that changes how documents are built
+        # touches no catalogue row, so nothing would be in the queue to drain.
+        queued = asyncio.run(run_reconcile())
+        count = asyncio.run(drain_index_queue(limit=None))
+        print(f"Reconciled {queued} stale locales; rebuilt {count} search documents")
+        return
     if args.command == "seed-db":
         count = asyncio.run(seed_database(force=args.force))
         print(f"Seeded {count} PostgreSQL experiences")
         return
     if args.command == "refresh-availability":
         result = asyncio.run(refresh_availability())
-        print(
-            f"Availability refreshed: {result['created']} created, "
-            f"{result['updated']} updated"
-        )
+        print(f"Availability refreshed: {result['created']} created, {result['updated']} updated")
         return
     count = store.seed(force=True)
     if args.command == "seed":

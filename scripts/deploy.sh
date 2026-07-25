@@ -117,36 +117,72 @@ login_server="$(az acr show \
 
 build_revision="build-$(date -u +%Y%m%d%H%M%S)"
 
-deploy_stack "${login_server}/vietra:latest" "$build_revision"
+# Runs a Container Apps job to completion, failing the deploy if it does not
+# succeed. Both jobs need this and neither may be fire-and-forget: an unnoticed
+# migration failure would be discovered by the first request that needed the
+# new column.
+run_job() {
+  local job_name="$1"
+  local description="$2"
+  local execution=""
+  local status=""
 
-az containerapp job start \
+  # Capture the execution this call started and poll *that* one. Selecting the
+  # most recently started execution instead looks equivalent and is not: for a
+  # few seconds after `start` returns, Azure's list can still show only the
+  # previous run. That run has already succeeded, so the script would read
+  # "Succeeded", promote the application, and take traffic on the new image
+  # before the migration it was supposed to wait for had even begun.
+  execution="$(az containerapp job start \
+    --resource-group "$resource_group" \
+    --name "$job_name" \
+    --query name \
+    --output tsv)"
+
+  if [[ -z "$execution" ]]; then
+    echo "${description} could not be started." >&2
+    return 1
+  fi
+
+  for _ in {1..120}; do
+    status="$(az containerapp job execution show \
+      --resource-group "$resource_group" \
+      --name "$job_name" \
+      --job-execution-name "$execution" \
+      --query properties.status \
+      --output tsv 2>/dev/null || true)"
+    case "$status" in
+      Succeeded)
+        return 0
+        ;;
+      Failed|Degraded)
+        echo "${description} failed (execution ${execution})." >&2
+        return 1
+        ;;
+    esac
+    sleep 10
+  done
+
+  echo "${description} did not complete within 20 minutes (execution ${execution})." >&2
+  return 1
+}
+
+# Migrate before the app is promoted, not after. The container app and the jobs
+# share one `containerImage` parameter, so deploying the stack would move the
+# app to the new image too; updating the job's image directly is what lets the
+# schema go first. Migrations must therefore be expand-only - the old code is
+# still serving traffic while this runs, and must keep working afterwards.
+az containerapp job update \
   --resource-group "$resource_group" \
-  --name "job-${prefix}-catalog" \
+  --name "job-${prefix}-migrate" \
+  --image "${login_server}/vietra:latest" \
   --output none
 
-job_status=""
-for _ in {1..120}; do
-  job_status="$(az containerapp job execution list \
-    --resource-group "$resource_group" \
-    --name "job-${prefix}-catalog" \
-    --query "sort_by(@, &properties.startTime)[-1].properties.status" \
-    --output tsv)"
-  case "$job_status" in
-    Succeeded)
-      break
-      ;;
-    Failed)
-      echo "Catalog job failed." >&2
-      exit 1
-      ;;
-  esac
-  sleep 10
-done
+run_job "job-${prefix}-migrate" "Schema migration"
 
-if [[ "$job_status" != "Succeeded" ]]; then
-  echo "Catalog job did not complete within 20 minutes." >&2
-  exit 1
-fi
+deploy_stack "${login_server}/vietra:latest" "$build_revision"
+
+run_job "job-${prefix}-catalog" "Catalog job"
 
 hostname="$(az containerapp show \
   --resource-group "$resource_group" \

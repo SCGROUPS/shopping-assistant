@@ -125,7 +125,14 @@ async def load_products(
         select(ExperienceSearchDocument).where(
             ExperienceSearchDocument.experience_id.in_(
                 {item.id for item in experiences}
-            )
+            ),
+            # Explicit, not incidental. The document table is keyed by
+            # (experience_id, locale), so without this filter a record with
+            # several locales would contribute several rows and whichever the
+            # database returned last would win - silently, and differently on
+            # different runs. Locale-aware resolution replaces the constant;
+            # until then the constant is the honest description of what we serve.
+            ExperienceSearchDocument.locale == "en",
         )
     )
     documents = {

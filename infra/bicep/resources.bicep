@@ -350,7 +350,7 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
             '-c'
           ]
           args: [
-            'uv run --no-sync alembic upgrade head && uv run --no-sync python -m app.catalog.cli seed-db && uv run --no-sync python -m app.catalog.cli refresh-availability && { uv run --no-sync python -m app.catalog.cli import-trippass || echo "Trippass import skipped: supplier feed unavailable"; }'
+            'uv run --no-sync python -m app.catalog.cli seed-db && uv run --no-sync python -m app.catalog.cli refresh-availability && { uv run --no-sync python -m app.catalog.cli import-trippass || echo "Trippass import skipped: supplier feed unavailable"; } && uv run --no-sync python -m app.catalog.cli reindex'
           ]
           env: [
             {
@@ -380,6 +380,78 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               name: 'AZURE_OPENAI_API_VERSION'
               value: '2025-04-01-preview'
+            }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+    }
+    workloadProfileName: 'Consumption'
+  }
+}
+
+// Schema migration is its own job, deliberately separate from the catalog job.
+// When both lived together the migration ran *after* `deploy_stack` had already
+// pointed the container app at the new image, so new code served traffic
+// against an old schema for however long Alembic took. Splitting it lets
+// deploy.sh update and run this job alone - by image, without touching the
+// app - and only promote the app once the expand migration has succeeded.
+resource migrateJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: 'job-${prefix}-migrate'
+  location: location
+  properties: {
+    environmentId: environment.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaTimeout: 1800
+      replicaRetryLimit: 0
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: contains(containerImage, registry.properties.loginServer)
+        ? [
+            {
+              server: registry.properties.loginServer
+              username: registry.listCredentials().username
+              passwordSecretRef: 'registry-password'
+            }
+          ]
+        : []
+      secrets: [
+        {
+          name: 'database-url'
+          value: databaseUrl
+        }
+        {
+          name: 'registry-password'
+          value: registry.listCredentials().passwords[0].value
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'migrate'
+          image: containerImage
+          command: [
+            'sh'
+            '-c'
+          ]
+          args: [
+            'uv run --no-sync alembic upgrade head'
+          ]
+          env: [
+            {
+              name: 'APP_ENV'
+              value: 'azure'
+            }
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
             }
           ]
           resources: {
