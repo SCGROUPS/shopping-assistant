@@ -193,12 +193,23 @@ frontend/src/
 
 ## 4.1 Supplier ingestion
 
-Seeded demo inventory is generated in the internal shape already. Real supply is
-not: `app/catalog/trippass.py` imports the Trippass (HeriStep) API, whose
-records carry names, descriptions, images and priced variants but **none of the
-facets L1-L3 needs** - no destination, category, duration, indoor/outdoor or
-accessibility. Its `category_name` mixes places ("Hoi An") with promotions ("Hot
-Deal") and vehicle types ("Hoi An E-Car"), so it cannot be used as a facet.
+Seeded demo inventory is generated in the internal shape already. Imported
+inventory is not: `app/catalog/trippass.py` imports the Trippass (HeriStep) API,
+whose records carry names, descriptions, images and priced variants but **none
+of the facets L1-L3 needs** - no destination, category, duration,
+indoor/outdoor or accessibility. Its `category_name` mixes places ("Hoi An")
+with promotions ("Hot Deal") and vehicle types ("Hoi An E-Car"), so it cannot be
+used as a facet.
+
+**Trippass is reference inventory, not the supply model.** It exists to give
+retrieval, ranking and the storefront realistic volume to work against; it is
+not a commercial source and nothing about the architecture should assume it
+stays. Owned supply arrives two ways, neither of which is built yet: authored
+directly by human operators, and submitted by remote partners through an API
+this system exposes. `docs/CONTENT_PIPELINE.md` specifies both, along with the
+ownership, locale and provenance columns that make an imported record and an
+authored one distinguishable - a distinction the current schema cannot express,
+which is why every listing is silently treated as third-party today.
 
 Classification therefore runs **once per listing at import time**, through the
 same declared-schema mechanism the assistant uses (`AIProvider.structure` with a

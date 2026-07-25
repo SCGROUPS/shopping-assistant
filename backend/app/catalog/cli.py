@@ -5,6 +5,7 @@ import json
 from app.admin.cli import create_operator, list_operators
 from app.catalog.db_seed import refresh_availability, seed_database
 from app.catalog.importer import import_trippass
+from app.catalog.indexing import run_reindex
 from app.catalog.seed import build_seed_catalog
 from app.common.store import store
 
@@ -18,6 +19,7 @@ def main() -> None:
             "seed-db",
             "refresh-availability",
             "import-trippass",
+            "reindex",
             "summary",
             "create-operator",
             "list-operators",
@@ -67,16 +69,28 @@ def main() -> None:
             f"{result['needs_review']} need review"
         )
         return
+    if args.command == "reindex":
+        # Reconcile first: a release that changes how documents are built
+        # touches no catalogue row, so nothing would be in the queue to drain.
+        queued, count, backlog = asyncio.run(run_reindex())
+        print(f"Reconciled {queued} stale locales; rebuilt {count} search documents")
+        # A drain stops when it can build nothing, which is not the same as the
+        # queue being empty - another replica may hold the rest, or a round of
+        # transient failures may have returned everything to `queued`. Reporting
+        # what is left and exiting non-zero is what turns "the job succeeded"
+        # into a claim about the index rather than about the command.
+        if backlog:
+            summary = ", ".join(f"{n} {status}" for status, n in sorted(backlog.items()))
+            print(f"Index backlog not empty: {summary}")
+            raise SystemExit(1)
+        return
     if args.command == "seed-db":
         count = asyncio.run(seed_database(force=args.force))
         print(f"Seeded {count} PostgreSQL experiences")
         return
     if args.command == "refresh-availability":
         result = asyncio.run(refresh_availability())
-        print(
-            f"Availability refreshed: {result['created']} created, "
-            f"{result['updated']} updated"
-        )
+        print(f"Availability refreshed: {result['created']} created, {result['updated']} updated")
         return
     count = store.seed(force=True)
     if args.command == "seed":

@@ -1,4 +1,5 @@
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,7 +23,23 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     if settings.demo_mode:
         store.seed()
-    yield
+        yield
+        return
+
+    # Content changes enqueue a reindex in their own transaction (see
+    # `catalog.indexing`); something has to drain the queue. A task in the
+    # application process is the right size for a single-replica deployment,
+    # and means an operator's correction reaches search in seconds rather than
+    # waiting for a manually triggered catalog job.
+    from app.catalog.indexing import index_worker_loop
+
+    worker = asyncio.create_task(index_worker_loop())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
 
 
 app = FastAPI(

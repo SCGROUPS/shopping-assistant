@@ -10,17 +10,23 @@ owns.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assistant.provider import AIProvider, build_ai_provider
+from app.catalog import indexing
 from app.catalog.db_seed import _document_text
+from app.catalog.indexing import (
+    FALLBACK_EMBEDDING_MODEL,
+    enqueue_experience_reindex,
+    mark_locale_indexed,
+    upsert_search_document,
+)
 from app.catalog.seed import stable_id
 from app.catalog.trippass import (
     TRIPPASS_SUPPLIER_EXTERNAL_ID,
@@ -84,15 +90,18 @@ async def _ensure_destination(session: AsyncSession, product: dict) -> Any:
     return destination
 
 
-async def _replace_media_and_document(session: AsyncSession, experience_id: Any) -> None:
-    """Media and the search document are derived, so they are safe to rebuild."""
+async def _replace_media(session: AsyncSession, experience_id: Any) -> None:
+    """Media is derived from the feed, so it is safe to rebuild wholesale.
+
+    Search documents deliberately are not. This used to delete every document
+    for the experience before recreating one, which is fine while English is
+    the only locale and destructive the moment it is not: one run of this
+    importer would erase every translated document and leave English behind,
+    degrading search silently rather than failing. Documents are now upserted
+    per locale by `catalog.indexing`.
+    """
     await session.execute(
         delete(ExperienceMedia).where(ExperienceMedia.experience_id == experience_id)
-    )
-    await session.execute(
-        delete(ExperienceSearchDocument).where(
-            ExperienceSearchDocument.experience_id == experience_id
-        )
     )
 
 
@@ -290,22 +299,48 @@ async def upsert_catalog(
     if not catalog:
         return {"created": 0, "updated": 0, "needs_review": 0}
 
+    # A fixed order, because two imports running at once take the same row
+    # locks. Visiting products in different orders is the textbook deadlock:
+    # each holds what the other needs next, and Postgres resolves it by killing
+    # one of them - an import that fails for no reason anybody can reproduce.
+    catalog = sorted(catalog, key=lambda product: str(product["external_id"]))
+
     provider = ai_provider or build_ai_provider()
     documents = [_document_text(product) for product in catalog]
     embeddings: list[list[float]] = []
+    # Tracked per document, because a deterministic vector is not an embedding:
+    # it is unrelated to the vectors a shopper's query produces, so a document
+    # holding one is absent from semantic search while looking perfectly
+    # healthy. Recording which model actually produced each vector is what lets
+    # reconciliation find and replace them once the provider recovers.
+    fallbacks: list[bool] = []
     for start in range(0, len(documents), 64):
         batch = documents[start : start + 64]
         try:
             embeddings.extend(await provider.embed_many(batch))
+            fallbacks.extend(False for _ in batch)
         except Exception:
             logger.exception("Embedding batch failed; falling back to deterministic vectors")
             embeddings.extend(deterministic_embedding(document) for document in batch)
+            fallbacks.extend(True for _ in batch)
 
     created = updated = 0
     async with session_factory() as session:
+        # Ordering alone does not make two concurrent imports safe. Suppliers,
+        # destinations and experiences are all created select-then-insert, so
+        # two runs meeting the same new entity race to insert it and one dies on
+        # the unique constraint. Serialising imports of a supplier costs nothing
+        # - they are batch jobs, and a second one has nothing useful to do while
+        # the first is running anyway.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": f"vietra:import:{supplier_external_id}"},
+        )
         supplier = await _ensure_supplier(session, supplier_external_id, supplier_name)
 
-        for product, document, embedding in zip(catalog, documents, embeddings, strict=True):
+        for product, document, embedding, is_fallback in zip(
+            catalog, documents, embeddings, fallbacks, strict=True
+        ):
             destination = await _ensure_destination(session, product)
             experience = await session.scalar(
                 select(Experience).where(Experience.external_id == product["external_id"])
@@ -316,7 +351,7 @@ async def upsert_catalog(
                 created += 1
                 protected = frozenset()
             else:
-                await _replace_media_and_document(session, experience.id)
+                await _replace_media(session, experience.id)
                 updated += 1
                 protected = await _protected_fields(session, experience.id)
             _apply(experience, product, supplier.id, destination.id, protected)
@@ -341,17 +376,78 @@ async def upsert_catalog(
                 {option_data["external_id"] for option_data in product["options"]},
             )
 
-            session.add(
-                ExperienceSearchDocument(
-                    experience_id=experience.id,
-                    document_text=document,
-                    embedding=embedding,
-                    embedding_model="text-embedding-3-small",
-                    embedding_version="1",
-                    content_hash=hashlib.sha256(document.encode()).hexdigest(),
-                    embedded_at=datetime.now(UTC),
+            # Enqueued *before* the document is written, and that order is the
+            # whole point. A worker holding an older version of this listing has
+            # already taken the work item's row lock; enqueueing makes the
+            # import wait for it rather than race it. Writing the document
+            # first, then skipping the enqueue because the document now looks
+            # current, let the worker wake up afterwards and overwrite the
+            # freshly imported text with the version it had been building - with
+            # no work item left to repair it.
+            #
+            # The fan-out is not only about English. Until a listing is
+            # translated every locale resolves *through* this text, so a source
+            # change that touched only `en` would leave seven documents
+            # describing the previous version.
+            await enqueue_experience_reindex(session, experience.id)
+
+            # The embedding above was computed from the *supplier's* text. The
+            # catalogue does not always agree with that text: `_apply` skips
+            # every field an operator has corrected, so a fixed title lives in
+            # the row while the feed keeps sending the old one. Writing the
+            # supplier's document would quietly undo the correction in search
+            # while the listing page went on showing it - and because the
+            # catalogue was current, the fan-out above found nothing to enqueue,
+            # so no work item would exist to notice.
+            #
+            # So the shortcut is taken only when the two agree. When they do
+            # not, the fan-out has already done the right thing: either the
+            # stored document matches the catalogue and there is nothing to do,
+            # or it does not and the work is queued for a worker that builds
+            # from the row rather than from the feed.
+            destination_name = await session.scalar(
+                select(Destination.name).where(Destination.id == experience.destination_id)
+            )
+            canonical = await indexing.resolved_document_text(
+                session, experience, destination_name or "", "en"
+            )
+            healthy_fingerprint = indexing.index_fingerprint(canonical, "en")
+            stored_fingerprint = await session.scalar(
+                select(ExperienceSearchDocument.index_fingerprint).where(
+                    ExperienceSearchDocument.experience_id == experience.id,
+                    ExperienceSearchDocument.locale == "en",
                 )
             )
+            # A deterministic vector is worth having when the alternative is no
+            # document at all, and never worth having in place of a real one. An
+            # unchanged re-import during a provider outage would otherwise
+            # replace a healthy embedding with numbers unrelated to any query -
+            # and because the text did not change, the fan-out above found
+            # nothing to enqueue, so nothing would ever put it back.
+            if canonical == document and not (
+                is_fallback and stored_fingerprint == healthy_fingerprint
+            ):
+                embedding_model = (
+                    FALLBACK_EMBEDDING_MODEL if is_fallback else indexing.EMBEDDING_MODEL
+                )
+                await upsert_search_document(
+                    session,
+                    experience_id=experience.id,
+                    locale="en",
+                    document_text=document,
+                    embedding=embedding,
+                    embedding_model=embedding_model,
+                )
+                # English is written here because the import already paid for
+                # its embedding, so the request it just enqueued is already
+                # satisfied - unless the vector was a fallback, in which case
+                # the fingerprints disagree and the request correctly survives.
+                await mark_locale_indexed(
+                    session,
+                    experience.id,
+                    "en",
+                    indexing.index_fingerprint(document, "en", embedding_model),
+                )
 
         await session.commit()
 
