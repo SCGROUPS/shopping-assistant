@@ -30,7 +30,6 @@ from app.catalog.trippass import (
 from app.common.database import session_factory
 from app.common.models import (
     AvailabilitySlot,
-    CartItem,
     Destination,
     Experience,
     ExperienceMedia,
@@ -84,40 +83,8 @@ async def _ensure_destination(session: AsyncSession, product: dict) -> Any:
     return destination
 
 
-async def _clear_children(session: AsyncSession, experience_id: Any) -> None:
-    """Drop the parts of an experience the supplier owns, keeping the row.
-
-    Keeping the experience row keeps its id stable, so carts, bookings and
-    behaviour events that reference it survive a re-import.
-    """
-    option_ids = (
-        await session.scalars(
-            select(ExperienceOption.id).where(ExperienceOption.experience_id == experience_id)
-        )
-    ).all()
-    if option_ids:
-        referenced = set(
-            (
-                await session.scalars(
-                    select(CartItem.option_id).where(CartItem.option_id.in_(option_ids))
-                )
-            ).all()
-        )
-        removable = [oid for oid in option_ids if oid not in referenced]
-        if referenced:
-            logger.info(
-                "Keeping %d option(s) still referenced by a cart on experience %s",
-                len(referenced),
-                experience_id,
-            )
-        if removable:
-            await session.execute(
-                delete(AvailabilitySlot).where(AvailabilitySlot.option_id.in_(removable))
-            )
-            await session.execute(delete(OptionPrice).where(OptionPrice.option_id.in_(removable)))
-            await session.execute(
-                delete(ExperienceOption).where(ExperienceOption.id.in_(removable))
-            )
+async def _replace_media_and_document(session: AsyncSession, experience_id: Any) -> None:
+    """Media and the search document are derived, so they are safe to rebuild."""
     await session.execute(
         delete(ExperienceMedia).where(ExperienceMedia.experience_id == experience_id)
     )
@@ -126,6 +93,116 @@ async def _clear_children(session: AsyncSession, experience_id: Any) -> None:
             ExperienceSearchDocument.experience_id == experience_id
         )
     )
+
+
+async def _sync_option(session: AsyncSession, experience_id: Any, option_data: dict) -> None:
+    """Upsert one option, its prices and its availability window.
+
+    Deleting and recreating options was wrong twice over: it breaks the foreign
+    keys carts and bookings hold, and skipping the ones a cart referenced left
+    those options frozen on stale prices with an availability window that
+    quietly expired. Upserting keeps every id stable and every option current.
+    """
+    option = await session.scalar(
+        select(ExperienceOption).where(
+            ExperienceOption.experience_id == experience_id,
+            ExperienceOption.external_id == option_data["external_id"],
+        )
+    )
+    if option is None:
+        option = ExperienceOption(
+            id=option_data["id"],
+            experience_id=experience_id,
+            external_id=option_data["external_id"],
+        )
+        session.add(option)
+    option.name = option_data["name"][:200]
+    option.description = option_data["description"]
+    option.validity_type = option_data["validity_type"]
+    option.confirmation_type = option_data["confirmation_type"]
+    option.cancellation_policy_code = option_data["cancellation_policy_code"]
+    option.free_cancellation_hours = option_data["free_cancellation_hours"]
+    option.max_party_size = option_data["max_party_size"]
+    option.active = option_data["active"]
+    await session.flush()
+
+    # Carts snapshot their own unit prices, so no row points at option_prices
+    # and the supplier's current price list can simply replace ours.
+    await session.execute(delete(OptionPrice).where(OptionPrice.option_id == option.id))
+    for price_data in option_data["prices"]:
+        session.add(
+            OptionPrice(
+                id=stable_id(
+                    "price",
+                    f"{option_data['external_id']}:{price_data['participant_type']}",
+                ),
+                option_id=option.id,
+                participant_type=price_data["participant_type"],
+                currency=price_data["currency"],
+                amount=Decimal(str(price_data["amount"])),
+                minimum_age=price_data["minimum_age"],
+                maximum_age=price_data["maximum_age"],
+            )
+        )
+
+    # Slot ids are derived from the option and start time, so re-importing on a
+    # later date extends the rolling window instead of duplicating it. Existing
+    # slots keep their capacity: resurrecting sold seats would manufacture the
+    # scarcity signal the storefront is supposed to report honestly.
+    wanted = option_data["slots"]
+    present = set(
+        (
+            await session.scalars(
+                select(AvailabilitySlot.id).where(
+                    AvailabilitySlot.id.in_([slot["id"] for slot in wanted])
+                )
+            )
+        ).all()
+    )
+    for slot_data in wanted:
+        if slot_data["id"] in present:
+            continue
+        session.add(
+            AvailabilitySlot(
+                id=slot_data["id"],
+                option_id=option.id,
+                starts_at=slot_data["starts_at"],
+                ends_at=slot_data["ends_at"],
+                capacity_total=slot_data["capacity_total"],
+                capacity_remaining=slot_data["capacity_remaining"],
+                status=slot_data["status"],
+                price_override=None,
+            )
+        )
+
+
+async def _retire_withdrawn_options(
+    session: AsyncSession, experience_id: Any, current: set[str]
+) -> None:
+    """Deactivate options the supplier no longer publishes.
+
+    Deleting them would orphan carts and bookings. Deactivating retires them
+    everywhere it matters instead: both search and add-to-cart require an
+    active option, so a withdrawn variant stops being sellable while the rows
+    a past purchase depends on stay intact.
+    """
+    stale = (
+        await session.scalars(
+            select(ExperienceOption).where(
+                ExperienceOption.experience_id == experience_id,
+                ExperienceOption.external_id.notin_(current),
+                ExperienceOption.active.is_(True),
+            )
+        )
+    ).all()
+    for option in stale:
+        option.active = False
+    if stale:
+        logger.info(
+            "Deactivated %d option(s) withdrawn by the supplier on experience %s",
+            len(stale),
+            experience_id,
+        )
 
 
 def _apply(experience: Experience, product: dict, supplier_id: Any, destination_id: Any) -> None:
@@ -193,7 +270,7 @@ async def upsert_catalog(
                 session.add(experience)
                 created += 1
             else:
-                await _clear_children(session, experience.id)
+                await _replace_media_and_document(session, experience.id)
                 updated += 1
             _apply(experience, product, supplier.id, destination.id)
             await session.flush()
@@ -209,61 +286,13 @@ async def upsert_catalog(
                     )
                 )
 
-            existing_options = set(
-                (
-                    await session.scalars(
-                        select(ExperienceOption.external_id).where(
-                            ExperienceOption.experience_id == experience.id
-                        )
-                    )
-                ).all()
-            )
             for option_data in product["options"]:
-                if option_data["external_id"] in existing_options:
-                    continue
-                session.add(
-                    ExperienceOption(
-                        id=option_data["id"],
-                        experience_id=experience.id,
-                        external_id=option_data["external_id"],
-                        name=option_data["name"][:200],
-                        description=option_data["description"],
-                        validity_type=option_data["validity_type"],
-                        confirmation_type=option_data["confirmation_type"],
-                        cancellation_policy_code=option_data["cancellation_policy_code"],
-                        free_cancellation_hours=option_data["free_cancellation_hours"],
-                        max_party_size=option_data["max_party_size"],
-                        active=option_data["active"],
-                    )
-                )
-                for price_data in option_data["prices"]:
-                    session.add(
-                        OptionPrice(
-                            id=stable_id(
-                                "price",
-                                f"{option_data['external_id']}:{price_data['participant_type']}",
-                            ),
-                            option_id=option_data["id"],
-                            participant_type=price_data["participant_type"],
-                            currency=price_data["currency"],
-                            amount=Decimal(str(price_data["amount"])),
-                            minimum_age=price_data["minimum_age"],
-                            maximum_age=price_data["maximum_age"],
-                        )
-                    )
-                for slot_data in option_data["slots"]:
-                    session.add(
-                        AvailabilitySlot(
-                            id=slot_data["id"],
-                            option_id=option_data["id"],
-                            starts_at=slot_data["starts_at"],
-                            ends_at=slot_data["ends_at"],
-                            capacity_total=slot_data["capacity_total"],
-                            capacity_remaining=slot_data["capacity_remaining"],
-                            status=slot_data["status"],
-                            price_override=None,
-                        )
-                    )
+                await _sync_option(session, experience.id, option_data)
+            await _retire_withdrawn_options(
+                session,
+                experience.id,
+                {option_data["external_id"] for option_data in product["options"]},
+            )
 
             session.add(
                 ExperienceSearchDocument(

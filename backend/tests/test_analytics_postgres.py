@@ -15,12 +15,12 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
-from conftest import reset_postgres
+from conftest import create_postgres_schema, reset_postgres
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.common import analytics, persistence
 from app.common.analytics import funnel_report
-from app.common.models import Base, BehaviorEvent, ShoppingSession
+from app.common.models import BehaviorEvent, ShoppingSession
 
 DATABASE_URL = os.getenv("POSTGRES_TEST_DATABASE_URL")
 
@@ -31,13 +31,9 @@ pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="POSTGRES_TEST_DATABASE
 async def db_factory(monkeypatch):
     engine = create_async_engine(DATABASE_URL or "", pool_pre_ping=True)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with engine.begin() as connection:
-        # Some models carry pgvector columns. The extension is not enabled by
-        # default even on an image that ships it, and creating it here keeps
-        # the suite runnable against any bare server rather than depending on
-        # setup performed elsewhere.
-        await connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
-        await connection.run_sync(Base.metadata.create_all)
+    # Build the schema the migration builds: the pgvector/unaccent extensions
+    # and the tsvector trigger are raw SQL that the metadata cannot describe.
+    await create_postgres_schema(engine)
     await reset_postgres(engine)
 
     # Route the analytics module at this engine and force the SQL branch.

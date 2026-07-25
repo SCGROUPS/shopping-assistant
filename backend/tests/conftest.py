@@ -31,3 +31,18 @@ async def reset_postgres(engine, keep: tuple[str, ...] = ()) -> None:
         await connection.exec_driver_sql(
             f"TRUNCATE TABLE {', '.join(tables)} RESTART IDENTITY CASCADE"
         )
+
+
+# `create_all` alone yields a schema that accepts catalogue rows and then
+# rejects the first search document, because the tsvector trigger is raw SQL the
+# metadata cannot describe. Build the same schema the migration does.
+async def create_postgres_schema(engine) -> None:
+    from app.common.models import Base
+    from app.common.schema import EXTENSIONS, POST_CREATE
+
+    async with engine.begin() as connection:
+        for statement in EXTENSIONS:
+            await connection.exec_driver_sql(statement)
+        await connection.run_sync(Base.metadata.create_all)
+        for statement in POST_CREATE:
+            await connection.exec_driver_sql(statement)
