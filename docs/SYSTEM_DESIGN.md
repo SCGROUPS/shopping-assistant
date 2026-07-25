@@ -212,11 +212,18 @@ Three rules keep the import honest:
   CLI reports the count. The first import silently filed a Hoi An museum under
   Da Nang this way; normalisation now backs off through the deployment's rate
   limit before conceding.
-- **Re-import must not be destructive.** `app/catalog/importer.py` upserts on
-  `Experience.external_id` and replaces only that experience's children, so
-  prices and variants resync while experience ids - and the carts, bookings and
-  behaviour events pointing at them - survive. Options still referenced by a
-  live cart are kept. Seeding truncates; importing never does.
+- **Re-import must not be destructive.** The import runs on every deploy while
+  shoppers hold live carts, so `app/catalog/importer.py` upserts rather than
+  rewrites. Experiences match on `external_id`, options on
+  `(experience_id, external_id)`, and slot ids are derived from the option and
+  start time; every id therefore stays stable and the carts, bookings and
+  behaviour events pointing at them survive. Prices are replaced (carts snapshot
+  their own, so nothing references them), new slots extend the rolling window
+  while existing ones keep their capacity - resurrecting sold seats would
+  manufacture the scarcity signal §6 requires to be honest - and a variant the
+  supplier withdraws is **deactivated, not deleted**, which removes it from
+  search and add-to-cart without erasing history. Seeding truncates; importing
+  never does.
 
 The supplier's stock endpoint is unavailable in staging, so imported
 availability is published on a fixed daily schedule rather than read from the

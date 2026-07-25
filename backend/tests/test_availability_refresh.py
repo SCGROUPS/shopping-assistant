@@ -12,7 +12,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-from conftest import reset_postgres
+from conftest import create_postgres_schema, reset_postgres
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -20,7 +20,6 @@ from app.catalog import db_seed
 from app.catalog.db_seed import refresh_availability
 from app.common.models import (
     AvailabilitySlot,
-    Base,
     Booking,
     Cart,
     CartItem,
@@ -69,9 +68,7 @@ def _mini_catalog(slot_id, starts_at, capacity_total, capacity_remaining):
 async def factory(monkeypatch):
     engine = create_async_engine(DATABASE_URL or "", pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with engine.begin() as connection:
-        await connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
-        await connection.run_sync(Base.metadata.create_all)
+    await create_postgres_schema(engine)
     await reset_postgres(engine)
     async with session_factory() as db, db.begin():
         db.add(Supplier(id=SUPPLIER_ID, external_id="T", name="T", status="ACTIVE"))
