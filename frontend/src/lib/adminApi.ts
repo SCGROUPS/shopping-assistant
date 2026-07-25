@@ -163,6 +163,11 @@ export const patchExperience = (id: string, changes: Record<string, unknown>) =>
     body: JSON.stringify(changes),
   })
 
+export const clearOverride = (id: string, field: string) =>
+  request<CatalogRow>(`/experiences/${id}/overrides/${encodeURIComponent(field)}`, {
+    method: 'DELETE',
+  })
+
 export const changeStatus = (id: string, status: string, note?: string) =>
   request<CatalogRow>(`/experiences/${id}/status`, {
     method: 'POST',
