@@ -1578,3 +1578,59 @@ async def test_the_repair_job_outwaits_a_live_lease(factory):
 
     assert indexing.run_reindex.__kwdefaults__ is not None
     assert indexing.run_reindex.__kwdefaults__["settle_seconds"] > indexing.LEASE_SECONDS
+
+
+async def test_a_re_import_does_not_undo_an_operator_correction_in_search(factory):
+    """The feed's text is not the catalogue's text, and only one of them is true.
+
+    `_apply` skips every field an operator has corrected, which is what lets the
+    editor and the nightly import coexist. But the import also carries a
+    document it built from the *supplier's* fields and an embedding of that
+    document. Writing it puts the supplier's title back into search while the
+    listing page goes on showing the operator's - and because the catalogue was
+    already current, the fan-out found nothing to enqueue, so no work item
+    exists to notice the disagreement.
+    """
+    from app.catalog import indexing
+    from app.common.models import ExperienceOverride, IndexWorkItem
+
+    await _import()
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+    experience = await _only(factory)
+
+    async with factory() as db, db.begin():
+        db.add(ExperienceOverride(experience_id=experience.id, fields=["title"]))
+        await db.execute(
+            update(Experience)
+            .where(Experience.id == experience.id)
+            .values(title="Operator Corrected Title")
+        )
+        await indexing.enqueue_experience_reindex(db, experience.id)
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+
+    await _import()
+
+    async with factory() as db:
+        document = await db.scalar(
+            select(ExperienceSearchDocument).where(
+                ExperienceSearchDocument.experience_id == experience.id,
+                ExperienceSearchDocument.locale == "en",
+            )
+        )
+        outstanding = list(
+            (
+                await db.scalars(
+                    select(IndexWorkItem).where(
+                        IndexWorkItem.experience_id == experience.id,
+                        IndexWorkItem.status != "done",
+                    )
+                )
+            ).all()
+        )
+        title = await db.scalar(select(Experience.title).where(Experience.id == experience.id))
+
+    assert title == "Operator Corrected Title"
+    assert document is not None
+    assert "Operator Corrected Title" in document.document_text
+    assert RAW["name"] not in document.document_text
+    assert outstanding == []

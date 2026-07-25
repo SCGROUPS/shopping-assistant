@@ -1401,6 +1401,37 @@ transaction. Until such an operation exists, nothing may issue an `UPDATE` on
 `Destination.name`. The same reasoning applies to any field later promoted into
 the document — promoting it into the text is only half the change.
 
+#### The importer's shortcut is only valid when the feed and the catalogue agree
+
+The import embeds a document it builds from the *supplier's* fields, and writes
+it directly to save the worker a round trip. That shortcut is only sound while
+the catalogue says the same thing as the feed, and `_apply` exists precisely to
+make them differ: every field an operator has corrected is skipped on import, so
+a fixed title lives in the row while the feed keeps sending the old one.
+
+Writing the supplier's document then puts the old title back into search while
+the listing page goes on showing the correction — and because the catalogue was
+already current, the fan-out found nothing to enqueue, so no work item exists
+anywhere to notice the disagreement. The import therefore rebuilds the canonical
+English document from the persisted row and takes its shortcut only when the two
+texts are identical. When they are not, the fan-out has already done the right
+thing: either the stored document matches the catalogue and there is nothing to
+do, or it does not and the work is queued for a worker that builds from the row.
+
+This is the same rule as §9.4's opening claim, applied to the one writer that
+was still exempt from it: **only the catalogue decides what is indexed.** A
+document assembled from anything else is a guess about what the catalogue
+contains, and the import is the one place where that guess can be wrong.
+
+#### Imports of a supplier are serialised
+
+Deterministic ordering removes the deadlock between two concurrent imports but
+not the race: suppliers, destinations and experiences are all created
+select-then-insert, so two runs meeting the same new entity race to insert it
+and one dies on the unique constraint. `upsert_catalog` takes a transaction-
+scoped advisory lock keyed on the supplier. It costs nothing — these are batch
+jobs, and a second run has nothing useful to do while the first is in flight.
+
 #### A deterministic vector never replaces a real one
 
 A fallback vector is worth having when the alternative is no document at all,
@@ -1702,6 +1733,8 @@ first, then revision 2's.
 | **A `failed` row is always evidence of work still owed** | The document can be made current by another path while a request for it is failing; reconciliation then walks past it forever because there is nothing to enqueue, and every future deploy fails on a healthy index. Satisfied requests are retired (§9.4) |
 | **Import order is an implementation detail** | Two concurrent imports taking the same row locks in different orders deadlock, and Postgres resolves it by killing one — an unreproducible failure. Products are visited in `external_id` order (§9.4) |
 | **Only `Experience` fields feed the document** | `resolved_document_text` also reads `Destination.name`, and nothing enqueues on a rename. Latent only because destinations are insert-only today; "every mutation of an indexed input enqueues the experiences it affects" is now an explicit invariant (§9.4) |
+| **The document the import embedded is the document to store** | It is built from the supplier's fields, but `_apply` skips every field an operator has corrected — so writing it reverted the correction in search while the listing page still showed it, with nothing enqueued to notice. The shortcut is taken only when the canonical text matches (§9.4) |
+| **Deterministic ordering makes concurrent imports safe** | It removes the deadlock, not the race: suppliers, destinations and experiences are created select-then-insert, so two runs meeting the same new entity race to insert it. Imports of a supplier take an advisory lock (§9.4) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,
 migration entirely, the `language`/`locale` collision, audit attribution for

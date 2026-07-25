@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assistant.provider import AIProvider, build_ai_provider
@@ -326,6 +326,16 @@ async def upsert_catalog(
 
     created = updated = 0
     async with session_factory() as session:
+        # Ordering alone does not make two concurrent imports safe. Suppliers,
+        # destinations and experiences are all created select-then-insert, so
+        # two runs meeting the same new entity race to insert it and one dies on
+        # the unique constraint. Serialising imports of a supplier costs nothing
+        # - they are batch jobs, and a second one has nothing useful to do while
+        # the first is running anyway.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": f"vietra:import:{supplier_external_id}"},
+        )
         supplier = await _ensure_supplier(session, supplier_external_id, supplier_name)
 
         for product, document, embedding, is_fallback in zip(
@@ -381,7 +391,27 @@ async def upsert_catalog(
             # describing the previous version.
             await enqueue_experience_reindex(session, experience.id)
 
-            healthy_fingerprint = indexing.index_fingerprint(document, "en")
+            # The embedding above was computed from the *supplier's* text. The
+            # catalogue does not always agree with that text: `_apply` skips
+            # every field an operator has corrected, so a fixed title lives in
+            # the row while the feed keeps sending the old one. Writing the
+            # supplier's document would quietly undo the correction in search
+            # while the listing page went on showing it - and because the
+            # catalogue was current, the fan-out above found nothing to enqueue,
+            # so no work item would exist to notice.
+            #
+            # So the shortcut is taken only when the two agree. When they do
+            # not, the fan-out has already done the right thing: either the
+            # stored document matches the catalogue and there is nothing to do,
+            # or it does not and the work is queued for a worker that builds
+            # from the row rather than from the feed.
+            destination_name = await session.scalar(
+                select(Destination.name).where(Destination.id == experience.destination_id)
+            )
+            canonical = await indexing.resolved_document_text(
+                session, experience, destination_name or "", "en"
+            )
+            healthy_fingerprint = indexing.index_fingerprint(canonical, "en")
             stored_fingerprint = await session.scalar(
                 select(ExperienceSearchDocument.index_fingerprint).where(
                     ExperienceSearchDocument.experience_id == experience.id,
@@ -394,7 +424,9 @@ async def upsert_catalog(
             # replace a healthy embedding with numbers unrelated to any query -
             # and because the text did not change, the fan-out above found
             # nothing to enqueue, so nothing would ever put it back.
-            if not (is_fallback and stored_fingerprint == healthy_fingerprint):
+            if canonical == document and not (
+                is_fallback and stored_fingerprint == healthy_fingerprint
+            ):
                 embedding_model = (
                     FALLBACK_EMBEDDING_MODEL if is_fallback else indexing.EMBEDDING_MODEL
                 )
