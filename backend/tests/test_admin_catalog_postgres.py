@@ -33,6 +33,7 @@ from app.common.models import (
     Destination,
     Experience,
     ExperienceOverride,
+    ExperienceSearchDocument,
 )
 from app.main import app
 
@@ -605,14 +606,19 @@ async def test_exhausted_work_becomes_failed_and_an_edit_revives_it(factory):
         await process_index_work(factory, broken, limit=50)
 
     async with factory() as db:
-        statuses = set(
+        statuses = dict(
             (
-                await db.scalars(
-                    select(IndexWorkItem.status).where(IndexWorkItem.experience_id == experience.id)
+                await db.execute(
+                    select(IndexWorkItem.locale, IndexWorkItem.status).where(
+                        IndexWorkItem.experience_id == experience.id
+                    )
                 )
             ).all()
         )
-    assert statuses == {"failed"}
+    # English was satisfied by the import itself; every locale the worker had to
+    # build is retired as failed rather than left reporting itself as pending.
+    assert statuses.pop("en") == "done"
+    assert set(statuses.values()) == {"failed"}
 
     await catalog_ops.update_experience(
         experience.id, {"title": "Corrected After An Outage"}, OPERATOR
@@ -762,14 +768,17 @@ async def test_reconciliation_revives_work_that_burnt_its_retries(factory):
         await indexing.process_index_work(factory, broken, limit=50)
 
     async with factory() as db:
-        statuses = set(
+        statuses = dict(
             (
-                await db.scalars(
-                    select(IndexWorkItem.status).where(IndexWorkItem.experience_id == experience.id)
+                await db.execute(
+                    select(IndexWorkItem.locale, IndexWorkItem.status).where(
+                        IndexWorkItem.experience_id == experience.id
+                    )
                 )
             ).all()
         )
-    assert statuses == {"failed"}
+    assert statuses.pop("en") == "done"
+    assert set(statuses.values()) == {"failed"}
 
     async with factory() as db, db.begin():
         revived = await indexing.reconcile_index(db)
@@ -1220,8 +1229,9 @@ async def test_a_shutdown_while_recording_a_failure_still_releases_the_item(fact
                 )
             ).all()
         )
-    assert items
-    assert all(item.status == "queued" for item in items)
+    released = [item for item in items if item.locale != "en"]
+    assert released
+    assert all(item.status == "queued" for item in released)
     assert all(item.lease_token is None for item in items)
     assert all(item.attempts == 0 for item in items)
 
@@ -1302,3 +1312,140 @@ async def test_a_drain_that_builds_nothing_still_reports_its_backlog(factory, mo
 
     backlog = await indexing.index_backlog()
     assert backlog.get("queued", 0) >= len(SUPPORTED_LOCALES) - 1
+
+
+async def test_an_import_cannot_be_overwritten_by_a_worker_holding_older_content(factory):
+    """The import must wait for a worker mid-flight, not race it.
+
+    A worker leases English, reads the listing, and starts embedding. The import
+    arrives with newer content. If it wrote its document first and then skipped
+    the enqueue - because the document it had just written already looked
+    current - the worker would wake, overwrite the imported text with the
+    version it had been building, and mark the item done. The newer content
+    would be gone from search with nothing left to repair it.
+
+    Enqueueing first is what prevents that: the work item's row lock is held by
+    the worker, so the import blocks until the worker has finished and can
+    therefore never be overtaken by it.
+    """
+    import asyncio
+
+    from app.catalog import indexing
+    from app.common.models import IndexWorkItem
+
+    await _import()
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+    experience = await _only(factory)
+
+    async def import_v2() -> None:
+        await upsert_catalog(
+            [to_catalog_product({**RAW, "name": "Marble Mountains Full Day"}, FACETS, days=3)],
+            supplier_external_id="TRIPPASS",
+            supplier_name="Trippass",
+            ai_provider=_StubEmbedder(),
+        )
+
+    async with factory() as holder, holder.begin():
+        await holder.execute(
+            select(IndexWorkItem)
+            .where(
+                IndexWorkItem.experience_id == experience.id,
+                IndexWorkItem.locale == "en",
+            )
+            .with_for_update()
+        )
+        running = asyncio.create_task(import_v2())
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(running), timeout=1.0)
+
+    await asyncio.wait_for(running, timeout=30)
+
+    async with factory() as db:
+        document = await db.scalar(
+            select(ExperienceSearchDocument).where(
+                ExperienceSearchDocument.experience_id == experience.id,
+                ExperienceSearchDocument.locale == "en",
+            )
+        )
+    assert document is not None
+    assert "Full Day" in document.document_text
+
+
+async def test_the_repair_job_waits_for_work_another_replica_is_doing(factory, monkeypatch):
+    """A deployment must not fail because indexing was working.
+
+    The repair job does not run alone: the application keeps an in-process
+    worker, so part of the backlog can be leased by a replica getting on with
+    it. The job's own drain finds nothing leasable, and a job that failed the
+    moment it saw a non-empty backlog would report a broken index every time
+    the app happened to be busy at deploy time.
+    """
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+
+    from app.catalog import indexing
+    from app.common import database
+    from app.common.models import IndexWorkItem
+
+    await _import()
+    monkeypatch.setattr(database, "session_factory", factory, raising=False)
+    monkeypatch.setattr("app.assistant.provider.build_ai_provider", lambda: _StubEmbedder())
+
+    # Another replica holds this locale, and holds it beyond one poll.
+    async with factory() as db, db.begin():
+        await db.execute(
+            update(IndexWorkItem)
+            .where(
+                IndexWorkItem.experience_id.in_(select(Experience.id)),
+                IndexWorkItem.locale == "vi",
+            )
+            .values(
+                status="leased",
+                lease_token=uuid4(),
+                leased_until=datetime.now(UTC) + timedelta(minutes=5),
+            )
+        )
+
+    async def finish_later() -> None:
+        await asyncio.sleep(0.6)
+        async with db2 as session, session.begin():
+            await session.execute(
+                update(IndexWorkItem)
+                .where(IndexWorkItem.locale == "vi")
+                .values(status="done", lease_token=None, leased_until=None)
+            )
+
+    db2 = factory()
+    helper = asyncio.create_task(finish_later())
+    _, _, backlog = await indexing.run_reindex(settle_seconds=20.0, poll_seconds=0.2)
+    await helper
+
+    assert backlog == {}
+
+
+async def test_the_repair_job_does_not_wait_out_a_terminal_failure(factory, monkeypatch):
+    """Waiting is for work in progress. A `failed` row is not in progress.
+
+    Blocking the full settle window on something that will never change turns
+    every genuine indexing failure into a slow one, and the job has to report
+    it either way.
+    """
+    import time
+
+    from app.catalog import indexing
+    from app.common import database
+
+    await _import()
+    monkeypatch.setattr(database, "session_factory", factory, raising=False)
+    monkeypatch.setattr(
+        "app.assistant.provider.build_ai_provider", lambda: _StubEmbedder(fail=True)
+    )
+    for _ in range(indexing.MAX_ATTEMPTS + 1):
+        await indexing.process_index_work(factory, _StubEmbedder(fail=True), limit=500)
+
+    started = time.monotonic()
+    _, _, backlog = await indexing.run_reindex(settle_seconds=30.0, poll_seconds=1.0)
+    elapsed = time.monotonic() - started
+
+    assert backlog.get("failed", 0) >= 1
+    assert elapsed < 10

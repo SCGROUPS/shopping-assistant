@@ -1217,6 +1217,18 @@ Two capabilities depend on that, and neither works without it:
   *every* locale unconditionally and have only the genuinely stale ones become
   jobs. That is what makes the next point affordable.
 
+**The importer enqueues before it writes, and that order is load-bearing.**
+The English document is written directly because the import already paid for
+its embedding. Written *first*, the import would then find its own document
+current, skip the English enqueue, take no lock on the work item at all, and
+commit — and a worker that had leased the previous version would wake up,
+overwrite the freshly imported text with what it had been building, and mark the
+item done. The newer content would be gone from search with nothing left to
+repair it. Enqueueing first takes the work item's row lock, so an import cannot
+overtake a worker; it waits for one. The request the import just created is then
+retired explicitly, conditional on the fingerprint, so a document written with a
+fallback embedding does not retire the request that exists to replace it.
+
 **The importer enqueues every locale, not just the one it writes.** Until a
 listing is translated, every locale resolves *through* the source text, so an
 import that writes only `en` leaves seven documents describing the previous
@@ -1320,11 +1332,28 @@ to the queue, the backlog and every retry. Leasing therefore begins by retiring
 expired leases with no attempts left, and `_fail` logs its own failure rather
 than suppressing it, so the state has both a recovery and an explanation.
 
+**Lease deadlines are the database's clock, never the application's.**
+Replicas do not agree on the time. A replica running fast would expire leases
+another replica is still working; running slow, it would decline to reclaim
+leases that really are dead. `now()` is evaluated in Postgres for both the
+deadline and the sweep, so every replica reads the same clock. Fencing by lease
+token is what makes an expired-but-still-running worker harmless: it can no
+longer commit, because the token no longer matches.
+
 **A drain that stops is not a queue that is empty.** The loop ends when a round
 builds nothing, and a round in which every item failed transiently returns them
 all to `queued` and builds none. The repair command therefore reports the
 remaining backlog by status and exits non-zero, which is what makes "the job
 succeeded" a claim about the index rather than about the command.
+
+But it does not run alone: the application keeps an in-process worker, so part
+of the backlog can be legitimately leased by a replica getting on with it, and a
+job that failed the moment it saw a non-empty backlog would report a broken
+index every time the app happened to be busy at deploy time. Queued and leased
+rows are treated as in flight and waited on to a bound; a `failed` row is
+terminal by definition and returns immediately, because waiting out a settle
+window on something that will never change only makes every genuine failure a
+slow one.
 
 **The catalog job drains too, and this is not redundancy.** The web app runs
 with `minReplicas: 0`, so the in-process worker only exists while the app is
@@ -1623,6 +1652,9 @@ first, then revision 2's.
 | **A drain that returns zero means the queue is empty** | A round in which every item failed transiently returns them to `queued` and builds nothing, so the repair command exited successfully having rebuilt none of the index it exists to repair (§9.4) |
 | **A default argument reads the module constant** | `page_size: int = RECONCILE_PAGE_SIZE` binds at import, so the paging test monkeypatching the constant ran a single page of 200 and proved nothing about paging (§9.4) |
 | **Normalising `source_language` in the chain builder is enough** | Field resolution compared each candidate against the raw column, so a record tagged `VI` resolved no fields at all — the one failure mode the normalisation was added to prevent (§9.4) |
+| **A writer that keeps its own document current need not enqueue** | The importer wrote English, found it current, and skipped the enqueue — so it never took the work item's row lock, and a worker holding the previous version overwrote the import after it committed. Writers enqueue *before* they write (§9.4) |
+| **Lease deadlines can be stamped by the application clock** | Replicas disagree about the time, so one running fast expires leases another is still working. Both the deadline and the sweep are evaluated in the database (§9.4) |
+| **A non-empty backlog means the repair failed** | The in-process worker holds part of it whenever the app is awake, so the deploy job would fail because indexing was working. In-flight work is waited on to a bound; only `failed` is immediate (§9.4) |
 | **`information_schema.data_type` compares column types** | It reports every `varchar(n)` as "character varying" and every `vector(n)` as "USER-DEFINED", so a migration creating `vector(1536)` against a model wanting `vector(512)` compared equal. `format_type` is what compares (§13) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,

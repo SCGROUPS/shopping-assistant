@@ -24,6 +24,7 @@ from app.catalog.db_seed import _document_text
 from app.catalog.indexing import (
     FALLBACK_EMBEDDING_MODEL,
     enqueue_experience_reindex,
+    mark_locale_indexed,
     upsert_search_document,
 )
 from app.catalog.seed import stable_id
@@ -358,23 +359,42 @@ async def upsert_catalog(
                 {option_data["external_id"] for option_data in product["options"]},
             )
 
+            # Enqueued *before* the document is written, and that order is the
+            # whole point. A worker holding an older version of this listing has
+            # already taken the work item's row lock; enqueueing makes the
+            # import wait for it rather than race it. Writing the document
+            # first, then skipping the enqueue because the document now looks
+            # current, let the worker wake up afterwards and overwrite the
+            # freshly imported text with the version it had been building - with
+            # no work item left to repair it.
+            #
+            # The fan-out is not only about English. Until a listing is
+            # translated every locale resolves *through* this text, so a source
+            # change that touched only `en` would leave seven documents
+            # describing the previous version.
+            await enqueue_experience_reindex(session, experience.id)
+
+            embedding_model = (
+                FALLBACK_EMBEDDING_MODEL if is_fallback else indexing.EMBEDDING_MODEL
+            )
             await upsert_search_document(
                 session,
                 experience_id=experience.id,
                 locale="en",
                 document_text=document,
                 embedding=embedding,
-                embedding_model=(
-                    FALLBACK_EMBEDDING_MODEL if is_fallback else indexing.EMBEDDING_MODEL
-                ),
+                embedding_model=embedding_model,
             )
-            # English is written directly because the import already computed
-            # its embedding, but the other locales resolve *through* this text
-            # until they are translated - so a source change that only touched
-            # `en` would leave seven documents describing the previous version.
-            # Enqueueing every locale is safe: the ones already carrying this
-            # fingerprint are skipped rather than requeued.
-            await enqueue_experience_reindex(session, experience.id)
+            # English is written here because the import already paid for its
+            # embedding, so the request it just enqueued is already satisfied -
+            # unless the vector was a fallback, in which case the fingerprints
+            # disagree and the request correctly survives.
+            await mark_locale_indexed(
+                session,
+                experience.id,
+                "en",
+                indexing.index_fingerprint(document, "en", embedding_model),
+            )
 
         await session.commit()
 

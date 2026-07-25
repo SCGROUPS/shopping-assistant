@@ -5,7 +5,7 @@ import json
 from app.admin.cli import create_operator, list_operators
 from app.catalog.db_seed import refresh_availability, seed_database
 from app.catalog.importer import import_trippass
-from app.catalog.indexing import drain_index_queue, index_backlog, run_reconcile
+from app.catalog.indexing import run_reindex
 from app.catalog.seed import build_seed_catalog
 from app.common.store import store
 
@@ -72,17 +72,15 @@ def main() -> None:
     if args.command == "reindex":
         # Reconcile first: a release that changes how documents are built
         # touches no catalogue row, so nothing would be in the queue to drain.
-        queued = asyncio.run(run_reconcile())
-        count = asyncio.run(drain_index_queue(limit=None))
+        queued, count, backlog = asyncio.run(run_reindex())
         print(f"Reconciled {queued} stale locales; rebuilt {count} search documents")
-        # The drain stops when a round builds nothing, which is not the same as
-        # the queue being empty: a round in which every item failed transiently
-        # returns its items to `queued` and builds none. Reporting the backlog
-        # and exiting non-zero is what turns "the job succeeded" into a claim
-        # about the index rather than about the command.
-        backlog = asyncio.run(index_backlog())
+        # A drain stops when it can build nothing, which is not the same as the
+        # queue being empty - another replica may hold the rest, or a round of
+        # transient failures may have returned everything to `queued`. Reporting
+        # what is left and exiting non-zero is what turns "the job succeeded"
+        # into a claim about the index rather than about the command.
         if backlog:
-            summary = ", ".join(f"{count} {status}" for status, count in sorted(backlog.items()))
+            summary = ", ".join(f"{n} {status}" for status, n in sorted(backlog.items()))
             print(f"Index backlog not empty: {summary}")
             raise SystemExit(1)
         return

@@ -19,13 +19,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import case, func, select, true, update
+from sqlalchemy import case, func, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -184,6 +185,43 @@ def source_locale(experience: Experience) -> str:
     document would be built, stored, and searchable - containing no text.
     """
     return (experience.source_language or DEFAULT_LOCALE).strip().lower()
+
+
+async def mark_locale_indexed(
+    session: AsyncSession,
+    experience_id: uuid.UUID,
+    locale: str,
+    fingerprint: str,
+) -> None:
+    """Retire a work item a caller has just satisfied itself, in its transaction.
+
+    Used by the importer, which already computed an embedding and writes the
+    source document directly. It must still *enqueue* first - taking the work
+    item's row lock is the only thing that stops a worker holding an older
+    version from overwriting the document after the import commits - and this is
+    what stops the enqueue from then causing a pointless rebuild of a document
+    that is already correct.
+
+    Conditional on the fingerprint, so a document written with a fallback
+    embedding does not retire the request that exists to replace it.
+    """
+    await session.execute(
+        update(IndexWorkItem)
+        .where(
+            IndexWorkItem.experience_id == experience_id,
+            IndexWorkItem.locale == locale,
+            IndexWorkItem.status == "queued",
+            IndexWorkItem.fingerprint == fingerprint,
+        )
+        .values(
+            status="done",
+            lease_token=None,
+            leased_until=None,
+            attempts=0,
+            error_detail=None,
+            updated_at=datetime.now(UTC),
+        )
+    )
 
 
 async def resolution_chain(experience: Experience, locale: str) -> tuple[str, ...]:
@@ -379,7 +417,11 @@ async def _lease(session: AsyncSession, limit: int) -> list[tuple[Any, ...]]:
     embedding calls, which cost money.
     """
     token = uuid.uuid4()
-    now = datetime.now(UTC)
+    # Lease deadlines are read and written in the database's clock, never the
+    # application's. Replicas do not agree on the time, and a replica running a
+    # few seconds fast would expire leases another replica is still working -
+    # or, running slow, decline to reclaim leases that really are dead.
+    now = func.now()
 
     # Retire leases that expired with no attempts left. Leasing requires
     # `attempts < MAX_ATTEMPTS`, so an item whose lease expired on its final
@@ -430,7 +472,7 @@ async def _lease(session: AsyncSession, limit: int) -> list[tuple[Any, ...]]:
             .values(
                 status="leased",
                 lease_token=token,
-                leased_until=now + timedelta(seconds=LEASE_SECONDS),
+                leased_until=now + text(f"interval '{LEASE_SECONDS} seconds'"),
                 attempts=IndexWorkItem.attempts + 1,
                 updated_at=now,
             )
@@ -811,6 +853,32 @@ async def drain_index_queue(*, limit: int | None = 500) -> int:
             return total
         if limit is not None and total >= limit:
             return total
+
+
+async def run_reindex(
+    *, settle_seconds: float = 90.0, poll_seconds: float = 3.0
+) -> tuple[int, int, dict[str, int]]:
+    """Reconcile, drain, and wait for work this process cannot take itself.
+
+    The repair job does not run alone. The application keeps an in-process
+    worker, so at any moment some of the backlog can be leased by a replica that
+    is getting on with it perfectly well. A drain stops when *it* can build
+    nothing, which is not the same as the queue being empty - so a job that
+    failed the moment it saw a non-empty backlog would fail a deployment
+    because indexing was working.
+
+    Leased and queued rows are therefore treated as in flight and waited on to a
+    bound. A `failed` row is terminal by definition and returns immediately.
+    """
+    reconciled = await run_reconcile()
+    built = 0
+    deadline = time.monotonic() + settle_seconds
+    while True:
+        built += await drain_index_queue(limit=None)
+        backlog = await index_backlog()
+        if not backlog or "failed" in backlog or time.monotonic() >= deadline:
+            return reconciled, built, backlog
+        await asyncio.sleep(poll_seconds)
 
 
 async def index_backlog() -> dict[str, int]:
