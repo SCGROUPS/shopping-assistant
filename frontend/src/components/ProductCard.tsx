@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import type { Experience } from '../types'
+import { NEW_LISTING_LABEL, hasReviews } from '../lib/rating'
 
 type ProductCardProps = {
   product: Experience
@@ -120,11 +121,15 @@ export function ProductCard({
           </div>
         )}
         <div className="product-meta">
-          <span className="rating">
-            <Star size={14} fill="currentColor" />
-            <strong>{product.rating.toFixed(1)}</strong>
-            <span>({product.review_count.toLocaleString()})</span>
-          </span>
+          {hasReviews(product) ? (
+            <span className="rating">
+              <Star size={14} fill="currentColor" />
+              <strong>{product.rating.toFixed(1)}</strong>
+              <span>({product.review_count.toLocaleString()})</span>
+            </span>
+          ) : (
+            <span className="rating new-listing">{NEW_LISTING_LABEL}</span>
+          )}
           <span>
             <Clock3 size={14} />
             {durationLabel(product.duration_minutes)}

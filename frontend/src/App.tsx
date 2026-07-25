@@ -46,6 +46,7 @@ import {
   type FrictionSignal,
   type Nudge,
 } from './lib/presence'
+import { NEW_LISTING_LABEL, hasReviews } from './lib/rating'
 import type {
   AssistantAction,
   AssistantContext,
@@ -1359,7 +1360,7 @@ function App() {
                   <small>{index === 0 ? 'Morning anchor' : index === 1 ? 'Golden hour' : 'Easy finish'}</small>
                   <strong>{product.title}</strong>
                   <span>
-                    {product.rating.toFixed(1)} ★ ·{' '}
+                    {hasReviews(product) ? `${product.rating.toFixed(1)} ★ · ` : ''}
                     {money(product.currency, product.price)}
                   </span>
                 </div>
@@ -1568,9 +1569,17 @@ function App() {
                 </button>
               </div>
               <div className="modal-rating">
-                <Star size={15} fill="currentColor" />
-                <strong>{selectedProduct.rating.toFixed(1)}</strong>
-                <span>{selectedProduct.review_count.toLocaleString()} verified guests</span>
+                {hasReviews(selectedProduct) ? (
+                  <>
+                    <Star size={15} fill="currentColor" />
+                    <strong>{selectedProduct.rating.toFixed(1)}</strong>
+                    <span>
+                      {selectedProduct.review_count.toLocaleString()} verified guests
+                    </span>
+                  </>
+                ) : (
+                  <span>{NEW_LISTING_LABEL} · no guest reviews yet</span>
+                )}
               </div>
               <p>{selectedProduct.short_description}</p>
               <div className="reason-box">

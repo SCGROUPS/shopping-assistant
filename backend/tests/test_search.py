@@ -15,7 +15,7 @@ from app.common.config import get_settings
 from app.common.features import availability_fit
 from app.common.persistence import catalog_products
 from app.common.ranking import deterministic_embedding
-from app.search.service import SearchService, merge_filters, sanitize_intent
+from app.search.service import SearchService, is_eligible, merge_filters, sanitize_intent
 
 
 class HallucinatedCountryProvider:
@@ -320,3 +320,31 @@ async def test_search_score_no_longer_carries_dead_constants():
     ]
     assert all(weight > 0 for weight in weights)
     assert sum(weights) == pytest.approx(1.0)
+
+
+def test_mixed_settings_satisfy_either_indoor_or_outdoor_preference():
+    """A part-indoor, part-outdoor experience answers both preferences.
+
+    "mixed" used to be admitted only for an indoor preference, so an outdoor
+    shopper never saw a Ba Na Hills cable-car combo - the cable car is outdoors
+    and the buffet is not. Supplier inventory is mostly mixed, so the asymmetry
+    silently hid the strongest imported products.
+    """
+    product = {
+        "status": "PUBLISHED",
+        "indoor_outdoor": "mixed",
+        "duration_minutes": 720,
+        "languages": ["English"],
+        "accessibility_features": [],
+        "family_friendly": True,
+        "instant_confirmation": True,
+        "options": [],
+        "minimum_age": None,
+        "rating": 4.6,
+    }
+    for preference in ("indoor", "outdoor"):
+        assert is_eligible(product, SearchFilters(indoor_outdoor=preference))
+
+    indoor_only = dict(product, indoor_outdoor="indoor")
+    assert is_eligible(indoor_only, SearchFilters(indoor_outdoor="indoor"))
+    assert not is_eligible(indoor_only, SearchFilters(indoor_outdoor="outdoor"))

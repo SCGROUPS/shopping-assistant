@@ -166,7 +166,7 @@ backend/app/
 ├── search/         service.py · postgres.py        L1–L3 + query engine
 ├── recommendations/service.py                      recommendation engine
 ├── assistant/      service.py · provider.py        L5 orchestration + LLM
-├── catalog/        seed.py · ingest                products, embeddings
+├── catalog/        seed.py · trippass.py · importer.py  products, embeddings
 ├── commerce/       cart · booking · voucher        simulated purchase
 └── common/         ranking.py · features.py · persistence.py · config.py
                     urgency.py · currency.py       commercial signals (§10)
@@ -182,6 +182,48 @@ frontend/src/
 ├── lib/api.ts                  API client, SSE, normalization
 └── types.ts                    shared contracts
 ```
+
+---
+
+## 4.1 Supplier ingestion
+
+Seeded demo inventory is generated in the internal shape already. Real supply is
+not: `app/catalog/trippass.py` imports the Trippass (HeriStep) API, whose
+records carry names, descriptions, images and priced variants but **none of the
+facets L1-L3 needs** - no destination, category, duration, indoor/outdoor or
+accessibility. Its `category_name` mixes places ("Hoi An") with promotions ("Hot
+Deal") and vehicle types ("Hoi An E-Car"), so it cannot be used as a facet.
+
+Classification therefore runs **once per listing at import time**, through the
+same declared-schema mechanism the assistant uses (`AIProvider.structure` with a
+strict function tool). Category and indoor/outdoor are schema `enum`s, so
+imported supply is forced into the same vocabulary the storefront filters on
+rather than drifting into synonyms. Nothing about this touches the request path.
+
+Three rules keep the import honest:
+
+- **Never invent trust signals.** The feed has no review history, so imported
+  products carry `rating = 0, review_count = 0`. Ranking's Bayesian prior
+  (`bayesian_rating`) reads that as *unproven* and pulls it to the catalogue
+  mean, so new supply competes fairly without a fabricated score. The UI shows
+  "Newly listed" rather than `0.0 ★`.
+- **Degradation is visible.** If classification fails - a rate limit, an outage
+  - the listing is stored with defaults and flagged `needs_review`, and the
+  CLI reports the count. The first import silently filed a Hoi An museum under
+  Da Nang this way; normalisation now backs off through the deployment's rate
+  limit before conceding.
+- **Re-import must not be destructive.** `app/catalog/importer.py` upserts on
+  `Experience.external_id` and replaces only that experience's children, so
+  prices and variants resync while experience ids - and the carts, bookings and
+  behaviour events pointing at them - survive. Options still referenced by a
+  live cart are kept. Seeding truncates; importing never does.
+
+The supplier's stock endpoint is unavailable in staging, so imported
+availability is published on a fixed daily schedule rather than read from the
+supplier. This is the one part of an imported product that is not authoritative.
+
+The catalog job runs the import after seeding on every deploy, non-fatally: a
+supplier outage logs and continues rather than failing the deployment.
 
 ---
 

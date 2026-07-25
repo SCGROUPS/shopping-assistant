@@ -35,7 +35,7 @@ class ToolPlan:
         return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
-def _function(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
+def function_tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
     """Strict function tools require every property to be listed as required;
     optional arguments are expressed by allowing null."""
     return {
@@ -61,7 +61,7 @@ _EXPERIENCE_ID = {
 }
 
 SHOPPING_TOOLS: list[dict[str, Any]] = [
-    _function(
+    function_tool(
         "search_experiences",
         "Search the bookable catalogue. Returns offerings with their "
         "experience_id, price, rating, destination, category and availability.",
@@ -96,30 +96,30 @@ SHOPPING_TOOLS: list[dict[str, Any]] = [
             },
         },
     ),
-    _function(
+    function_tool(
         "get_recommendations",
         "Get offerings that pair with one the shopper is already considering, for "
         "referential follow-ups such as 'something similar' or 'complete my day'. "
         "It takes no query, so it cannot answer a request that names a subject.",
         {"experience_id": _EXPERIENCE_ID},
     ),
-    _function(
+    function_tool(
         "check_availability",
         "Get dates, times, prices and remaining spaces for one offering.",
         {"experience_id": _EXPERIENCE_ID},
     ),
-    _function(
+    function_tool(
         "add_to_cart",
         "Add one offering to the shopper's cart, using the first bookable "
         "option and slot for their dates and party.",
         {"experience_id": _EXPERIENCE_ID},
     ),
-    _function(
+    function_tool(
         "prepare_checkout",
         "Summarise the cart and move the shopper towards payment.",
         {},
     ),
-    _function(
+    function_tool(
         "confirm_simulated_checkout",
         "Complete the booking. Only after the shopper explicitly confirms.",
         {},
@@ -129,7 +129,7 @@ SHOPPING_TOOLS: list[dict[str, Any]] = [
 # The contract that makes an agent answer renderable: anything the agent tells the
 # shopper about must be listed here by the experience_id a tool actually returned,
 # so the application can show a bookable card instead of loose prose.
-FINAL_ANSWER = _function(
+FINAL_ANSWER = function_tool(
     "final_answer",
     "Give the shopper your answer. Every offering you refer to must appear in "
     "selections, in the order you want it shown, identified by an experience_id "
@@ -207,6 +207,13 @@ class AIProvider(Protocol):
         state: dict[str, Any],
         execute: ToolExecutor,
     ) -> AgentAnswer | None: ...
+
+    async def structure(
+        self,
+        instructions: str,
+        payload: dict[str, Any],
+        tool: dict[str, Any],
+    ) -> dict[str, Any] | None: ...
 
     async def enhance_assistant(self, prompt: str, facts: list[dict[str, Any]]) -> str | None: ...
 
@@ -404,6 +411,14 @@ class DemoAIProvider:
         execute: ToolExecutor,
     ) -> AgentAnswer | None:
         """No model, no reasoning: fall through to the deterministic path."""
+        return None
+
+    async def structure(
+        self,
+        instructions: str,
+        payload: dict[str, Any],
+        tool: dict[str, Any],
+    ) -> dict[str, Any] | None:
         return None
 
     async def enhance_assistant(self, prompt: str, facts: list[dict[str, Any]]) -> str | None:
@@ -693,6 +708,35 @@ class AzureOpenAIProvider:
                         "output": json.dumps(result, default=str),
                     }
                 )
+        return None
+
+    async def structure(
+        self,
+        instructions: str,
+        payload: dict[str, Any],
+        tool: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Read a messy document and return the typed fields a caller declared.
+
+        Deliberately generic: the caller owns the tool schema, so the same call
+        serves catalogue normalisation and anything else that needs a model to
+        turn prose into structure. Supplier content is untrusted data.
+        """
+        response = await self.client.responses.create(
+            model=self.settings.azure_openai_chat_deployment,
+            input=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": json.dumps(payload, default=str)},
+            ],
+            tools=cast(Any, [tool]),
+            tool_choice="required",
+            max_output_tokens=1200,
+        )
+        self._record(response, self.settings.azure_openai_chat_deployment, "structuring")
+        for item in response.output or []:
+            if getattr(item, "type", None) != "function_call":
+                continue
+            return _load_arguments(getattr(item, "arguments", "") or "{}", tool.get("name", ""))
         return None
 
     async def enhance_assistant(self, prompt: str, facts: list[dict[str, Any]]) -> str | None:

@@ -34,10 +34,9 @@ HYBRID_SEARCH_SQL = text(
         AND (
           CAST(:indoor_outdoor AS text) IS NULL
           OR lower(e.indoor_outdoor) = lower(CAST(:indoor_outdoor AS text))
-          OR (
-            lower(CAST(:indoor_outdoor AS text)) = 'indoor'
-            AND lower(e.indoor_outdoor) = 'mixed'
-          )
+          -- "mixed" is partly indoors and partly outdoors, so it satisfies
+          -- either preference.
+          OR lower(e.indoor_outdoor) = 'mixed'
         )
         AND (
           CAST(:family_friendly AS boolean) IS NULL

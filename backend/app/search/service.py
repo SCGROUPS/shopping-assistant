@@ -241,9 +241,10 @@ def is_eligible(
     if filters.max_duration_minutes and product["duration_minutes"] > filters.max_duration_minutes:
         return False
     if filters.indoor_outdoor:
-        allowed = {filters.indoor_outdoor.casefold()}
-        if "indoor" in allowed:
-            allowed.add("mixed")
+        # A "mixed" experience happens partly indoors and partly outdoors, so it
+        # satisfies either preference. Admitting it only for "indoor" hid every
+        # part-outdoor experience from an outdoor shopper.
+        allowed = {filters.indoor_outdoor.casefold(), "mixed"}
         if product["indoor_outdoor"].casefold() not in allowed:
             return False
     if filters.language and filters.language.casefold() not in {
@@ -305,8 +306,12 @@ def _explanations(
     reasons: list[str] = []
     if filters.visit_start:
         reasons.append("Available on your selected date.")
-    if filters.indoor_outdoor and product["indoor_outdoor"] in {"indoor", "mixed"}:
-        reasons.append("Includes an indoor experience.")
+    if filters.indoor_outdoor:
+        setting = product["indoor_outdoor"].casefold()
+        if setting == "mixed":
+            reasons.append("Runs both indoors and outdoors.")
+        elif setting == filters.indoor_outdoor.casefold():
+            reasons.append(f"Takes place {setting}s.")
     if filters.family_friendly and product["family_friendly"]:
         reasons.append("Family-friendly.")
     if filters.free_cancellation:

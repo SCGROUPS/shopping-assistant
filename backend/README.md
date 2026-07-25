@@ -82,12 +82,23 @@ Azure CLI, or developer credential chain). No secrets belong in source control. 
 to deterministic parsing/embeddings if a model call fails. The backend only exposes the image
 deployment setting; catalog image assets are generated and managed outside this service.
 
-## Seed CLI
+## Catalog CLI
 
 ```bash
-uv run python -m app.catalog.cli seed
+uv run python -m app.catalog.cli seed                 # in-memory demo catalog
 uv run python -m app.catalog.cli summary
+uv run python -m app.catalog.cli seed-db [--force]    # PostgreSQL demo catalog
+uv run python -m app.catalog.cli refresh-availability
+uv run python -m app.catalog.cli import-trippass [--days 30]
 ```
+
+`import-trippass` pulls live inventory from the Trippass (HeriStep) supplier API
+and upserts it on `Experience.external_id`, so it is safe to re-run: prices and
+variants resync while experience ids - and therefore carts, bookings and
+behaviour events - stay put. The supplier feed carries no facets, so each
+listing is classified once at import time by the model (see
+`app/catalog/trippass.py`); a listing that could not be classified is stored
+with defaults and counted under `need review`. Requires `DATABASE_URL`.
 
 All public endpoints use `/api/v1`. Send `X-Session-ID` to isolate anonymous state and
 `Idempotency-Key` for cart mutations and checkout. Assistant messages stream SSE by default;
