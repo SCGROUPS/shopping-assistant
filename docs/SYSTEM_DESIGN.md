@@ -150,9 +150,11 @@ change must be applied deliberately to both.
 
 ### L5 · Assistant
 
-Conversation state, tool routing, and response narration. Critically, the
-assistant is a *consumer* of L4 — it does not re-rank or select products
-itself. See [section 7](#7-assistant-design).
+Conversation state and a bounded tool-using agent loop. The assistant is a
+*consumer* of L4: it cannot invent offerings, and every product it presents must
+have been returned by a tool. Within that constraint it does reason over results
+— selecting, ordering, and justifying a subset, and asking for the search it
+actually needs. See [section 7](#7-assistant-design).
 
 ---
 
@@ -164,7 +166,7 @@ backend/app/
 ├── search/         service.py · postgres.py        L1–L3 + query engine
 ├── recommendations/service.py                      recommendation engine
 ├── assistant/      service.py · provider.py        L5 orchestration + LLM
-├── catalog/        seed.py · ingest                products, embeddings
+├── catalog/        seed.py · trippass.py · importer.py  products, embeddings
 ├── commerce/       cart · booking · voucher        simulated purchase
 └── common/         ranking.py · features.py · persistence.py · config.py
                     urgency.py · currency.py       commercial signals (§10)
@@ -180,6 +182,48 @@ frontend/src/
 ├── lib/api.ts                  API client, SSE, normalization
 └── types.ts                    shared contracts
 ```
+
+---
+
+## 4.1 Supplier ingestion
+
+Seeded demo inventory is generated in the internal shape already. Real supply is
+not: `app/catalog/trippass.py` imports the Trippass (HeriStep) API, whose
+records carry names, descriptions, images and priced variants but **none of the
+facets L1-L3 needs** - no destination, category, duration, indoor/outdoor or
+accessibility. Its `category_name` mixes places ("Hoi An") with promotions ("Hot
+Deal") and vehicle types ("Hoi An E-Car"), so it cannot be used as a facet.
+
+Classification therefore runs **once per listing at import time**, through the
+same declared-schema mechanism the assistant uses (`AIProvider.structure` with a
+strict function tool). Category and indoor/outdoor are schema `enum`s, so
+imported supply is forced into the same vocabulary the storefront filters on
+rather than drifting into synonyms. Nothing about this touches the request path.
+
+Three rules keep the import honest:
+
+- **Never invent trust signals.** The feed has no review history, so imported
+  products carry `rating = 0, review_count = 0`. Ranking's Bayesian prior
+  (`bayesian_rating`) reads that as *unproven* and pulls it to the catalogue
+  mean, so new supply competes fairly without a fabricated score. The UI shows
+  "Newly listed" rather than `0.0 ★`.
+- **Degradation is visible.** If classification fails - a rate limit, an outage
+  - the listing is stored with defaults and flagged `needs_review`, and the
+  CLI reports the count. The first import silently filed a Hoi An museum under
+  Da Nang this way; normalisation now backs off through the deployment's rate
+  limit before conceding.
+- **Re-import must not be destructive.** `app/catalog/importer.py` upserts on
+  `Experience.external_id` and replaces only that experience's children, so
+  prices and variants resync while experience ids - and the carts, bookings and
+  behaviour events pointing at them - survive. Options still referenced by a
+  live cart are kept. Seeding truncates; importing never does.
+
+The supplier's stock endpoint is unavailable in staging, so imported
+availability is published on a fixed daily schedule rather than read from the
+supplier. This is the one part of an imported product that is not authoritative.
+
+The catalog job runs the import after seeding on every deploy, non-fatally: a
+supplier outage logs and continues rather than failing the deployment.
 
 ---
 
@@ -332,50 +376,107 @@ constant.
 
 ## 7. Assistant design
 
-### 7.1 As-built: a router, not a reasoner
+### 7.1 As-built: a tool-using agent
 
-`AssistantService.respond()` (`assistant/service.py:211`) calls
-`ai.plan_action()`, which asks `gpt-5.4-mini` to pick one tool from a seven-value
-enum. But dispatch is an `if/elif` chain of this shape:
+`AssistantService.respond()` (`assistant/service.py:293`) runs a bounded
+**agent loop** (`AzureOpenAIProvider.run_agent`, `assistant/provider.py:204`).
+`gpt-5.4-mini` is given the shopping tools as native Responses-API function
+tools and decides, per step, which tool to call and **what arguments to fill**.
+The service executes the call, feeds the JSON result back, and lets the model
+reason over it. `MAX_AGENT_STEPS` (=4) bounds the loop.
 
-```python
-elif ("add" in lowered and "cart" in lowered) or planned_tool == "add_to_cart":
+Two rules shape the whole design:
+
+**1. Language interpretation belongs to the model, not to regex.** There is no
+keyword router, no substring precedence, no `re.findall` intent extraction. The
+shopper's words reach the model intact and the model fills the parameters. A
+phrase like "somewhere in the ocean, not mountain" is understood as a positive
+query plus a negative constraint because the model reads it, not because a
+pattern matched.
+
+**2. Business logic belongs to the tools, not to the service.** Exclusion is a
+declared capability of `search_experiences` (an `exclude` array), not a special
+case in `_search`. The service never inspects the message to decide behaviour;
+it only executes what the agent asked for. Adding a capability means adding a
+tool parameter, not another branch.
+
+#### Tool contract
+
+`SHOPPING_TOOLS` (`provider.py:63`) declares six tools:
+
+| Tool | Agent-filled arguments |
+| --- | --- |
+| `search_experiences` | `query`, `destination`, `exclude`, `max_total_price`, `limit` |
+| `get_recommendations` | `experience_id` |
+| `check_availability` | `experience_id`, `date`, `travellers` |
+| `add_to_cart` | `experience_id`, `date`, `travellers` |
+| `prepare_checkout` | — |
+| `confirm_simulated_checkout` | — |
+
+Only `search_experiences` carries a `query`. This is deliberate and is the fix
+for a real defect: the previous router sent "recommend some good Pho
+restaurants in Hanoi old quarter" to a cross-sell tool that had no query
+parameter, so the shopper's words were **structurally discarded** and Mui Ne
+cycling tours came back. A tool that cannot accept a subject must never be
+chosen to answer a request that names one, and the tool descriptions say so.
+
+Tools use **strict** schemas, so every declared property appears in `required`
+and optional arguments are expressed as nullable types
+(`{"type": ["string", "null"]}`). A test pins this invariant.
+
+#### The grounding convention
+
+The agent does not answer in prose. It terminates by calling `final_answer`
+(`provider.py:132`) with:
+
+```json
+{
+  "message": "...",
+  "selections": [{ "experience_id": "exp_123", "reason": "..." }],
+  "clarification": "..."
+}
 ```
 
-Because the substring test is evaluated **first**, hardcoded keyword matching
-**overrides the planner**. Any message containing "compare" is routed to
-compare regardless of intent.
+`selections` is the contract that makes an answer **renderable**: each entry
+names a real offering, so the UI shows bookable cards with live price and
+availability rather than a wall of text, and each `reason` is the model's own
+justification for that specific item.
 
-Further limits:
+`_build_answer` (`provider.py:358`) enforces the contract. Every tool result is
+serialised by `_offering` (`service.py:83`) with an `experience_id`, and the
+loop accumulates the set of ids the tools actually returned. Any
+`experience_id` in `selections` that is **not** in that set is dropped. A
+hallucinated offering therefore cannot reach the shopper.
 
-- The model returns a **tool name only** — never arguments. All arguments are
-  derived from conversation state by backend code.
-- **One tool per turn.** No chaining, no reflection, no retry.
-  `assistant_max_tool_rounds` (=3) is dead config.
-- `_add_first_result` adds the **first** result, not the item the user named.
-- `_search` embeds the **raw user message** with no conversational rewriting.
-  "Something cheaper" is embedded literally. Only *filters* carry across turns
-  (via `conversation["state"]["filters"]`), not query meaning.
+Because the model reasons *over* tool output rather than merely triggering it,
+narration and results can no longer contradict each other — the earlier failure
+where Mai described a cruise as the ocean match while the rail still showed
+Marble Mountains is not expressible in this design.
 
-**The LLM never influences which products appear or in what order.** Its three
-real jobs are: extract filters from text, hint at a tool name, and rewrite the
-final prose (`enhance_assistant`). Assistant quality is therefore hard-capped by
-the L4 engines.
+#### Failure behaviour
 
-A deterministic router is a legitimate MVP choice — cheap, low-latency,
-predictable, and resistant to prompt injection through catalog content. It is
-documented here as a **deliberate decision**, with the caveat that the
-keyword-over-planner precedence is a defect, not part of the design.
+`_run_agent` (`service.py:417`) falls through to the legacy deterministic path
+when reasoning is unavailable: demo mode (`DemoAIProvider.run_agent` returns
+`None`) or a tripped budget breaker (`BudgetExceeded`). Within the loop, a tool
+that raises `ApiError` returns `{"error", "detail"}` **to the agent** rather
+than failing the turn, so it can correct its arguments and retry inside the
+step budget.
+
+`confirm_simulated_checkout` always returns `confirmation-required`: the agent
+can prepare a booking but can never self-confirm one.
+
+The deterministic fallback remains weak — it ranks on keyword overlap and will
+answer "not mountain" with mountain results. It is a degraded mode, and per the
+architecture rules above it will not be improved with more pattern matching.
 
 ### 7.2 MVP target
 
-- Invert precedence: the planner decides; keywords become a **fallback** used
-  only when planning fails or returns low confidence.
-- Add **conversational query rewriting**: resolve "something cheaper", "the
-  second one", "same but indoors" against conversation state before retrieval.
-- Resolve referents properly so `add_to_cart` targets the named item.
-- Allow a bounded tool loop (honour `assistant_max_tool_rounds`) so the
-  assistant can search, notice zero results, relax, and re-search in one turn.
+- Add **conversational query rewriting** so "something cheaper" and "the second
+  one" resolve against conversation state before the agent searches.
+- Replace the deterministic fallback with a cheaper model rather than regex, so
+  degraded mode is still language-aware.
+- Tune `MAX_AGENT_STEPS` against observed latency; consider streaming the
+  narration while tool calls are still in flight.
 - Keep all mutation server-side, validated, idempotent, and audited.
 
 ### 7.3 Grounding and injection controls
@@ -706,7 +807,7 @@ Outstanding:
 
 | # | Spec | Implementation | Impact |
 |---|---|---|---|
-| 8 | §13.3 ten tools incl. `get_experience_details`, `get_cart`, `remove_from_cart` | seven-value enum, subset implemented | reduced capability |
+| 8 | §13.3 ten tools incl. `get_experience_details`, `get_cart`, `remove_from_cart` | six agent tools (§7.1); the read-back tools are absent | agent cannot inspect cart or product detail mid-conversation |
 | 11 | §11.3 margin term | category take-rate proxy; no real margin data | ranking approximates revenue (§16) |
 | 12 | §13.7 exact cost ceiling | per-process ledger | effective ceiling is N × budget |
 | 16 | email capture and abandoned-cart recovery | not implemented | deferred pending the account-scope decision in §16 |
@@ -784,7 +885,7 @@ work deliberately: better ranking into a leaking funnel returns little.
 **Phase 1 — foundations (unblocks the rest)** ✅
 1. Unify storefront/assistant state with bidirectional sync.
 2. Route recommendations through the shared eligibility gate.
-3. Fix keyword-over-planner routing precedence.
+3. Replace keyword routing with a tool-using agent (§7.1).
 
 **Phase 2 — stop the leaks** ✅
 4. Graceful constraint relaxation with "we relaxed X" messaging.

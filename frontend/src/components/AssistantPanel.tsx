@@ -18,6 +18,7 @@ import type {
   AssistantMessage,
   Experience,
 } from '../types'
+import { hasReviews } from '../lib/rating'
 import { VoiceInputButton } from './VoiceInputButton'
 
 type AssistantPanelProps = {
@@ -215,7 +216,7 @@ export function AssistantPanel({
                             <strong>{product.title}</strong>
                             <small>
                               <Star size={11} fill="currentColor" />
-                              {product.rating.toFixed(1)} ·{' '}
+                              {hasReviews(product) ? `${product.rating.toFixed(1)} · ` : ''}
                               {money(product.currency, product.price)}
                             </small>
                             <em>

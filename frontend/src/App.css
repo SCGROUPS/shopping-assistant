@@ -623,6 +623,30 @@
   max-width: 660px;
 }
 
+/* After a search the shopper wants the results, not the orientation copy. Shrink
+   the heading and replace the standing paragraph with a one-line summary so the
+   grid is not pushed below the fold. */
+.discovery-section.searched .section-intro {
+  margin-bottom: 20px;
+}
+
+.discovery-section.searched .section-intro h2 {
+  font-size: clamp(26px, 2.4vw, 34px);
+  margin: 4px 0 0;
+}
+
+.product-meta .rating.new-listing {
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.result-summary {
+  color: var(--muted);
+  font-size: 15px;
+  margin: 6px 0 0;
+}
+
 .assistant-cta {
   align-items: center;
   background: #e6f2ec;
