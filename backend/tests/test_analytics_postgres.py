@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete
+from conftest import reset_postgres
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.common import analytics, persistence
@@ -24,9 +24,7 @@ from app.common.models import Base, BehaviorEvent, ShoppingSession
 
 DATABASE_URL = os.getenv("POSTGRES_TEST_DATABASE_URL")
 
-pytestmark = pytest.mark.skipif(
-    not DATABASE_URL, reason="POSTGRES_TEST_DATABASE_URL is required"
-)
+pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="POSTGRES_TEST_DATABASE_URL is required")
 
 
 @pytest.fixture
@@ -40,9 +38,7 @@ async def db_factory(monkeypatch):
         # setup performed elsewhere.
         await connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
         await connection.run_sync(Base.metadata.create_all)
-    async with factory() as db, db.begin():
-        await db.execute(delete(BehaviorEvent))
-        await db.execute(delete(ShoppingSession))
+    await reset_postgres(engine)
 
     # Route the analytics module at this engine and force the SQL branch.
     monkeypatch.setattr(analytics, "database_mode", lambda: True)
@@ -60,9 +56,7 @@ async def _seed(factory, rows):
         sessions: dict[str, ShoppingSession] = {}
         for anonymous_id, *_ in rows:
             if anonymous_id not in sessions:
-                shopping_session = ShoppingSession(
-                    id=uuid4(), anonymous_id=anonymous_id
-                )
+                shopping_session = ShoppingSession(id=uuid4(), anonymous_id=anonymous_id)
                 db.add(shopping_session)
                 sessions[anonymous_id] = shopping_session
         # Sessions must exist before events reference them; SQLAlchemy is free

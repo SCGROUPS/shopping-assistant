@@ -2,19 +2,28 @@ import argparse
 import asyncio
 import json
 
-from app.catalog.db_seed import seed_database
+from app.catalog.db_seed import refresh_availability, seed_database
 from app.catalog.seed import build_seed_catalog
 from app.common.store import store
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Seed or export the POC tourism catalog")
-    parser.add_argument("command", choices=["seed", "seed-db", "summary"])
+    parser.add_argument(
+        "command", choices=["seed", "seed-db", "refresh-availability", "summary"]
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     if args.command == "seed-db":
         count = asyncio.run(seed_database(force=args.force))
         print(f"Seeded {count} PostgreSQL experiences")
+        return
+    if args.command == "refresh-availability":
+        result = asyncio.run(refresh_availability())
+        print(
+            f"Availability refreshed: {result['created']} created, "
+            f"{result['updated']} updated"
+        )
         return
     count = store.seed(force=True)
     if args.command == "seed":

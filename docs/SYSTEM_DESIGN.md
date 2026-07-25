@@ -558,6 +558,24 @@ comfortable). Uniform capacity made scarcity permanently silent and left
 `availability_fit` unable to discriminate; the fix belongs in the data, not in
 a lower threshold.
 
+**Seeded data does not converge on its own.** `seed_database()` returns early
+when a catalogue already exists, so changing the seed has no effect on any
+environment that has been seeded once — the demand profile above reached
+production only after this was addressed. `force=True` is not the answer: it
+truncates `behavior_events`, `shopping_sessions` and `bookings`, destroying the
+measurement data that §13 depends on and that `social_proof` is computed from.
+
+`refresh_availability()` (`catalog/db_seed.py`, exposed as
+`python -m app.catalog.cli refresh-availability` and run by the catalog job on
+every deploy) closes the gap. Slot ids are
+`stable_id("slot", f"{slug}:{starts.isoformat()}")` — deterministic in slug and
+start time — so the same generator upserts by id: overlapping dates are
+refreshed in place with the current supply profile, and dates beyond the
+previous horizon are inserted, which also rolls the booking window forward on
+each deploy. Capacity already consumed by confirmed bookings is subtracted, so
+a refresh can never resurrect inventory that was sold, and remaining capacity is
+floored at zero. Behavioural history is untouched.
+
 ### 10.2 Display currency
 
 `common/currency.py`. Conversion is **presentation-only and server-side**.
@@ -676,6 +694,7 @@ Resolved during the MVP build:
 | 13 | §12.4 scarcity and social proof signals | `common/urgency.py`, silent unless earned | 6 |
 | 14 | multi-currency display for tourists | `common/currency.py`, presentation-only | 6 |
 | 15 | cross-sell outside the assistant | cart drawer rail, `cart_cross_sell` placement | 6 |
+| 19 | seed-data changes reaching seeded environments | `refresh_availability()` on every deploy (§10.1) | 6 |
 
 Outstanding:
 
