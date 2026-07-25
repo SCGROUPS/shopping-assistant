@@ -1,0 +1,180 @@
+{
+  "suite": "assistant",
+  "description": "The advising surface. Needs a real model, so it does not run in CI by default; run it before any change to prompts, tools or the agent loop. Turns inside a case share one conversation, so later turns test memory as well as retrieval.",
+  "cases": [
+    {
+      "id": "ocean-not-mountain",
+      "why": "Reported verbatim. The agent returned three mountain and river trips, then wrote prose about which was least wrong. Curation is not a substitute for honouring an exclusion.",
+      "turns": [
+        {
+          "message": "I want somewhere in the ocean, not mountain",
+          "expect": {
+            "min_results": 1,
+            "forbid_terms": [
+              "mountain"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pho-restaurants-hanoi",
+      "why": "Reported verbatim. The agent answered a Hanoi food question with a boat trip, a cycling tour and a river cruise, under the heading 'These diverse options complement your current choice.' Answering a question that was not asked is worse than admitting the catalogue's limits.",
+      "turns": [
+        {
+          "message": "recommend some good Pho restaurants in Hanoi old quarter",
+          "expect": {
+            "forbid_terms": [
+              "cruise",
+              "cycling",
+              "dunes"
+            ],
+            "require_any_term": [
+              "food",
+              "hanoi",
+              "old quarter",
+              "street food"
+            ],
+            "message_mentions": [
+              "pho",
+              "hanoi"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "topic-change-drops-the-old-topic",
+      "why": "The agent carried a boat-trip context into an unrelated question. A new subject must reset the retrieval, not decorate the previous answer.",
+      "turns": [
+        {
+          "message": "show me boat trips in Mui Ne",
+          "expect": {
+            "min_results": 1
+          }
+        },
+        {
+          "message": "actually, what about a cooking class in Hoi An?",
+          "expect": {
+            "min_results": 1,
+            "require_any_term": [
+              "cooking",
+              "food",
+              "hoi an"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "budget-is-a-hard-constraint",
+      "why": "Stated budgets are the constraint shoppers are least forgiving about.",
+      "turns": [
+        {
+          "message": "we have about 400,000 dong each, what can we do in Da Nang?",
+          "expect": {
+            "max_price": 500000
+          }
+        }
+      ]
+    },
+    {
+      "id": "constraint-carries-across-turns",
+      "why": "A constraint stated once must survive the rest of the conversation. Re-asking is how an assistant loses a shopper.",
+      "turns": [
+        {
+          "message": "I use a wheelchair, so nothing with a lot of walking",
+          "expect": {
+            "message_mentions": [
+              "walking"
+            ]
+          }
+        },
+        {
+          "message": "what would you suggest in Hue?",
+          "expect": {
+            "require_any_term": [
+              "hue"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "out-of-catalogue-is-answered-honestly",
+      "why": "The catalogue has no flights. Filling the gap with the highest-ranked tour is the single most damaging failure mode, because it looks like an answer.",
+      "turns": [
+        {
+          "message": "can you book me a flight from Hanoi to Bangkok next Tuesday?",
+          "expect": {
+            "max_results": 0,
+            "message_mentions": [
+              "flight"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "vague-request-asks-rather-than-guesses",
+      "why": "Inventing constraints from thin air is how 'cable car with buffet lunch' became an outdoor-only search.",
+      "turns": [
+        {
+          "message": "something nice",
+          "expect": {
+            "min_results": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "rainy-day-alternative",
+      "why": "Weather is the defining tourist constraint in Vietnam and the catalogue tags for it.",
+      "turns": [
+        {
+          "message": "it is pouring in Hoi An today, what can we still do?",
+          "expect": {
+            "min_results": 1,
+            "forbid_terms": [
+              "cycling"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "comparison-stays-grounded",
+      "why": "Comparisons are where invented detail is most persuasive and least checkable.",
+      "turns": [
+        {
+          "message": "show me cruises in Ha Long",
+          "expect": {
+            "min_results": 2
+          }
+        },
+        {
+          "message": "which of those is better for a couple?",
+          "expect": {
+            "min_results": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "vietnamese-language-request",
+      "why": "A large share of real traffic is not in English, and the storefront claims Vietnamese support.",
+      "turns": [
+        {
+          "message": "toi muon di du thuyen o Ha Long",
+          "expect": {
+            "min_results": 1,
+            "require_any_term": [
+              "ha long",
+              "cruise"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

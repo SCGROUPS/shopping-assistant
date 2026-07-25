@@ -11,6 +11,13 @@ HYBRID_SEARCH_SQL = text(
       FROM experiences e
       JOIN destinations destination ON destination.id = e.destination_id
       WHERE e.status = 'PUBLISHED'
+        -- Suppressed inventory must not consume a candidate slot; otherwise a
+        -- withdrawn product crowds out a bookable one before ranking sees it.
+        AND NOT (
+          e.suppressed
+          AND (e.promotion_starts_at IS NULL OR now() >= e.promotion_starts_at)
+          AND (e.promotion_ends_at IS NULL OR now() <= e.promotion_ends_at)
+        )
         AND (
           CAST(:destination_id AS uuid) IS NULL
           OR e.destination_id = CAST(:destination_id AS uuid)

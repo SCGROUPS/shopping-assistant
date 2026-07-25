@@ -41,8 +41,15 @@ Set the required values:
 ```bash
 export AZURE_SUBSCRIPTION_ID="<application-subscription-id>"
 export POSTGRES_ADMIN_PASSWORD="<strong-random-bootstrap-password>"
+export ADMIN_BOOTSTRAP_KEY="<strong-random-operator-key>"
 export VIETRA_PREFIX="vietrapoc"
 ```
+
+`ADMIN_BOOTSTRAP_KEY` is the first operator credential for the console at
+`/admin` and for `/api/v1/analytics/funnel`. Deploying without it leaves both
+unreachable — there is no other way in, by design — so the script warns and
+continues. Treat it as a bootstrap secret: use it to create named operators
+(`create-operator`), then rotate it.
 
 Override these defaults when the regions or generated AI account name differ:
 
@@ -139,6 +146,8 @@ Application state is PostgreSQL-backed outside explicit demo mode.
 ## Security boundaries
 
 - The PostgreSQL `AllowAzureServices` firewall rule is a POC compromise.
+- Operator access is credential-gated and capability-checked, and every operator
+  mutation is written to `audit_log` with a field-level diff.
 - Database, ACR, and Foundry credentials are held as Container Apps secrets for
   this POC.
 - No real payment details are collected.

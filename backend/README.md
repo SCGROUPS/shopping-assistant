@@ -40,7 +40,7 @@ without a server:
 
 | Variable | Enables | Needs |
 |---|---|---|
-| `POSTGRES_TEST_DATABASE_URL` | `test_analytics_postgres.py` — SQL aggregation in `common/analytics.py` | a bare PostgreSQL server |
+| `POSTGRES_TEST_DATABASE_URL` | `test_analytics_postgres.py`, `test_admin_catalog_postgres.py`, `test_trippass_upsert_postgres.py`, `test_availability_refresh.py` | a bare PostgreSQL server |
 | `POSTGRES_SEEDED_TEST_DATABASE_URL` | `test_postgres_integration.py` — full application journey | a seeded catalogue via `DATABASE_URL`, plus an LLM provider |
 
 CI runs the first against a throwaway `pgvector/pgvector:pg17` service. Run it
@@ -50,6 +50,21 @@ locally the same way:
 createdb vietra_test
 POSTGRES_TEST_DATABASE_URL="postgresql+psycopg://$(whoami)@127.0.0.1:5432/vietra_test" uv run pytest
 ```
+
+### Answer quality
+
+Unit tests cannot tell you the answers got worse. The golden suites can:
+
+```bash
+uv run python -m app.evals.cli                      # search; no model needed
+uv run python -m app.evals.cli --suite assistant    # needs Azure OpenAI + a DB
+uv run python -m app.evals.cli --update-baseline    # accept the current results
+```
+
+Cases live in `evals/*.json` and are graded against product attributes rather
+than by an LLM judge, so a failure names the offending product and check. The
+runner exits non-zero on any case that passed in `evals/baseline.json` and fails
+now, which is the signal an aggregate pass rate hides. CI runs the search suite.
 
 ## PostgreSQL
 
@@ -90,6 +105,11 @@ uv run python -m app.catalog.cli summary
 uv run python -m app.catalog.cli seed-db [--force]    # PostgreSQL demo catalog
 uv run python -m app.catalog.cli refresh-availability
 uv run python -m app.catalog.cli import-trippass [--days 30]
+
+# Operator console credentials (see docs/SYSTEM_DESIGN.md §4.2)
+uv run python -m app.catalog.cli create-operator --email ops@example.com \
+    --role catalog_manager [--name "Ops"] [--rotate]
+uv run python -m app.catalog.cli list-operators
 ```
 
 `import-trippass` pulls live inventory from the Trippass (HeriStep) supplier API
@@ -97,8 +117,15 @@ and upserts it on `Experience.external_id`, so it is safe to re-run: prices and
 variants resync while experience ids - and therefore carts, bookings and
 behaviour events - stay put. The supplier feed carries no facets, so each
 listing is classified once at import time by the model (see
-`app/catalog/trippass.py`); a listing that could not be classified is stored
-with defaults and counted under `need review`. Requires `DATABASE_URL`.
+`app/catalog/trippass.py`); a listing that could not be classified is flagged
+`needs_review` and held at `PENDING_REVIEW`, which keeps it out of the
+storefront until an operator decides (`/admin`). Fields an operator edits are
+recorded as overrides and are not overwritten by later imports. Requires
+`DATABASE_URL`.
+
+Operator endpoints live under `/api/v1/admin` and take an `X-API-Key` header.
+`/api/v1/analytics/funnel` needs the same credential. Set `ADMIN_BOOTSTRAP_KEY`
+to create the first operator; in demo mode `demo-admin-key` stands in.
 
 All public endpoints use `/api/v1`. Send `X-Session-ID` to isolate anonymous state and
 `Idempotency-Key` for cart mutations and checkout. Assistant messages stream SSE by default;

@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 
+from app.admin.cli import create_operator, list_operators
 from app.catalog.db_seed import refresh_availability, seed_database
 from app.catalog.importer import import_trippass
 from app.catalog.seed import build_seed_catalog
@@ -18,7 +19,21 @@ def main() -> None:
             "refresh-availability",
             "import-trippass",
             "summary",
+            "create-operator",
+            "list-operators",
         ],
+    )
+    parser.add_argument("--email", help="Operator email address.")
+    parser.add_argument("--name", default="", help="Operator display name.")
+    parser.add_argument(
+        "--role",
+        default="analyst",
+        help="admin, catalog_manager, merchandiser or analyst.",
+    )
+    parser.add_argument(
+        "--rotate",
+        action="store_true",
+        help="Issue a new key for an existing operator, invalidating the old one.",
     )
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
@@ -28,6 +43,22 @@ def main() -> None:
         help="How many days of availability to publish for imported products.",
     )
     args = parser.parse_args()
+    if args.command == "create-operator":
+        if not args.email:
+            raise SystemExit("--email is required")
+        result = asyncio.run(
+            create_operator(args.email, args.name or args.email, args.role, args.rotate)
+        )
+        if result["api_key"]:
+            print(f"{result['action']}: {result['email']} ({result['role']})")
+            print(f"API key (shown once): {result['api_key']}")
+        else:
+            print(f"{result['action']}: {result['email']} already exists; pass --rotate to reissue")
+        return
+    if args.command == "list-operators":
+        for row in asyncio.run(list_operators()):
+            print(f"{row['email']:<40} {row['role']:<18} active={row['active']}")
+        return
     if args.command == "import-trippass":
         result = asyncio.run(import_trippass(days=args.days))
         print(

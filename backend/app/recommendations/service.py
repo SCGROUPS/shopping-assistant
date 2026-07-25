@@ -12,10 +12,13 @@ from app.common.features import (
     availability_fit,
     context_fit,
     median_party_total,
+    merchandising_multiplier,
+    promotion_active,
     quality,
 )
 from app.common.persistence import catalog_products, demand_stats, event_history
 from app.common.ranking import cosine_similarity, mmr_diversify, time_decay
+from app.common.runtime_config import get_config
 from app.common.store import DemoStore, store
 from app.search.service import is_eligible
 
@@ -142,21 +145,14 @@ class RecommendationService:
             for i in range(dimensions)
         ]
 
-    def _weights(self, has_session: bool) -> dict[str, float]:
+    def _weights(self, has_session: bool, configured: dict[str, float]) -> dict[str, float]:
         """Weights from configuration, with cold-start redistribution.
 
         With no history the session term is dead weight, so its budget goes to
         the terms that still discriminate for a first-time visitor
         (POC_SPEC.md §12.4).
         """
-        weights = {
-            "session": self.settings.recommendation_weight_session,
-            "context_fit": self.settings.recommendation_weight_context_fit,
-            "item_similarity": self.settings.recommendation_weight_item_similarity,
-            "availability_fit": self.settings.recommendation_weight_availability_fit,
-            "popularity": self.settings.recommendation_weight_popularity,
-            "quality": self.settings.recommendation_weight_quality,
-        }
+        weights = dict(configured)
         if has_session:
             return weights
         spare = weights["session"]
@@ -200,7 +196,9 @@ class RecommendationService:
         session_vector = self._session_vector(history, products_by_id)
         eligible = [product for product in products if product["id"] in eligible_ids]
         reference_total = median_party_total(eligible, party)
-        weights = self._weights(session_vector is not None)
+        config = await get_config()
+        weights = self._weights(session_vector is not None, config["recommendation_weights"])
+        boost_ceiling = config["max_merchandising_boost"]
 
         candidates: list[tuple[dict[str, Any], float, str, str]] = []
         for product in eligible:
@@ -244,18 +242,29 @@ class RecommendationService:
             else:
                 reason_code = "AVAILABLE_ON_DATE"
                 reason = "Available with instant confirmation."
-            candidates.append((product, score, reason_code, reason))
+            candidates.append(
+                (product, score * merchandising_multiplier(product, boost_ceiling),
+                 reason_code, reason)
+            )
 
         if not candidates:
             return RecommendationResponse(items=[])
-        candidates.sort(key=lambda item: item[1], reverse=True)
+        # A pin lifts a product within the rail's own ordering, bounded the
+        # same way search bounds it.
+        candidates.sort(
+            key=lambda item: (
+                bool(item[0].get("pinned")) and promotion_active(item[0]),
+                item[1],
+            ),
+            reverse=True,
+        )
         diversified_ids = mmr_diversify(
             [
                 (str(item[0]["id"]), item[1], item[0]["embedding"], item[0]["subcategories"][0])
                 for item in candidates
             ],
             limit,
-            self.settings.recommendation_mmr_lambda,
+            config["recommendation_mmr_lambda"],
         )
         by_id = {str(item[0]["id"]): item for item in candidates}
         items = []

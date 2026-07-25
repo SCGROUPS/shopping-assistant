@@ -23,9 +23,11 @@ from app.common.features import (
     conversion_lift,
     margin_fit,
     median_party_total,
+    merchandising_multiplier,
     party_total,
     preference_fit,
     price_fit,
+    promotion_active,
     quality,
 )
 from app.common.llm_cost import BudgetExceeded
@@ -38,6 +40,7 @@ from app.common.ranking import (
     smoothed_rate,
     tokenize,
 )
+from app.common.runtime_config import get_config
 from app.common.store import DemoStore, store
 from app.search.postgres import hybrid_search
 
@@ -226,6 +229,11 @@ def is_eligible(
     book must be absent rather than ranked lower.
     """
     if product["status"] != "PUBLISHED":
+        return False
+    # An operator pulling a product must remove it everywhere at once, not
+    # merely rank it lower. Suppression is a hard gate for that reason, and it
+    # is shared with recommendations because this function is.
+    if product.get("suppressed") and promotion_active(product):
         return False
     if filters.destination_id and product["destination_id"] != filters.destination_id:
         return False
@@ -599,6 +607,10 @@ class SearchService:
         reference_total = median_party_total(eligible, request.party)
         demand = await demand_stats(self.data)
         settings = self.settings
+        config = await get_config()
+        weights = config["search_weights"]
+        take_rates = config["category_take_rates"]
+        boost_ceiling = config["max_merchandising_boost"]
         final: list[tuple[dict[str, Any], float]] = []
         for item_id, normalized_rrf in zip(ordered, rrf_values, strict=True):
             product = products[item_id]
@@ -613,20 +625,27 @@ class SearchService:
                 settings.conversion_prior_rate,
             )
             score = (
-                settings.search_weight_relevance * normalized_rrf
-                + settings.search_weight_preference_fit
+                weights.get("relevance", 0.0) * normalized_rrf
+                + weights.get("preference_fit", 0.0)
                 * preference_fit(product, filters, request.party)
-                + settings.search_weight_availability_fit
+                + weights.get("availability_fit", 0.0)
                 * availability_fit(product, filters, request.party)
-                + settings.search_weight_price_fit
+                + weights.get("price_fit", 0.0)
                 * price_fit(product, filters, request.party, reference_total)
-                + settings.search_weight_quality * quality(product)
-                + settings.search_weight_conversion * conversion
-                + settings.search_weight_margin * margin_fit(product)
+                + weights.get("quality", 0.0) * quality(product)
+                + weights.get("conversion", 0.0) * conversion
+                + weights.get("margin", 0.0) * margin_fit(product, take_rates)
             )
-            final.append((product, score))
+            final.append((product, score * merchandising_multiplier(product, boost_ceiling)))
         sorters = {
-            "recommended": lambda item: item[1],
+            # A pin lifts a product within the relevance ordering only. If the
+            # shopper has explicitly asked for cheapest or highest-rated,
+            # answering with a promoted item instead is a lie about the sort
+            # control, and shoppers stop trusting the controls.
+            "recommended": lambda item: (
+                bool(item[0].get("pinned")) and promotion_active(item[0]),
+                item[1],
+            ),
             "price": lambda item: -starting_price(item[0])[0],
             "rating": lambda item: item[0]["rating"],
             "duration": lambda item: -item[0]["duration_minutes"],

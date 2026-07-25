@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     demo_mode: bool = True
     database_url: str | None = None
 
+    # The first operator credential. Somebody has to be able to sign in
+    # before any operator exists, and in demo mode there is no database to
+    # hold one. Set as a secret in a real environment; rotate by changing it.
+    admin_bootstrap_key: str | None = None
+    admin_bootstrap_email: str = "bootstrap@vietra.local"
+
     azure_openai_endpoint: str | None = None
     azure_openai_api_key: str | None = None
     azure_openai_api_version: str = "2025-04-01-preview"

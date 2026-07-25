@@ -34,6 +34,7 @@ from app.common.models import (
     Experience,
     ExperienceMedia,
     ExperienceOption,
+    ExperienceOverride,
     ExperienceSearchDocument,
     OptionPrice,
     Supplier,
@@ -205,32 +206,76 @@ async def _retire_withdrawn_options(
         )
 
 
-def _apply(experience: Experience, product: dict, supplier_id: Any, destination_id: Any) -> None:
+# Supplier-owned fields. Everything else on the row - merchandising, review
+# state, published_at - belongs to the business and is never touched by an
+# import.
+IMPORTED_FIELDS = (
+    "slug",
+    "title",
+    "short_description",
+    "description",
+    "category",
+    "subcategories",
+    "interest_tags",
+    "indoor_outdoor",
+    "duration_minutes",
+    "latitude",
+    "longitude",
+    "meeting_point",
+    "languages",
+    "accessibility_features",
+    "minimum_age",
+    "family_friendly",
+    "instant_confirmation",
+    "mobile_voucher",
+    "rating",
+    "review_count",
+    "popularity_score",
+)
+_DECIMAL_FIELDS = {"latitude", "longitude", "rating", "popularity_score"}
+
+
+async def _protected_fields(session: AsyncSession, experience_id: Any) -> frozenset[str]:
+    """Fields a human has corrected and the supplier must not overwrite."""
+    override = await session.get(ExperienceOverride, experience_id)
+    return frozenset(override.fields) if override and override.fields else frozenset()
+
+
+def _apply(
+    experience: Experience,
+    product: dict,
+    supplier_id: Any,
+    destination_id: Any,
+    protected: frozenset[str] = frozenset(),
+) -> None:
+    """Copy the supplier's view onto the row, minus anything a human owns.
+
+    `protected` carries the fields an operator has corrected. Skipping them is
+    what lets the catalog editor and the nightly import coexist: a fixed
+    category stays fixed while price and availability keep syncing.
+    """
     experience.supplier_id = supplier_id
-    experience.destination_id = destination_id
-    experience.slug = product["slug"]
-    experience.title = product["title"]
-    experience.short_description = product["short_description"]
-    experience.description = product["description"]
-    experience.category = product["category"]
-    experience.subcategories = product["subcategories"]
-    experience.interest_tags = product["interest_tags"]
-    experience.indoor_outdoor = product["indoor_outdoor"]
-    experience.duration_minutes = product["duration_minutes"]
-    experience.latitude = Decimal(str(product["latitude"]))
-    experience.longitude = Decimal(str(product["longitude"]))
-    experience.meeting_point = product["meeting_point"]
-    experience.languages = product["languages"]
-    experience.accessibility_features = product["accessibility_features"]
-    experience.minimum_age = product["minimum_age"]
-    experience.family_friendly = product["family_friendly"]
-    experience.instant_confirmation = product["instant_confirmation"]
-    experience.mobile_voucher = product["mobile_voucher"]
-    experience.rating = Decimal(str(product["rating"]))
-    experience.review_count = product["review_count"]
-    experience.popularity_score = Decimal(str(product["popularity_score"]))
-    experience.status = product["status"]
-    experience.published_at = experience.published_at or datetime.now(UTC)
+    if "destination_id" not in protected:
+        experience.destination_id = destination_id
+    for field in IMPORTED_FIELDS:
+        if field in protected:
+            continue
+        value = product[field]
+        setattr(experience, field, Decimal(str(value)) if field in _DECIMAL_FIELDS else value)
+    # A product the classifier was unsure of is held for a human rather than
+    # sold on a guess. `PENDING_REVIEW` is not `PUBLISHED`, and the eligibility
+    # gate already filters on that, so nothing downstream needs to know.
+    #
+    # Once a human has ruled on the listing they own its status, and the
+    # classifier does not get to reopen the question on the next run - a review
+    # queue that refills itself with work already done is a queue nobody reads.
+    if "status" in protected:
+        experience.needs_review = False
+    else:
+        experience.needs_review = bool(product.get("needs_review"))
+        experience.status = "PENDING_REVIEW" if experience.needs_review else product["status"]
+    if experience.status == "PUBLISHED":
+        experience.published_at = experience.published_at or datetime.now(UTC)
 
 
 async def upsert_catalog(
@@ -269,10 +314,12 @@ async def upsert_catalog(
                 experience = Experience(id=product["id"], external_id=product["external_id"])
                 session.add(experience)
                 created += 1
+                protected = frozenset()
             else:
                 await _replace_media_and_document(session, experience.id)
                 updated += 1
-            _apply(experience, product, supplier.id, destination.id)
+                protected = await _protected_fields(session, experience.id)
+            _apply(experience, product, supplier.id, destination.id, protected)
             await session.flush()
 
             for order, url in enumerate([product["image_url"]]):

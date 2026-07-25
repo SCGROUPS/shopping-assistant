@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
@@ -12,7 +13,12 @@ from app.api.schemas import (
 )
 from app.assistant.provider import deterministic_intent
 from app.common.config import get_settings
-from app.common.features import availability_fit
+from app.common.features import (
+    availability_fit,
+    margin_fit,
+    merchandising_multiplier,
+    promotion_active,
+)
 from app.common.persistence import catalog_products
 from app.common.ranking import deterministic_embedding
 from app.search.service import SearchService, is_eligible, merge_filters, sanitize_intent
@@ -348,3 +354,65 @@ def test_mixed_settings_satisfy_either_indoor_or_outdoor_preference():
     indoor_only = dict(product, indoor_outdoor="indoor")
     assert is_eligible(indoor_only, SearchFilters(indoor_outdoor="indoor"))
     assert not is_eligible(indoor_only, SearchFilters(indoor_outdoor="outdoor"))
+
+
+def _listing(**overrides):
+    product = {
+        "id": uuid4(),
+        "category": "Day trip",
+        "rating": 4.5,
+        "review_count": 100,
+        "boost": 1.0,
+        "pinned": False,
+        "suppressed": False,
+        "promotion_starts_at": None,
+        "promotion_ends_at": None,
+        "status": "PUBLISHED",
+    }
+    product.update(overrides)
+    return product
+
+
+def test_merchandising_is_inert_until_an_operator_uses_it():
+    """A default listing must rank exactly as it did before these controls."""
+    assert merchandising_multiplier(_listing()) == 1.0
+    # Seeded demo products carry none of these keys at all.
+    assert merchandising_multiplier({"category": "Day trip"}) == 1.0
+
+
+def test_a_boost_moves_a_listing_but_cannot_run_away_with_the_page():
+    """Merchandising should be a thumb on the scale, not a replacement for it."""
+    assert merchandising_multiplier(_listing(boost=1.3), ceiling=1.5) == pytest.approx(1.3)
+    # Beyond the ceiling the operator does not simply get what they asked for.
+    assert merchandising_multiplier(_listing(boost=10.0), ceiling=1.5) == pytest.approx(1.5)
+    assert merchandising_multiplier(_listing(boost=0.01), ceiling=1.5) == pytest.approx(1 / 1.5)
+
+
+def test_a_promotion_outside_its_window_does_nothing():
+    """A campaign that outlives its dates is how Tet offers show up in June."""
+    past = datetime.now(UTC) - timedelta(days=10)
+    future = datetime.now(UTC) + timedelta(days=10)
+    expired = _listing(boost=1.5, promotion_starts_at=past, promotion_ends_at=past)
+    scheduled = _listing(boost=1.5, promotion_starts_at=future, promotion_ends_at=future)
+    running = _listing(boost=1.5, promotion_starts_at=past, promotion_ends_at=future)
+
+    assert merchandising_multiplier(expired) == 1.0
+    assert merchandising_multiplier(scheduled) == 1.0
+    assert merchandising_multiplier(running, ceiling=1.5) == pytest.approx(1.5)
+    assert not promotion_active(expired)
+    assert promotion_active(running)
+
+
+async def test_suppression_removes_a_listing_from_the_shared_eligibility_gate():
+    """Pulling a product has to remove it everywhere, not rank it lower."""
+    product = dict((await catalog_products())[0])
+    assert is_eligible(product, SearchFilters())
+    assert not is_eligible({**product, "suppressed": True}, SearchFilters())
+
+
+def test_take_rates_come_from_configuration():
+    """The commercial lever must be editable by a commercial person."""
+    product = {"category": "Transport ticket"}
+    default = margin_fit(product)
+    lifted = margin_fit(product, {"Transport ticket": 0.30, "Day trip": 0.18})
+    assert lifted > default

@@ -1,0 +1,476 @@
+/* Operator console styling.
+ *
+ * Intentionally unlike the storefront. The shopping surface is warm and
+ * spacious because it is selling; this one is dense and quiet because it is
+ * being read for eight hours a day. Shared tokens would drag one of them
+ * toward the wrong job.
+ */
+
+.ops-shell {
+  --ops-bg: #f6f7f9;
+  --ops-panel: #ffffff;
+  --ops-line: #dfe3e8;
+  --ops-text: #1c2126;
+  --ops-muted: #63707d;
+  --ops-accent: #0b5fff;
+  --ops-warn: #b45309;
+  --ops-danger: #b42318;
+  min-height: 100vh;
+  background: var(--ops-bg);
+  color: var(--ops-text);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+}
+
+.ops-signin {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: #f6f7f9;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+.ops-signin form {
+  background: #fff;
+  border: 1px solid #dfe3e8;
+  border-radius: 12px;
+  padding: 32px;
+  width: min(380px, 90vw);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ops-signin h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.ops-signin p {
+  margin: 0;
+  color: #63707d;
+  font-size: 13px;
+}
+
+.ops-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 24px;
+  background: var(--ops-panel);
+  border-bottom: 1px solid var(--ops-line);
+}
+
+.ops-header h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.ops-header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ops-header-right a {
+  color: var(--ops-accent);
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.ops-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 24px;
+  background: var(--ops-panel);
+  border-bottom: 1px solid var(--ops-line);
+}
+
+.ops-tabs button {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--ops-muted);
+  cursor: pointer;
+}
+
+.ops-tabs button.is-current {
+  color: var(--ops-text);
+  border-bottom-color: var(--ops-accent);
+  font-weight: 600;
+}
+
+.ops-main {
+  padding: 20px 24px 60px;
+}
+
+.ops-sub {
+  color: var(--ops-muted);
+  font-size: 12px;
+  display: block;
+}
+
+.ops-error {
+  color: var(--ops-danger);
+  font-size: 13px;
+  margin: 8px 0 0;
+}
+
+.ops-catalog {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+@media (min-width: 1180px) {
+  .ops-catalog:has(.ops-editor) {
+    grid-template-columns: minmax(0, 1fr) 420px;
+  }
+}
+
+/* The status select has an intrinsic width; the search box should take what
+ * is left. Without explicit bases the shared `width: 100%` rule makes the
+ * select claim the row and squeezes the input to nothing. */
+.ops-filters {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.ops-filters input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ops-filters select {
+  flex: 0 0 190px;
+  width: 190px;
+}
+
+.ops-shell input,
+.ops-shell select,
+.ops-shell textarea,
+.ops-signin input {
+  border: 1px solid var(--ops-line, #dfe3e8);
+  border-radius: 7px;
+  padding: 8px 10px;
+  font: inherit;
+  background: #fff;
+  color: inherit;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.ops-shell textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+.ops-shell button,
+.ops-signin button {
+  border: 1px solid var(--ops-line, #dfe3e8);
+  background: #fff;
+  border-radius: 7px;
+  padding: 8px 12px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  color: inherit;
+}
+
+.ops-shell button:hover:not(:disabled),
+.ops-signin button:hover:not(:disabled) {
+  border-color: #b9c0c8;
+}
+
+.ops-shell button:disabled,
+.ops-signin button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ops-shell button.is-current {
+  background: var(--ops-accent);
+  border-color: var(--ops-accent);
+  color: #fff;
+}
+
+.ops-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.ops-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--ops-panel);
+  border: 1px solid var(--ops-line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.ops-table th {
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ops-muted);
+  font-weight: 600;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--ops-line);
+}
+
+.ops-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #eef1f4;
+  vertical-align: top;
+}
+
+.ops-table tbody tr {
+  cursor: pointer;
+}
+
+.ops-table tbody tr:hover {
+  background: #f9fbfd;
+}
+
+.ops-table tbody tr.is-selected {
+  background: #eef4ff;
+}
+
+/* A left edge rather than a full-row tint: the queue is mostly flagged rows,
+ * and tinting all of them would make the flag mean nothing. */
+.ops-table tbody tr.needs-review td:first-child {
+  box-shadow: inset 3px 0 0 var(--ops-warn);
+}
+
+.ops-actions-cell {
+  color: var(--ops-accent);
+  font-size: 12px;
+}
+
+.ops-status {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ops-status-published {
+  color: #067647;
+}
+.ops-status-pending_review {
+  color: var(--ops-warn);
+}
+.ops-status-draft,
+.ops-status-archived {
+  color: var(--ops-muted);
+}
+
+.ops-flag {
+  display: inline-block;
+  font-size: 11px;
+  background: #fff6e8;
+  color: var(--ops-warn);
+  border: 1px solid #f5dcb4;
+  border-radius: 999px;
+  padding: 1px 7px;
+  margin: 2px 4px 0 0;
+}
+
+.ops-flag-off {
+  background: #fdeceb;
+  color: var(--ops-danger);
+  border-color: #f4c9c5;
+}
+
+.ops-flag-edit {
+  background: #eef4ff;
+  color: var(--ops-accent);
+  border-color: #cfdcfb;
+}
+
+.ops-pager {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.ops-editor {
+  background: var(--ops-panel);
+  border: 1px solid var(--ops-line);
+  border-radius: 10px;
+  padding: 16px;
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+}
+
+.ops-editor header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.ops-editor h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.ops-editor h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ops-muted);
+}
+
+.ops-editor section {
+  border-top: 1px solid #eef1f4;
+  padding-top: 14px;
+  margin-top: 14px;
+}
+
+.ops-field {
+  display: block;
+  margin-bottom: 10px;
+}
+
+.ops-field > span {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 4px;
+  color: var(--ops-muted);
+}
+
+.ops-callout {
+  background: #fff6e8;
+  border: 1px solid #f5dcb4;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+
+.ops-callout strong {
+  display: block;
+  margin-bottom: 2px;
+}
+
+.ops-callout-quiet {
+  background: #eef4ff;
+  border-color: #cfdcfb;
+}
+
+.ops-history {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+}
+
+.ops-history li {
+  padding: 6px 0;
+  border-bottom: 1px solid #f2f4f6;
+}
+
+.ops-settings {
+  display: grid;
+  gap: 16px;
+  max-width: 820px;
+}
+
+.ops-settings article {
+  background: var(--ops-panel);
+  border: 1px solid var(--ops-line);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.ops-settings header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ops-settings h3 {
+  margin: 0;
+  font-size: 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.ops-insight {
+  display: grid;
+  gap: 20px;
+  max-width: 720px;
+}
+
+.ops-metrics {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.ops-metrics > div {
+  background: var(--ops-panel);
+  border: 1px solid var(--ops-line);
+  border-radius: 10px;
+  padding: 12px 16px;
+  min-width: 200px;
+}
+
+.ops-metrics strong {
+  font-size: 20px;
+  display: block;
+}
+
+.ops-funnel {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  background: var(--ops-panel);
+  border: 1px solid var(--ops-line);
+  border-radius: 10px;
+}
+
+.ops-funnel li {
+  display: grid;
+  grid-template-columns: 160px 1fr 70px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #eef1f4;
+  font-size: 13px;
+}
+
+.ops-funnel li:last-child {
+  border-bottom: none;
+}
+
+.ops-bar {
+  background: #eef1f4;
+  border-radius: 999px;
+  height: 8px;
+  overflow: hidden;
+}
+
+.ops-bar > div {
+  background: var(--ops-accent);
+  height: 100%;
+}
+
+.ops-funnel strong {
+  text-align: right;
+}

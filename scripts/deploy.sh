@@ -35,6 +35,14 @@ deployment_parameters=(
 if [[ -n "$ai_account_name" ]]; then
   deployment_parameters+=(aiAccountName="$ai_account_name")
 fi
+if [[ -n "${ADMIN_BOOTSTRAP_KEY:-}" ]]; then
+  deployment_parameters+=(adminBootstrapKey="$ADMIN_BOOTSTRAP_KEY")
+else
+  # Not fatal: the storefront is unaffected. But say so plainly, because the
+  # failure mode is otherwise a console that returns 401 to a correct key and
+  # gives no hint why.
+  echo "ADMIN_BOOTSTRAP_KEY is not set: the operator console will be unreachable." >&2
+fi
 
 # This script runs the same ARM deployment twice — once to bootstrap the
 # registry, once with the real image. Azure Database for PostgreSQL rejects a

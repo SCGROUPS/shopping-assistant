@@ -168,9 +168,14 @@ backend/app/
 ├── assistant/      service.py · provider.py        L5 orchestration + LLM
 ├── catalog/        seed.py · trippass.py · importer.py  products, embeddings
 ├── commerce/       cart · booking · voucher        simulated purchase
+├── admin/          auth · audit · catalog_ops      operations surface (§4.2)
+│                   settings_ops · routes · cli
+├── evals/          checks · runner · cli           quality suites (§13.4)
 └── common/         ranking.py · features.py · persistence.py · config.py
                     urgency.py · currency.py       commercial signals (§10)
                     analytics.py                   funnel + holdout (§13)
+                    runtime_config.py              live business config (§4.2)
+                    schema.py                      DDL shared with migrations
                     llm_cost.py · embedding_cache.py  cost controls (§11)
 
 frontend/src/
@@ -178,6 +183,7 @@ frontend/src/
 ├── components/AssistantPanel   assistant surface
 ├── components/CartDrawer       cart, cross-sell rail
 ├── components/ProductCard      pricing, urgency badges
+├── components/AdminConsole     operator console at /admin (§4.2)
 ├── lib/presence.ts             assistant presence and friction rules
 ├── lib/api.ts                  API client, SSE, normalization
 └── types.ts                    shared contracts
@@ -231,6 +237,105 @@ supplier. This is the one part of an imported product that is not authoritative.
 
 The catalog job runs the import after seeding on every deploy, non-fatally: a
 supplier outage logs and continues rather than failing the deployment.
+
+---
+
+## 4.2 Operations surface
+
+Everything above describes an engine. §4.1 ends with an importer that classifies
+supply with a model and writes it straight to `PUBLISHED`, which means the one
+case the system already knows it got wrong — a listing it could not confidently
+classify — reaches shoppers unreviewed. That was not an oversight in the
+importer; it was the absence of anywhere for a human to stand.
+
+`backend/app/admin/` is that place, and `frontend/src/components/AdminConsole.tsx`
+is its front end at `/admin`. Four capabilities, in the order they matter.
+
+### Identity and authorisation
+
+Operators authenticate with a `vk_`-prefixed key, stored as a salted `scrypt`
+hash. Verification is a single indexed lookup on the first eight characters,
+and a decoy hash runs when no operator matches so a wrong prefix costs the same
+as a wrong key.
+
+Endpoints declare **capabilities**, not roles (`requires("catalog:write")`), and
+`ROLES` maps role to capability set. Adding a role touches one dictionary rather
+than every route. The separations are deliberate:
+
+| Role | Can | Deliberately cannot |
+| --- | --- | --- |
+| `analyst` | read | change anything |
+| `merchandiser` | read, merchandise, configure | edit or publish catalogue content |
+| `catalog_manager` | read, merchandise, edit, publish | change ranking configuration or create operators |
+| `admin` | everything | — |
+
+`ADMIN_BOOTSTRAP_KEY` supplies the first credential, because creating an
+operator requires being one. Left unset the console is simply unreachable,
+which is the right default for an unattended deploy. In demo mode — which has
+no database — a fixed key stands in.
+
+Two consequences worth stating plainly: `/api/v1/analytics/funnel` previously
+served conversion, revenue and model spend to anyone who asked, and now requires
+`read`. And a wrong key returns **401 even when no database is configured**,
+because reporting "service unavailable" for a bad credential reports an
+authentication failure as an outage.
+
+### The review queue
+
+`needs_review` is now persisted rather than counted and discarded, and a flagged
+import is written as `PENDING_REVIEW`. Since the storefront only ever selects
+`PUBLISHED` rows, an unreviewed listing is held back with no change anywhere
+downstream. The console's default screen is that queue, ordered
+`needs_review DESC`, so the console opens as a worklist rather than a browser.
+
+### Overrides: why a catalogue editor needs them
+
+An editor is worthless if the next deploy silently reverts it, and `_apply()`
+used to overwrite every field on every import. `IMPORTED_FIELDS` now enumerates
+the fields the supplier owns; anything a human touches is recorded in
+`experience_overrides.fields` and skipped on subsequent imports. Merchandising,
+review state and `published_at` are never supplier-owned at all.
+
+One rule earns its own line: if a human has ruled on `status`, the importer
+forces `needs_review = False` and leaves status alone. Without it the queue
+refills itself with decisions already made, and a queue that does that stops
+being read.
+
+### Merchandising
+
+Three controls, each bounded by an argument rather than by taste:
+
+- **Boost** is clamped to `[1/ceiling, ceiling]` (default 1.5), enforced at
+  write time so the operator is told, *and* at read time so a stale value cannot
+  swamp relevance later.
+- **Pin** applies to the `recommended` sort only. Honouring it under an explicit
+  price or rating sort would override the control the shopper just used.
+- **Suppress** is a hard gate in `is_eligible` and in the SQL candidate CTE, so
+  pulled inventory does not merely rank lower and does not consume a candidate
+  slot.
+
+All three respect promotion windows, checked at read time rather than trusted to
+a cleanup job.
+
+### Runtime configuration
+
+Ranking weights, category take rates, the boost ceiling, MMR lambda and the
+assistant policy text move from environment variables to
+`business_settings`, editable in the console and live within 30 seconds with no
+deploy. Weights are validated individually and as a sum (0.5–1.5): ranking
+compares items so scale cancels, but a wildly wrong total means an arithmetic
+slip rather than a choice.
+
+Two degradations are deliberate and pinned by tests. A database error during
+refresh falls back to deployed defaults — configuration must never take the
+storefront down. A stored value that no longer validates is ignored per key
+rather than raising — a schema change must not break ranking.
+
+### Audit
+
+Every operator mutation writes an `audit_log` row with actor, action, entity and
+a field-level before/after diff, on the caller's transaction so the record
+cannot survive a rolled-back change or vice versa.
 
 ---
 
@@ -867,18 +972,63 @@ assumed **enabled** — a telemetry outage must not silently remove the product.
 Without a holdout the core thesis — that the assistant beats manual search —
 is unfalsifiable, and therefore untunable.
 
+### 13.4 Quality evaluation
+
+Types and unit tests cannot tell you the answers got worse. Every regression
+this project has actually shipped was a quality regression — an ocean request
+answered with mountains, a Hanoi food question answered with a boat trip — and
+each looked entirely reasonable in the diff.
+
+`backend/evals/` holds two golden suites, graded by `app/evals/`:
+
+- **`search_cases.json`** runs with no model configured, so it is safe in CI. It
+  asserts what ranking must do: budgets and rating floors hold, explicit sort
+  controls are not overridden, a stated exclusion removes the excluded thing,
+  garbage degrades to browsing rather than an error.
+- **`assistant_cases.json`** needs a real model and is run before any change to
+  prompts, tools or the agent loop. Turns within a case share one conversation,
+  so later turns test memory as well as retrieval.
+
+The grader is deliberately **not an LLM judge**. Every failure worth catching is
+a statement about product attributes, which are data we already hold, so the
+grade is exact and reproducible. Adding a judge later is easy; removing a flaky
+one from CI once it is there is not. Two details matter more than they look:
+matching allows an optional plural but not arbitrary substrings — `pho` is
+inside `photography`, and a substring grader would score a photography tour as a
+Pho match and pass the exact bug the suite exists to catch — and the assistant
+suite checks **grounding** on every turn, failing any card that does not trace
+to a real catalogue product, because an invented card is unbookable.
+
+Cases must carry a `why` and must assert something; both are enforced by test,
+because a suite full of empty expectations is worse than no suite. The runner
+compares against a committed baseline and fails on any case that used to pass,
+which catches the change that fixes one case while breaking another — invisible
+in an aggregate pass rate.
+
+Current state: search 15/15 in CI; assistant 13/13 against the live model, at a
+p95 of ~13s per turn.
+
 ---
 
 ## 14. Security, privacy, reliability
 
-- Anonymous sessions; no shopper accounts or PII collection in the POC.
-- All mutations are server-side, session-validated, idempotency-keyed, and
-  audited. Idempotency is verified under concurrency by integration test.
+- Anonymous shopper sessions; no shopper accounts or PII collection.
+- Shopper mutations are server-side, session-validated and idempotency-keyed;
+  idempotency is verified under concurrency by integration test.
+- **Operator** mutations are authenticated, capability-checked and written to
+  `audit_log` with a field-level diff, on the same transaction as the change
+  (§4.2). Earlier revisions of this document claimed all mutations were audited
+  while no audit table existed; that is now true rather than aspirational.
+- The analytics funnel requires the `read` capability. It previously served
+  conversion, revenue and model spend anonymously.
+- Operator keys are stored as salted `scrypt` hashes, never in plaintext, and
+  are shown once at creation.
 - Catalog content is untrusted input to the model and cannot alter instructions.
 - Generated constraints are sanitized before reaching the query planner.
 - Payment is simulated end to end; no real payment data exists.
-- PostgreSQL uses `AllowAzureServices`, an explicit low-cost POC trade-off to be
-  replaced with private networking before production.
+- PostgreSQL uses `AllowAzureServices`, an explicit low-cost trade-off to be
+  replaced with private networking before production. See
+  `docs/PRODUCTION_READINESS.md` §4 for the full list of remaining blockers.
 - Secrets are Container Apps secrets; Azure OIDC federation is used for CI/CD.
 - Assistant turns are capped (`assistant_max_session_turns` = 12).
 

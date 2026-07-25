@@ -14,6 +14,7 @@ from fastapi import (
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.admin.auth import CatalogWrite, ReadAccess
 from app.api.schemas import (
     BookingView,
     CartItemRequest,
@@ -329,31 +330,46 @@ async def get_voucher(booking_id: UUID) -> VoucherView:
 
 @router.post("/admin/imports", status_code=202)
 async def import_catalog(
+    principal: CatalogWrite,
     file: UploadFile = File(...),
-    admin_role: Annotated[str | None, Header(alias="X-Admin-Role")] = None,
 ) -> dict[str, Any]:
-    if admin_role != "catalog_manager":
-        raise ApiError(403, "Forbidden", "Catalog manager role is required", "forbidden")
+    """Validate a supplier catalogue file before it is imported.
+
+    This endpoint used to trust an `X-Admin-Role` request header, which made
+    every caller a catalog manager. It now requires a real operator credential.
+
+    It validates and reports; it does not write. Supplier inventory is imported
+    by `app.catalog.cli`, which runs on every deploy and routes anything the
+    classifier was unsure of into the review queue - a path with attribution and
+    an audit trail that an ad-hoc file upload would bypass.
+    """
     if not file.filename or not file.filename.endswith(".json"):
         raise ApiError(422, "Invalid import", "Upload a JSON catalog file", "invalid-import")
-    payload = json.loads((await file.read()).decode())
+    try:
+        payload = json.loads((await file.read()).decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ApiError(422, "Invalid import", "File is not valid JSON", "invalid-import") from error
     records = payload if isinstance(payload, list) else payload.get("experiences", [])
     errors = []
-    imported = 0
+    valid = 0
     required = {"slug", "title", "description", "destination", "category", "options"}
     for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            errors.append({"row": index + 1, "error": "Expected an object"})
+            continue
         missing = sorted(required.difference(record))
         if missing:
             errors.append({"row": index + 1, "error": f"Missing: {', '.join(missing)}"})
             continue
-        imported += 1
+        valid += 1
     return {
         "id": uuid4(),
         "status": "VALIDATED",
         "source_name": file.filename,
-        "imported_count": imported,
+        "validated_by": principal.email,
+        "valid_count": valid,
         "errors": errors,
-        "note": "Demo mode validates uploads; use `python -m app.catalog.cli` for seed upsert.",
+        "note": "Validation only. Supplier inventory is imported by the catalog job.",
     }
 
 
@@ -373,7 +389,7 @@ async def session_context(session_id: SessionHeader = "demo-session") -> dict[st
 
 
 @router.get("/analytics/funnel")
-async def analytics_funnel() -> dict[str, Any]:
+async def analytics_funnel(principal: ReadAccess) -> dict[str, Any]:
     """Funnel counts per surface, assistant lift, nudge quality, search health."""
     settings = get_settings()
     spend = ledger.snapshot()
