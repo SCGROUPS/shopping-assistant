@@ -1,13 +1,15 @@
 import {
   ArrowRight,
   CalendarDays,
+  MessageCircle,
   Minus,
+  Plus,
   ShieldCheck,
   ShoppingBag,
   Trash2,
   X,
 } from 'lucide-react'
-import type { CartItem } from '../types'
+import type { CartItem, Experience } from '../types'
 
 const money = (currency: string, amount: number) =>
   new Intl.NumberFormat('en-US', {
@@ -22,6 +24,11 @@ type CartDrawerProps = {
   onClose: () => void
   onRemove: (id: string) => void
   onCheckout: () => void
+  onCheckPlan?: () => void
+  clashing: boolean
+  /** Attach-rate rail. Highest-intent moment in the funnel. */
+  crossSell?: Experience[]
+  onAddCrossSell?: (product: Experience) => void
 }
 
 export function CartDrawer({
@@ -29,7 +36,11 @@ export function CartDrawer({
   items,
   onClose,
   onRemove,
+  onCheckPlan,
+  clashing,
   onCheckout,
+  crossSell = [],
+  onAddCrossSell,
 }: CartDrawerProps) {
   const total = items.reduce((sum, item) => sum + item.total, 0)
   const currency = items[0]?.experience.currency ?? 'USD'
@@ -106,6 +117,47 @@ export function CartDrawer({
                 </article>
               ))}
             </div>
+
+            {crossSell.length > 0 && onAddCrossSell && (
+              <section className="cart-cross-sell">
+                <h3>Goes well with your day</h3>
+                <ul>
+                  {crossSell.slice(0, 3).map((product) => (
+                    <li key={product.id}>
+                      <img src={product.image_url} alt="" loading="lazy" />
+                      <div>
+                        <strong>{product.title}</strong>
+                        <small>
+                          {product.display_price != null &&
+                          product.display_currency
+                            ? money(
+                                product.display_currency,
+                                product.display_price,
+                              )
+                            : money(product.currency, product.price)}
+                          {product.scarcity ? ` · ${product.scarcity}` : ''}
+                        </small>
+                      </div>
+                      <button
+                        onClick={() => onAddCrossSell(product)}
+                        aria-label={`Add ${product.title}`}
+                      >
+                        <Plus size={16} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+
+            {onCheckPlan && (
+              <button className="cart-plan-check" onClick={onCheckPlan}>
+                <MessageCircle size={16} />
+                {clashing
+                  ? 'Two items clash — ask Mai to re-time one'
+                  : 'Check my plan with Mai'}
+              </button>
+            )}
 
             <div className="cart-assurance">
               <ShieldCheck size={20} />

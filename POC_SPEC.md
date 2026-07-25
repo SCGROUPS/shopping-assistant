@@ -5,6 +5,18 @@
 **Last updated:** 2026-07-24
 **Primary stack:** Python 3.14, FastAPI, React 19, Azure Database for PostgreSQL Flexible Server, pgvector, OpenAI API, Azure Container Apps
 
+> **Superseded in part.** This document remains the reference for the data
+> model, API surface, domain scope, and delivery phases, and it records the
+> original POC intent. For the **as-built architecture**, the ranking and
+> recommendation design, the assistant presence and engagement model, and the
+> MVP roadmap, see [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md).
+>
+> Several scoring terms specified here (`availability_fit`, `commercial_quality`,
+> `context_fit`, cold-start weight redistribution) were stubbed as constants
+> rather than implemented, and the assistant orchestration is narrower than
+> §13 describes. Section 12 of the system design document lists every known
+> divergence.
+
 ## 1. Executive summary
 
 Build a web-based proof of concept for discovering and purchasing tourism products such as attraction tickets, tours, activities, transport passes, and vouchers.

@@ -385,6 +385,127 @@
   position: absolute;
 }
 
+.search-segment select {
+  cursor: pointer;
+  inset: 0;
+  opacity: 0;
+  position: absolute;
+  width: 100%;
+}
+
+.guest-segment {
+  cursor: default;
+  justify-content: space-between;
+}
+
+.guest-stepper {
+  display: flex;
+  gap: 6px;
+}
+
+.guest-stepper button {
+  align-items: center;
+  background: var(--surface-muted, #f2f4f5);
+  border: 1px solid var(--line, #dfe3e6);
+  border-radius: 999px;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  height: 26px;
+  justify-content: center;
+  width: 26px;
+}
+
+.guest-stepper button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.filter-panel {
+  background: white;
+  border: 1px solid var(--line, #dfe3e6);
+  border-radius: 18px;
+  display: grid;
+  gap: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  margin-bottom: 22px;
+  padding: 22px;
+}
+
+.filter-group h4 {
+  font-size: 13px;
+  margin: 0 0 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.65;
+}
+
+.filter-group small {
+  display: block;
+  margin-top: 8px;
+  opacity: 0.6;
+}
+
+.filter-group input[type='number'] {
+  border: 1px solid var(--line, #dfe3e6);
+  border-radius: 10px;
+  padding: 9px 12px;
+  width: 100%;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip-row button {
+  background: white;
+  border: 1px solid var(--line, #dfe3e6);
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 7px 14px;
+}
+
+.chip-row button.active {
+  background: var(--green, #0f7b6c);
+  border-color: var(--green, #0f7b6c);
+  color: white;
+}
+
+.filter-reset {
+  align-self: end;
+  background: transparent;
+  border: 0;
+  color: var(--green, #0f7b6c);
+  cursor: pointer;
+  font-weight: 600;
+  justify-self: start;
+  padding: 0;
+}
+
+.filter-reset:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.relaxation-notice {
+  align-items: flex-start;
+  background: #fff7e8;
+  border: 1px solid #f2d9a8;
+  border-radius: 14px;
+  display: flex;
+  gap: 10px;
+  margin-bottom: 20px;
+  padding: 14px 16px;
+}
+
+.relaxation-notice p {
+  font-size: 14px;
+  margin: 0;
+}
+
 .search-submit {
   align-items: center;
   background: var(--green);
@@ -2578,11 +2699,11 @@
   }
 
   .discovery-bar {
-    grid-template-columns: 1.6fr 0.75fr 0.6fr auto;
+    grid-template-columns: 1.4fr 0.8fr 0.7fr 0.6fr auto;
   }
 
-  .destination-segment {
-    display: none;
+  .destination-segment strong {
+    max-width: 96px;
   }
 
   .product-grid {
@@ -2955,4 +3076,273 @@
   .confirmation-actions .checkout-button {
     width: 100%;
   }
+}
+
+.recommendation-empty {
+  grid-column: 1 / -1;
+  align-self: center;
+  margin: 0;
+  padding: 1.25rem 1.5rem;
+  border: 1px dashed rgba(15, 23, 42, 0.18);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.6);
+  color: #475569;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.facet-count {
+  background: rgba(0, 0, 0, 0.07);
+  border-radius: 999px;
+  font-size: 11px;
+  font-style: normal;
+  margin-left: 7px;
+  padding: 2px 7px;
+}
+
+.category-tabs button.active .facet-count {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* Assistant presence — docs/SYSTEM_DESIGN.md §8 */
+.assistant-fab-dock {
+  bottom: 22px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  position: fixed;
+  right: 22px;
+  z-index: 40;
+}
+
+.assistant-fab-dock .assistant-fab {
+  bottom: auto;
+  position: static;
+  right: auto;
+}
+
+.assistant-nudge {
+  align-items: center;
+  background: var(--green, #0f7b6c);
+  border-radius: 14px;
+  box-shadow: 0 12px 34px rgba(23, 59, 53, 0.24);
+  color: white;
+  display: flex;
+  gap: 8px;
+  max-width: 300px;
+  padding: 10px 10px 10px 14px;
+}
+
+.assistant-nudge p {
+  font-size: 13px;
+  line-height: 1.35;
+  margin: 0;
+}
+
+.nudge-dismiss {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.18);
+  border: 0;
+  border-radius: 8px;
+  color: white;
+  cursor: pointer;
+  display: flex;
+  flex-shrink: 0;
+  height: 24px;
+  justify-content: center;
+  width: 24px;
+}
+
+.cart-plan-check {
+  align-items: center;
+  background: white;
+  border: 1px solid var(--line, #dfe3e6);
+  border-radius: 12px;
+  cursor: pointer;
+  display: flex;
+  font-size: 13px;
+  font-weight: 600;
+  gap: 8px;
+  justify-content: center;
+  margin: 0 20px 12px;
+  padding: 11px 14px;
+  width: calc(100% - 40px);
+}
+
+.ask-about-button {
+  align-items: center;
+  background: white;
+  border: 1px solid var(--line, #dfe3e6);
+  border-radius: 12px;
+  cursor: pointer;
+  display: flex;
+  font-weight: 600;
+  gap: 8px;
+  justify-content: center;
+  padding: 13px 18px;
+}
+
+@media (max-width: 720px) {
+  .assistant-fab-dock {
+    align-items: stretch;
+    bottom: 12px;
+    left: 12px;
+    right: 12px;
+  }
+
+  .assistant-nudge {
+    max-width: none;
+  }
+}
+
+/* Non-exclusive layout (§8.5): on desktop the panel sits beside results. */
+.app-shell {
+  transition: padding-right 0.32s ease;
+}
+
+@media (min-width: 1101px) {
+  .app-shell.assistant-docked {
+    padding-right: 450px;
+  }
+
+  .app-shell.assistant-docked .mini-cart,
+  .app-shell.assistant-docked .assistant-fab-dock {
+    right: 472px;
+  }
+}
+
+/* On mobile it is a partial-height sheet, never a full-screen takeover. */
+@media (max-width: 1100px) {
+  .assistant-panel {
+    border-left: 0;
+    border-radius: 22px 22px 0 0;
+    box-shadow: 0 -18px 60px rgba(23, 59, 53, 0.24);
+    height: 78dvh;
+    left: 0;
+    top: auto;
+    transform: translateY(105%);
+    width: 100%;
+  }
+
+  .assistant-panel.open {
+    transform: translateY(0);
+  }
+}
+
+/* Commercial signals — only rendered when the underlying fact is real. */
+.product-signals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 2px;
+}
+
+.product-signals .signal {
+  align-items: center;
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 11.5px;
+  font-weight: 600;
+  gap: 4px;
+  letter-spacing: 0.01em;
+  padding: 4px 9px;
+}
+
+.signal-scarcity {
+  background: #fff1ec;
+  color: #c2410c;
+}
+
+.signal-proof {
+  background: #eef4ff;
+  color: #1d4ed8;
+}
+
+.currency-button select {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  padding: 0;
+}
+
+.currency-button select:focus-visible {
+  outline: 2px solid var(--accent, #0f766e);
+  outline-offset: 3px;
+}
+
+.sr-only {
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  height: 1px;
+  overflow: hidden;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+}
+
+/* Attach-rate rail at the highest-intent moment in the funnel. */
+.cart-cross-sell {
+  border-top: 1px solid var(--line, #dfe3e6);
+  margin: 4px 20px 12px;
+  padding-top: 14px;
+}
+
+.cart-cross-sell h3 {
+  font-size: 13px;
+  font-weight: 700;
+  margin: 0 0 10px;
+}
+
+.cart-cross-sell ul {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.cart-cross-sell li {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 44px 1fr auto;
+}
+
+.cart-cross-sell img {
+  border-radius: 9px;
+  height: 44px;
+  object-fit: cover;
+  width: 44px;
+}
+
+.cart-cross-sell strong {
+  display: block;
+  font-size: 13px;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cart-cross-sell small {
+  color: var(--muted, #667);
+  font-size: 11.5px;
+}
+
+.cart-cross-sell li button {
+  align-items: center;
+  background: var(--accent, #0f766e);
+  border: 0;
+  border-radius: 9px;
+  color: white;
+  cursor: pointer;
+  display: inline-flex;
+  height: 30px;
+  justify-content: center;
+  width: 30px;
 }

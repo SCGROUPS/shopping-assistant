@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -238,13 +239,22 @@ def _product_dict(
 
 async def event_history(
     anonymous_id: str, limit: int = 20, data: DemoStore = store
-) -> list[tuple[str, UUID]]:
+) -> list[tuple[str, UUID, datetime]]:
+    """Return recent behaviour, newest last, with timestamps preserved.
+
+    The timestamp is the point of the signal: for same-day tourist booking, a
+    view from ten minutes ago and one from yesterday mean very different things.
+    """
     if not database_mode():
         return data.event_experiences.get(anonymous_id, [])[-limit:]
     factory = require_session_factory()
     async with factory() as db:
         rows = await db.execute(
-            select(BehaviorEvent.event_type, BehaviorEvent.experience_id)
+            select(
+                BehaviorEvent.event_type,
+                BehaviorEvent.experience_id,
+                BehaviorEvent.occurred_at,
+            )
             .join(ShoppingSession, ShoppingSession.id == BehaviorEvent.session_id)
             .where(
                 ShoppingSession.anonymous_id == anonymous_id,
@@ -254,7 +264,51 @@ async def event_history(
             .limit(limit)
         )
         return [
-            (event_type, experience_id)
-            for event_type, experience_id in reversed(rows.all())
+            (event_type, experience_id, occurred_at)
+            for event_type, experience_id, occurred_at in reversed(rows.all())
             if experience_id is not None
         ]
+
+
+DEMAND_EVENTS = {
+    "experience_impression": "impressions",
+    "experience_viewed": "views",
+    "cart_item_added": "cart_adds",
+    "booking_completed": "bookings",
+}
+
+
+async def demand_stats(data: DemoStore = store) -> dict[UUID, dict[str, float]]:
+    """Observed demand per experience, aggregated across all sessions.
+
+    This is what turns `popularity` and `conversion_rate` into measurements
+    rather than the seeded review-count proxy they started as.
+    """
+    stats: dict[UUID, dict[str, float]] = defaultdict(
+        lambda: dict.fromkeys(DEMAND_EVENTS.values(), 0.0)
+    )
+    if not database_mode():
+        for event in data.events:
+            field = DEMAND_EVENTS.get(event["event_type"])
+            experience_id = event.get("experience_id")
+            if field and experience_id:
+                stats[experience_id][field] += 1
+        return dict(stats)
+
+    factory = require_session_factory()
+    async with factory() as db:
+        rows = await db.execute(
+            select(
+                BehaviorEvent.experience_id,
+                BehaviorEvent.event_type,
+                func.count(),
+            )
+            .where(
+                BehaviorEvent.experience_id.is_not(None),
+                BehaviorEvent.event_type.in_(list(DEMAND_EVENTS)),
+            )
+            .group_by(BehaviorEvent.experience_id, BehaviorEvent.event_type)
+        )
+        for experience_id, event_type, count in rows.all():
+            stats[experience_id][DEMAND_EVENTS[event_type]] += float(count)
+    return dict(stats)

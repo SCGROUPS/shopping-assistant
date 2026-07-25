@@ -142,3 +142,101 @@ async def test_azure_enhancement_path_keeps_structured_commerce_payload():
         "CHECK_AVAILABILITY",
         "ADD_TO_CART",
     }
+
+
+async def test_planner_decision_wins_over_keyword_match(client: AsyncClient):
+    from app.api.schemas import AssistantContext
+    from app.assistant.service import keyword_tool
+
+    # "compare" appears in the sentence but the shopper is asking to search.
+    assert keyword_tool("compare") == "compare_experiences"
+
+    class PlannerProvider:
+        async def plan_action(self, text, state):
+            return "search_experiences"
+
+        async def enhance_assistant(self, prompt, facts):
+            return None
+
+        async def embed(self, text):
+            return deterministic_embedding(text)
+
+        async def extract_intent(self, text):
+            return deterministic_intent(text)
+
+    service = AssistantService(store, PlannerProvider())
+    conversation = await service.create("test-session", ConversationCreate())
+    response = await service.respond(
+        conversation["id"],
+        "test-session",
+        MessageRequest(
+            message="I want to compare nothing, just show me Hoi An food tours",
+            context=AssistantContext(),
+        ),
+    )
+    assert response.products, "planner asked for a search, so results are expected"
+
+
+async def test_planner_alone_cannot_confirm_a_booking(client: AsyncClient):
+    class ConfirmingProvider:
+        async def plan_action(self, text, state):
+            return "confirm_simulated_checkout"
+
+        async def enhance_assistant(self, prompt, facts):
+            return None
+
+        async def embed(self, text):
+            return deterministic_embedding(text)
+
+        async def extract_intent(self, text):
+            return deterministic_intent(text)
+
+    service = AssistantService(store, ConfirmingProvider())
+    conversation = await service.create("test-session", ConversationCreate())
+    response = await service.respond(
+        conversation["id"],
+        "test-session",
+        MessageRequest(message="tell me about the lantern boat"),
+    )
+    assert "confirmed" not in response.message.casefold()
+
+
+async def test_context_carries_storefront_filters(client: AsyncClient):
+    from app.api.schemas import AssistantContext, Participant, SearchFilters
+
+    created = await client.post("/api/v1/conversations", json={})
+    conversation_id = created.json()["id"]
+    response = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages?stream=false",
+        json={
+            "message": "what should I do",
+            "context": AssistantContext(
+                filters=SearchFilters(destination="Hoi An"),
+                party=[Participant(type="adult", count=2)],
+                query="things to do",
+                result_count=12,
+            ).model_dump(mode="json"),
+        },
+    )
+    assert response.status_code == 200
+    products = response.json()["products"]
+    assert products, "storefront destination should scope the assistant search"
+    assert all(product["destination"] == "Hoi An" for product in products)
+
+
+async def test_referent_resolution_picks_the_named_experience(client: AsyncClient):
+    created = await client.post("/api/v1/conversations", json={})
+    conversation_id = created.json()["id"]
+    search = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages?stream=false",
+        json={"message": "Find a family friendly indoor activity in Hoi An"},
+    )
+    products = search.json()["products"]
+    assert len(products) >= 2
+    second = products[1]
+    added = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages?stream=false",
+        json={"message": f"add {second['title']} to my cart"},
+    )
+    assert added.status_code == 200
+    assert second["title"] in added.json()["message"]

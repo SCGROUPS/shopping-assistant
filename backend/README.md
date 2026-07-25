@@ -3,6 +3,16 @@
 FastAPI POC backend with deterministic local search/assistant behavior and a production-shaped
 PostgreSQL, pgvector, Alembic, and Azure OpenAI integration.
 
+## Design
+
+See [../docs/SYSTEM_DESIGN.md](../docs/SYSTEM_DESIGN.md) for the layered
+architecture. In short: `search/` owns the eligibility gate, hybrid retrieval,
+and RRF fusion; `recommendations/` is a **separate** query-less engine with its
+own scoring function; `assistant/` is an orchestration layer that consumes both
+as tools and does not itself rank products. Shared ranking primitives live in
+`common/ranking.py`. The design document also records where the implemented
+scoring diverges from `POC_SPEC.md`.
+
 ## Run locally
 
 ```bash

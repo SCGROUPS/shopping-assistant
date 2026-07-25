@@ -1,7 +1,19 @@
+from datetime import UTC, datetime, timedelta
+
+import pytest
 from httpx import AsyncClient
 
-from app.api.schemas import IntentValue, SearchFilters, SearchIntent, SearchRequest
+from app.api.schemas import (
+    IntentValue,
+    Participant,
+    SearchFilters,
+    SearchIntent,
+    SearchRequest,
+)
 from app.assistant.provider import deterministic_intent
+from app.common.config import get_settings
+from app.common.features import availability_fit
+from app.common.persistence import catalog_products
 from app.common.ranking import deterministic_embedding
 from app.search.service import SearchService, merge_filters, sanitize_intent
 
@@ -215,3 +227,96 @@ def test_optional_filters_and_multi_category_interests_do_not_block_search():
     assert filters.category is None
     assert filters.indoor_outdoor is None
     assert filters.family_friendly is True
+
+
+async def test_relaxation_recovers_from_zero_results(client: AsyncClient):
+    response = await client.post(
+        "/api/v1/search",
+        json={
+            "query": "museum",
+            "filters": {
+                "destination": "Hoi An",
+                "category": "Cruise",
+                "max_duration_minutes": 5,
+                "rating": 4.9,
+            },
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["items"], "relaxation should recover bookable results"
+    assert payload["relaxed_preferences"], "the shopper must be told what changed"
+
+
+async def test_relaxation_never_drops_accessibility(client: AsyncClient):
+    response = await client.post(
+        "/api/v1/search",
+        json={
+            "query": "impossible combination",
+            "filters": {
+                "accessibility": ["wheelchair"],
+                "max_duration_minutes": 1,
+                "rating": 5.0,
+            },
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert "accessibility" not in " ".join(payload["relaxed_preferences"])
+    for item in payload["items"]:
+        detail = await client.get(f"/api/v1/experiences/{item['id']}")
+        features = " ".join(detail.json()["accessibility_features"]).casefold()
+        assert "wheelchair" in features
+
+
+async def test_facets_allow_sideways_drill_down(client: AsyncClient):
+    response = await client.post(
+        "/api/v1/search",
+        json={"query": "things to do", "filters": {"category": "Food & drink"}},
+    )
+    assert response.status_code == 200
+    facets = response.json()["facets"]
+    assert len(facets["category"]) > 1, (
+        "category counts must ignore the category filter so shoppers can switch tabs"
+    )
+    assert facets["destination"], "destination counts should still be populated"
+
+
+async def test_ranking_prefers_comfortably_bookable_inventory(client: AsyncClient):
+    """Availability is a ranking term, not just a gate.
+
+    Two items that are equally relevant should not tie when one has a single
+    remaining seat: the shopper who picks it is far likelier to bounce.
+    """
+    products = await catalog_products()
+    scarce, plentiful = products[0], products[1]
+    for option in scarce["options"][1:]:
+        option["slots"] = []
+    scarce["options"][0]["slots"] = scarce["options"][0]["slots"][:1]
+    for slot in scarce["options"][0]["slots"]:
+        slot["capacity_remaining"] = 1
+
+    visit = datetime.now(UTC) + timedelta(days=2)
+    filters = SearchFilters(visit_start=visit, visit_end=visit + timedelta(days=7))
+    party = [Participant(type="adult", count=1)]
+    assert availability_fit(plentiful, filters, party) > availability_fit(scarce, filters, party)
+
+
+async def test_search_score_no_longer_carries_dead_constants():
+    """Every term in the objective must be able to discriminate.
+
+    The old score added 0.10 + 0.05 to every candidate, which changed no
+    ordering at all. Guard against that regressing.
+    """
+    settings = get_settings()
+    weights = [
+        settings.search_weight_relevance,
+        settings.search_weight_preference_fit,
+        settings.search_weight_availability_fit,
+        settings.search_weight_price_fit,
+        settings.search_weight_quality,
+        settings.search_weight_conversion,
+        settings.search_weight_margin,
+    ]
+    assert all(weight > 0 for weight in weights)
+    assert sum(weights) == pytest.approx(1.0)

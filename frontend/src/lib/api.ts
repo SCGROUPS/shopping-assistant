@@ -1,6 +1,7 @@
 import { demoExperiences } from '../data/demo'
 import type {
   AssistantAction,
+  AssistantContext,
   AssistantMessage,
   CartItem,
   Experience,
@@ -19,6 +20,37 @@ localStorage.setItem('vietra-session-id', SESSION_ID)
 const jsonHeaders = {
   'Content-Type': 'application/json',
   'X-Session-ID': SESSION_ID,
+}
+
+export const SUPPORTED_CURRENCIES = [
+  'VND',
+  'USD',
+  'EUR',
+  'GBP',
+  'AUD',
+  'SGD',
+  'KRW',
+  'JPY',
+] as const
+
+// Display currency is presentation state, so it lives here rather than being
+// threaded through every call signature. The authoritative VND price always
+// travels alongside it, and nothing that charges money reads this.
+let displayCurrency =
+  localStorage.getItem('vietra-display-currency') ?? 'VND'
+
+export const setDisplayCurrency = (currency: string) => {
+  displayCurrency = currency
+  localStorage.setItem('vietra-display-currency', currency)
+}
+
+export const getDisplayCurrency = () => displayCurrency
+
+const withDisplayCurrency = (params: URLSearchParams) => {
+  if (displayCurrency && displayCurrency !== 'VND') {
+    params.set('display_currency', displayCurrency)
+  }
+  return params
 }
 
 class ApiRequestError extends Error {
@@ -133,6 +165,13 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
     review_count: Number(item.review_count ?? 0),
     price: Number(item.price ?? options[0]?.price ?? 0),
     currency: String(item.currency ?? options[0]?.currency ?? 'VND'),
+    display_price:
+      item.display_price != null ? Number(item.display_price) : undefined,
+    display_currency: item.display_currency
+      ? String(item.display_currency)
+      : undefined,
+    scarcity: item.scarcity ? String(item.scarcity) : undefined,
+    social_proof: item.social_proof ? String(item.social_proof) : undefined,
     duration_minutes: Number(item.duration_minutes ?? 60),
     tags: Array.isArray(item.tags) ? item.tags.map(String) : [],
     badges,
@@ -220,6 +259,8 @@ const normalizeCart = async (
       experience: product,
       option_id: String(item.option_id),
       option_name: String(item.option_name ?? ''),
+      slot_id: item.slot_id ? String(item.slot_id) : undefined,
+      starts_at: startsAt?.toISOString(),
       date: startsAt?.toISOString().slice(0, 10) ?? '',
       time: startsAt?.toLocaleTimeString([], {
         hour: '2-digit',
@@ -242,6 +283,7 @@ const demoCartItem = (
   experience: product,
   option_id: product.options?.[0]?.id,
   option_name: product.options?.[0]?.name,
+  slot_id: product.options?.[0]?.slots?.[0]?.id,
   date,
   time: product.options?.[0]?.start_times?.[0],
   adults,
@@ -290,9 +332,45 @@ export const filterDemoProducts = (
 export const api = {
   demoFallbackEnabled: ALLOW_DEMO_FALLBACK,
 
+  /**
+   * Fire-and-forget funnel telemetry.
+   *
+   * Never awaited and never allowed to throw: measurement must not be able to
+   * break the thing it measures.
+   */
+  track(
+    eventType: string,
+    properties: Record<string, unknown> = {},
+    options: { experienceId?: string; placement?: string } = {},
+  ): void {
+    void request('/events', {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        event_type: eventType,
+        experience_id: options.experienceId ?? null,
+        placement: options.placement ?? null,
+        properties,
+      }),
+    }).catch(() => undefined)
+  },
+
+  /** Cohort assignment, resolved before first paint. */
+  async sessionContext(): Promise<{ assistantEnabled: boolean }> {
+    try {
+      const payload = await request<Record<string, unknown>>('/session/context')
+      return { assistantEnabled: payload.assistant_enabled !== false }
+    } catch {
+      // A telemetry outage must not remove the assistant.
+      return { assistantEnabled: true }
+    }
+  },
+
   async listExperiences(): Promise<Experience[]> {
     try {
-      return normalizeProducts(await request('/experiences'))
+      const params = withDisplayCurrency(new URLSearchParams())
+      const query = params.toString() ? `?${params}` : ''
+      return normalizeProducts(await request(`/experiences${query}`))
     } catch (error) {
       allowDemoFallbackOrThrow(error)
       return demoExperiences
@@ -307,6 +385,8 @@ export const api = {
     items: Experience[]
     intent?: Record<string, unknown>
     effectiveFilters: SearchFilters
+    relaxedPreferences: string[]
+    facets: Record<string, Record<string, number>>
   }> {
     try {
       const payload = await request<Record<string, unknown>>('/search', {
@@ -318,6 +398,7 @@ export const api = {
           party: [{ type: 'adult', count: partySize }],
           sort: 'recommended',
           page_size: 24,
+          display_currency: displayCurrency,
         }),
       })
       return {
@@ -325,21 +406,38 @@ export const api = {
         intent: payload.intent as Record<string, unknown> | undefined,
         effectiveFilters:
           (payload.effective_filters as SearchFilters | undefined) ?? filters,
+        relaxedPreferences: (payload.relaxed_preferences as string[]) ?? [],
+        facets:
+          (payload.facets as Record<string, Record<string, number>>) ?? {},
       }
     } catch (error) {
       allowDemoFallbackOrThrow(error)
       return {
         items: filterDemoProducts(query, filters),
         effectiveFilters: filters,
+        relaxedPreferences: [],
+        facets: {},
       }
     }
   },
 
   async recommendations(
     context?: Partial<Experience>,
+    filters: SearchFilters = {},
+    travellers = 0,
   ): Promise<Experience[]> {
     try {
-      const query = context?.id ? `?experience_id=${context.id}` : ''
+      const params = new URLSearchParams()
+      if (context?.id) params.set('experience_id', context.id)
+      if (filters.destination) params.set('destination', filters.destination)
+      if (filters.visit_start) params.set('visit_start', filters.visit_start)
+      if (filters.visit_end) params.set('visit_end', filters.visit_end)
+      if (filters.max_total_price !== undefined) {
+        params.set('max_total_price', String(filters.max_total_price))
+      }
+      if (travellers) params.set('travellers', String(travellers))
+      withDisplayCurrency(params)
+      const query = params.toString() ? `?${params}` : ''
       return normalizeProducts(await request(`/recommendations${query}`))
     } catch (error) {
       allowDemoFallbackOrThrow(error)
@@ -386,6 +484,7 @@ export const api = {
     conversationId: string,
     text: string,
     visibleProducts: Experience[],
+    context: AssistantContext = {},
   ): Promise<AssistantMessage> {
     try {
       const httpResponse = await fetch(
@@ -393,7 +492,7 @@ export const api = {
         {
           method: 'POST',
           headers: { ...jsonHeaders, Accept: 'text/event-stream' },
-          body: JSON.stringify({ message: text }),
+          body: JSON.stringify({ message: text, context }),
         },
       )
       if (!httpResponse.ok) {
@@ -443,6 +542,7 @@ export const api = {
             normalizeAssistantAction,
           )
         : []
+      const statePatch = (response.state_patch ?? {}) as Record<string, unknown>
       return {
         id: crypto.randomUUID(),
         role: 'assistant',
@@ -452,6 +552,7 @@ export const api = {
           'I found a few experiences that fit.',
         products,
         actions,
+        filters: statePatch.filters as SearchFilters | undefined,
         timestamp: new Date(),
       }
     } catch (error) {
@@ -614,6 +715,7 @@ export const api = {
   async confirmCheckout(
     items: CartItem[],
     customer: { name: string; email: string },
+    placement?: string,
   ): Promise<Voucher> {
     try {
       await request<Record<string, unknown>>(
@@ -630,6 +732,7 @@ export const api = {
         body: JSON.stringify({
           confirmation: 'CONFIRM',
           customer_details: customer,
+          placement,
         }),
       })
       const backendVoucher = booking.voucher as Record<string, unknown>

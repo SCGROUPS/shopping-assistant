@@ -22,3 +22,8 @@ PLAYWRIGHT_BASE_URL=http://localhost:5173 corepack pnpm test:e2e
 
 See the repository-level `README.md` and `docs/DEPLOYMENT.md` for complete
 local and Azure instructions.
+
+For the assistant presence and engagement model — ambient launcher,
+friction-triggered nudges, contextual cold opens, per-card entry points, and
+the storefront/assistant shared-state contract — see
+[../docs/SYSTEM_DESIGN.md](../docs/SYSTEM_DESIGN.md) sections 8 and 9.

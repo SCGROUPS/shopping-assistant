@@ -1,12 +1,13 @@
-import hashlib
 import logging
 import re
 from collections import Counter
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
 from app.api.schemas import (
+    Participant,
     SearchFilters,
     SearchIntent,
     SearchRequest,
@@ -16,16 +17,31 @@ from app.assistant.provider import AIProvider, build_ai_provider, deterministic_
 from app.catalog.service import product_card, starting_price
 from app.common.config import get_settings
 from app.common.database import session_factory
-from app.common.persistence import catalog_products
+from app.common.embedding_cache import embedding_cache
+from app.common.features import (
+    availability_fit,
+    conversion_lift,
+    margin_fit,
+    median_party_total,
+    party_total,
+    preference_fit,
+    price_fit,
+    quality,
+)
+from app.common.llm_cost import BudgetExceeded
+from app.common.persistence import catalog_products, demand_stats
 from app.common.ranking import (
-    bayesian_rating,
     cosine_similarity,
+    deterministic_embedding,
     minmax,
     reciprocal_rank_fusion,
+    smoothed_rate,
     tokenize,
 )
 from app.common.store import DemoStore, store
 from app.search.postgres import hybrid_search
+
+DATE_WIDEN_DAYS = 3
 
 SYNONYMS = {
     "kids": "family",
@@ -199,15 +215,16 @@ def _expanded_tokens(query: str) -> list[str]:
     return tokens + [synonym for token in tokens for synonym in tokenize(SYNONYMS.get(token, ""))]
 
 
-def _party_total(product: dict[str, Any], request: SearchRequest) -> float:
-    option = product["options"][0]
-    prices = {price["participant_type"]: price["amount"] for price in option["prices"]}
-    if not request.party:
-        return float(prices.get("adult", 0))
-    return float(sum(prices.get(person.type, 0) * person.count for person in request.party))
+def is_eligible(
+    product: dict[str, Any],
+    filters: SearchFilters,
+    party: Sequence[Participant] = (),
+) -> bool:
+    """Hard-constraint gate shared by search and recommendations.
 
-
-def _eligible(product: dict[str, Any], request: SearchRequest, filters: SearchFilters) -> bool:
+    Hard constraints are gates, never ranking boosts: an item the shopper cannot
+    book must be absent rather than ranked lower.
+    """
     if product["status"] != "PUBLISHED":
         return False
     if filters.destination_id and product["destination_id"] != filters.destination_id:
@@ -255,7 +272,7 @@ def _eligible(product: dict[str, Any], request: SearchRequest, filters: SearchFi
         return False
     if (
         filters.max_total_price is not None
-        and _party_total(product, request) > filters.max_total_price
+        and party_total(product, party) > filters.max_total_price
     ):
         return False
     if filters.currency:
@@ -267,7 +284,7 @@ def _eligible(product: dict[str, Any], request: SearchRequest, filters: SearchFi
         if any(exclusion.casefold() in searchable for exclusion in filters.exclusions):
             return False
     if filters.visit_start:
-        party_size = sum(person.count for person in request.party) or 1
+        party_size = sum(person.count for person in party) or 1
         visit_end = filters.visit_end or filters.visit_start
         if not any(
             filters.visit_start.date()
@@ -308,11 +325,126 @@ def _explanations(
     return reasons[:3]
 
 
+def _drop(field: str):
+    def mutate(filters: SearchFilters) -> None:
+        setattr(filters, field, None)
+
+    return mutate
+
+
+def _widen_dates(filters: SearchFilters) -> None:
+    if not filters.visit_start:
+        return
+    end = filters.visit_end or filters.visit_start
+    filters.visit_start = filters.visit_start - timedelta(days=DATE_WIDEN_DAYS)
+    filters.visit_end = end + timedelta(days=DATE_WIDEN_DAYS)
+
+
+# Ordered least-costly first. Accessibility requirements and explicit exclusions are
+# never relaxed: showing a wheelchair user an inaccessible tour is worse than showing
+# nothing at all.
+RELAXATION_STEPS: tuple[tuple[str, str, Any], ...] = (
+    ("max_duration_minutes", "maximum duration", _drop("max_duration_minutes")),
+    ("rating", "minimum rating", _drop("rating")),
+    ("instant_confirmation", "instant confirmation", _drop("instant_confirmation")),
+    ("free_cancellation", "free cancellation", _drop("free_cancellation")),
+    ("category", "category", _drop("category")),
+    ("indoor_outdoor", "indoor or outdoor preference", _drop("indoor_outdoor")),
+    ("language", "language", _drop("language")),
+    ("family_friendly", "family-friendly filter", _drop("family_friendly")),
+    ("visit_start", f"exact date (searched ±{DATE_WIDEN_DAYS} days)", _widen_dates),
+    ("max_total_price", "budget", _drop("max_total_price")),
+    ("destination", "destination", _drop("destination")),
+)
+
+
+def relax_until_results(
+    products: list[dict[str, Any]],
+    filters: SearchFilters,
+    party: Sequence[Participant],
+) -> tuple[list[dict[str, Any]], SearchFilters, list[str]]:
+    """Find results by progressively relaxing the least valuable constraints.
+
+    A zero-result page is the most common exit point in tourism shopping, so the
+    engine trades an exact match for a bookable one and reports what it changed.
+    """
+    eligible = [product for product in products if is_eligible(product, filters, party)]
+    if eligible:
+        return eligible, filters, []
+
+    working = filters.model_copy(deep=True)
+    relaxed: list[str] = []
+    for field, label, mutate in RELAXATION_STEPS:
+        if getattr(working, field) in (None, [], ""):
+            continue
+        mutate(working)
+        relaxed.append(label)
+        eligible = [
+            product for product in products if is_eligible(product, working, party)
+        ]
+        if eligible:
+            return eligible, working, relaxed
+    return [], working, relaxed
+
+
+FACET_FIELDS: tuple[tuple[str, str], ...] = (
+    ("destination", "destination"),
+    ("category", "category"),
+    ("indoor_outdoor", "indoor_outdoor"),
+)
+
+
+def _facets(
+    products: list[dict[str, Any]],
+    filters: SearchFilters,
+    party: Sequence[Participant],
+) -> dict[str, dict[str, int]]:
+    """Count each facet with its own filter removed.
+
+    Counting against the fully filtered set would collapse every facet to the
+    single selected value, which makes the counts useless for drilling sideways.
+    """
+    facets: dict[str, dict[str, int]] = {}
+    for facet_name, field in FACET_FIELDS:
+        scoped = filters.model_copy(deep=True)
+        setattr(scoped, field, None)
+        facets[facet_name] = dict(
+            Counter(
+                product[field]
+                for product in products
+                if is_eligible(product, scoped, party)
+            )
+        )
+    return facets
+
+
 class SearchService:
     def __init__(self, data: DemoStore = store, ai_provider: AIProvider | None = None) -> None:
         self.data = data
         self.ai = ai_provider or build_ai_provider()
         self.settings = get_settings()
+
+    async def _query_embedding(self, normalized: str) -> list[float]:
+        """Embed the query, hitting the shared cache first.
+
+        Tourist search traffic is head-heavy, so the same handful of queries
+        arrive constantly. Caching them across replicas and restarts
+        (POC_SPEC.md §11.4) is the single largest cost lever in the system.
+        """
+        model = self.settings.azure_openai_embedding_deployment
+        cached = await embedding_cache.get(normalized, model)
+        if cached is not None:
+            return cached
+        try:
+            vector = await self.ai.embed(normalized)
+        except BudgetExceeded as exhausted:
+            logger.warning("%s", exhausted)
+            return deterministic_embedding(normalized)
+        except Exception:
+            logger.exception("Query embedding failed; using deterministic embedding")
+            return deterministic_embedding(normalized)
+        await embedding_cache.put(normalized, model, vector)
+        return vector
 
     async def search(self, request: SearchRequest) -> SearchResponse:
         available_products = await catalog_products(self.data)
@@ -363,11 +495,9 @@ class SearchService:
                 items=[],
                 facets={},
             )
-        eligible = [
-            product
-            for product in available_products
-            if _eligible(product, request, filters)
-        ]
+        eligible, filters, relaxed_preferences = relax_until_results(
+            available_products, filters, request.party
+        )
 
         tokens = _expanded_tokens(intent.search_text or request.query)
         lexical_scored: list[tuple[str, float]] = []
@@ -383,16 +513,7 @@ class SearchService:
                 lexical_scored.append((str(product["id"]), float(score)))
         lexical_scored.sort(key=lambda item: item[1], reverse=True)
         normalized = " ".join(tokenize(intent.search_text or request.query))
-        cache_key = hashlib.sha256(normalized.encode()).hexdigest()
-        if cache_key not in self.data.query_embeddings:
-            try:
-                self.data.query_embeddings[cache_key] = await self.ai.embed(normalized)
-            except Exception:
-                logger.exception("Query embedding failed; using deterministic embedding")
-                from app.common.ranking import deterministic_embedding
-
-                self.data.query_embeddings[cache_key] = deterministic_embedding(normalized)
-        query_embedding = self.data.query_embeddings[cache_key]
+        query_embedding = await self._query_embedding(normalized)
         semantic_scored = sorted(
             (
                 (str(product["id"]), cosine_similarity(query_embedding, product["embedding"]))
@@ -470,18 +591,33 @@ class SearchService:
         products = {str(product["id"]): product for product in eligible}
         ordered = [item_id for item_id in ordered if item_id in products]
         rrf_values = minmax([fused[item_id] for item_id in ordered])
+        reference_total = median_party_total(eligible, request.party)
+        demand = await demand_stats(self.data)
+        settings = self.settings
         final: list[tuple[dict[str, Any], float]] = []
         for item_id, normalized_rrf in zip(ordered, rrf_values, strict=True):
             product = products[item_id]
-            preference = 1.0 if filters.family_friendly and product["family_friendly"] else 0.7
-            rating = bayesian_rating(product["rating"], product["review_count"]) / 5
+            stats = demand.get(product["id"], {})
+            conversion = conversion_lift(
+                smoothed_rate(
+                    stats.get("bookings", 0.0),
+                    stats.get("impressions", 0.0) + stats.get("views", 0.0),
+                    settings.conversion_prior_rate,
+                    settings.conversion_prior_strength,
+                ),
+                settings.conversion_prior_rate,
+            )
             score = (
-                0.55 * normalized_rrf
-                + 0.15 * preference
-                + 0.10
-                + 0.08 * rating
-                + 0.07 * product["popularity_score"]
-                + 0.05
+                settings.search_weight_relevance * normalized_rrf
+                + settings.search_weight_preference_fit
+                * preference_fit(product, filters, request.party)
+                + settings.search_weight_availability_fit
+                * availability_fit(product, filters, request.party)
+                + settings.search_weight_price_fit
+                * price_fit(product, filters, request.party, reference_total)
+                + settings.search_weight_quality * quality(product)
+                + settings.search_weight_conversion * conversion
+                + settings.search_weight_margin * margin_fit(product)
             )
             final.append((product, score))
         sorters = {
@@ -493,18 +629,22 @@ class SearchService:
         }
         final.sort(key=sorters[request.sort], reverse=True)
         page = final[: request.page_size]
-        facets = {
-            "destination": dict(Counter(product["destination"] for product in eligible)),
-            "category": dict(Counter(product["category"] for product in eligible)),
-            "indoor_outdoor": dict(Counter(product["indoor_outdoor"] for product in eligible)),
-        }
+        facets = _facets(available_products, filters, request.party)
         return SearchResponse(
             query_id=uuid4(),
             intent=intent,
             effective_filters=filters,
             items=[
-                product_card(product, _explanations(product, filters, request))
+                product_card(
+                    product,
+                    _explanations(product, filters, request),
+                    filters=filters,
+                    party=request.party,
+                    demand=demand.get(product["id"]),
+                    display_currency=request.display_currency,
+                )
                 for product, _ in page
             ],
             facets=facets,
+            relaxed_preferences=relaxed_preferences,
         )

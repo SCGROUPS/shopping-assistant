@@ -25,7 +25,9 @@ from app.api.schemas import (
     ExperienceDetail,
     ExperienceListResponse,
     MessageRequest,
+    Participant,
     RecommendationResponse,
+    SearchFilters,
     SearchRequest,
     SearchResponse,
     VoucherView,
@@ -34,8 +36,11 @@ from app.assistant.service import AssistantService
 from app.bookings.service import BookingService
 from app.cart.service import CartService
 from app.catalog.service import get_product_async, product_card, product_detail
+from app.common.analytics import assistant_holdout, funnel_report
+from app.common.config import get_settings
 from app.common.database import database_ready
 from app.common.errors import ApiError
+from app.common.llm_cost import ledger
 from app.common.models import BehaviorEvent
 from app.common.persistence import (
     catalog_products,
@@ -76,6 +81,7 @@ async def list_experiences(
     category: str | None = None,
     limit: int = Query(default=20, ge=1, le=50),
     offset: int = Query(default=0, ge=0),
+    display_currency: str | None = None,
 ) -> ExperienceListResponse:
     products = [
         product
@@ -86,7 +92,10 @@ async def list_experiences(
     ]
     products.sort(key=lambda item: item["popularity_score"], reverse=True)
     return ExperienceListResponse(
-        items=[product_card(product) for product in products[offset : offset + limit]],
+        items=[
+            product_card(product, display_currency=display_currency)
+            for product in products[offset : offset + limit]
+        ],
         total=len(products),
     )
 
@@ -128,13 +137,29 @@ async def recommendations(
     experience_id: UUID | None = None,
     destination: str | None = None,
     limit: int = Query(default=6, ge=1, le=20),
+    visit_start: datetime | None = None,
+    visit_end: datetime | None = None,
+    travellers: int = Query(default=0, ge=0, le=20),
+    max_total_price: float | None = Query(default=None, ge=0),
+    currency: str | None = None,
+    display_currency: str | None = None,
 ) -> RecommendationResponse:
+    filters = SearchFilters(
+        visit_start=visit_start,
+        visit_end=visit_end,
+        max_total_price=max_total_price,
+        currency=currency,
+    )
+    party = [Participant(type="adult", count=travellers)] if travellers else []
     return await recommendation_service.recommend(
         session_id=session_id,
         placement=placement,
         experience_id=experience_id,
         destination=destination,
         limit=limit,
+        filters=filters,
+        party=party,
+        display_currency=display_currency,
     )
 
 
@@ -269,12 +294,26 @@ async def confirm_checkout(
     idempotency_key: IdempotencyHeader,
     session_id: SessionHeader = "demo-session",
 ) -> BookingView:
+    # Read the cart before confirming: confirmation clears it, and a booking
+    # event with no experience attached is invisible to demand stats, so the
+    # highest-weight signal in the product would never reach ranking.
+    cart = await cart_service.get_cart(session_id)
+    booked = [item.experience_id for item in cart.items]
     booking = await booking_service.confirm(
         session_id,
         idempotency_key=idempotency_key,
         customer_details=request.customer_details,
     )
-    await _capture(session_id, EventRequest(event_type="booking_completed"))
+    for experience_id in booked or [None]:
+        await _capture(
+            session_id,
+            EventRequest(
+                event_type="booking_completed",
+                experience_id=experience_id,
+                placement=request.placement,
+                properties={"booking_reference": booking.booking_reference},
+            ),
+        )
     return booking
 
 
@@ -318,6 +357,38 @@ async def import_catalog(
     }
 
 
+@router.get("/session/context")
+async def session_context(session_id: SessionHeader = "demo-session") -> dict[str, Any]:
+    """Bootstrap the storefront: which cohort is this shopper in?
+
+    The frontend must know before first paint whether to render the assistant
+    at all, otherwise a holdout session briefly sees the very thing it is meant
+    to be a control for.
+    """
+    return {
+        "session_id": session_id,
+        "assistant_enabled": not assistant_holdout(session_id),
+        "assistant_holdout": assistant_holdout(session_id),
+    }
+
+
+@router.get("/analytics/funnel")
+async def analytics_funnel() -> dict[str, Any]:
+    """Funnel counts per surface, assistant lift, nudge quality, search health."""
+    settings = get_settings()
+    spend = ledger.snapshot()
+    report = await funnel_report()
+    report["cost"] = {
+        "day": spend.day.isoformat(),
+        "spent_usd": round(spend.total, 4),
+        "budget_usd": settings.openai_daily_budget,
+        "calls": spend.calls,
+        "by_purpose": {key: round(value, 4) for key, value in spend.by_purpose.items()},
+        "breaker_tripped": ledger.exhausted(settings.openai_daily_budget),
+    }
+    return report
+
+
 @router.get("/health")
 async def api_health() -> dict[str, Any]:
     products = await catalog_products()
@@ -333,14 +404,20 @@ async def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
     allowed = {
         "search_submitted",
         "search_results_viewed",
+        "search_zero_results",
+        "search_relaxed",
         "filter_applied",
         "experience_impression",
         "experience_viewed",
         "recommendation_impression",
         "recommendation_clicked",
+        "assistant_opened",
         "assistant_message_sent",
         "assistant_product_shown",
         "assistant_action_clicked",
+        "assistant_nudge_shown",
+        "assistant_nudge_accepted",
+        "assistant_nudge_dismissed",
         "availability_checked",
         "cart_item_added",
         "cart_item_removed",
@@ -368,7 +445,7 @@ async def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
         store.events.append(event)
         if request.experience_id:
             store.event_experiences[session_id].append(
-                (request.event_type, request.experience_id)
+                (request.event_type, request.experience_id, event["occurred_at"])
             )
         return {"accepted": True, "event_id": event["id"]}
 

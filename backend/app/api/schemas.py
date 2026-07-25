@@ -39,6 +39,8 @@ class SearchRequest(BaseModel):
     sort: Literal["recommended", "price", "rating", "duration", "popularity"] = "recommended"
     page_size: int = Field(default=20, ge=1, le=50)
     cursor: str | None = None
+    # Presentation only. Never used for any amount that is charged.
+    display_currency: str | None = None
 
 
 class IntentValue(BaseModel):
@@ -99,6 +101,13 @@ class ExperienceCard(BaseModel):
     currency: str
     tags: list[str]
     badges: list[str]
+    # Display-only conversion; `price`/`currency` stay authoritative for money.
+    display_price: float | None = None
+    display_currency: str | None = None
+    # Both are None unless the underlying fact is real and above a threshold
+    # where it still means something (common/urgency.py).
+    scarcity: str | None = None
+    social_proof: str | None = None
     reason: str | None = None
     reason_code: str | None = None
     options: list[OptionView] = Field(default_factory=list)
@@ -130,6 +139,7 @@ class SearchResponse(BaseModel):
     items: list[ExperienceCard]
     recommendations: list[ExperienceCard] | None = None
     facets: dict[str, dict[str, int]]
+    relaxed_preferences: list[str] = Field(default_factory=list)
 
 
 class ExperienceListResponse(BaseModel):
@@ -189,6 +199,9 @@ class CheckoutPrepareResponse(BaseModel):
 class CheckoutConfirmRequest(BaseModel):
     confirmation: Literal["CONFIRM"]
     customer_details: dict[str, str] = Field(default_factory=dict)
+    # The surface that sourced the cart, so "the assistant converts better"
+    # stays attributable at the point of sale rather than being re-derived.
+    placement: str | None = None
 
 
 class VoucherView(BaseModel):
@@ -218,8 +231,22 @@ class ConversationCreate(BaseModel):
     party: list[Participant] = Field(default_factory=list)
 
 
+class AssistantContext(BaseModel):
+    """Storefront state handed to the assistant so a shopper never repeats work."""
+
+    query: str | None = None
+    filters: SearchFilters | None = None
+    party: list[Participant] = Field(default_factory=list)
+    result_ids: list[UUID] = Field(default_factory=list)
+    result_count: int | None = None
+    recently_viewed: list[UUID] = Field(default_factory=list)
+    focused_experience_id: UUID | None = None
+    cart_experience_ids: list[UUID] = Field(default_factory=list)
+
+
 class MessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    context: AssistantContext | None = None
 
 
 class AssistantAction(BaseModel):

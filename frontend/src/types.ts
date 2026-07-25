@@ -28,6 +28,12 @@ export type Experience = {
   review_count: number
   price: number
   currency: string
+  /** Presentation only; `price`/`currency` remain authoritative for money. */
+  display_price?: number
+  display_currency?: string
+  /** Present only when the underlying fact is real (see backend urgency.py). */
+  scarcity?: string
+  social_proof?: string
   duration_minutes: number
   tags: string[]
   badges: string[]
@@ -59,6 +65,17 @@ export type SearchFilters = {
   exclusions?: string[]
 }
 
+export type AssistantContext = {
+  query?: string
+  filters?: SearchFilters
+  party?: Array<{ type: string; count: number }>
+  result_ids?: string[]
+  result_count?: number
+  recently_viewed?: string[]
+  focused_experience_id?: string
+  cart_experience_ids?: string[]
+}
+
 export type AssistantAction = {
   type:
     | 'VIEW'
@@ -82,6 +99,7 @@ export type AssistantMessage = {
   text: string
   products?: Experience[]
   actions?: AssistantAction[]
+  filters?: SearchFilters
   timestamp: Date
 }
 
@@ -90,6 +108,8 @@ export type CartItem = {
   experience: Experience
   option_id?: string
   option_name?: string
+  slot_id?: string
+  starts_at?: string
   date: string
   time?: string
   adults: number
