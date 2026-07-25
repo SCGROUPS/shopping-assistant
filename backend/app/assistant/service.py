@@ -18,12 +18,13 @@ from app.api.schemas import (
     SearchFilters,
     SearchRequest,
 )
-from app.assistant.provider import AIProvider, build_ai_provider
+from app.assistant.provider import AIProvider, ToolPlan, build_ai_provider
 from app.bookings.service import BookingService
 from app.cart.service import CartService
 from app.catalog.service import get_product_async, product_card, product_detail
 from app.common.config import get_settings
 from app.common.errors import ApiError
+from app.common.llm_cost import BudgetExceeded
 from app.common.models import (
     Conversation,
     ConversationMessage,
@@ -43,11 +44,21 @@ logger = logging.getLogger(__name__)
 CONFIRM_PHRASES = {"confirm", "confirm booking", "yes, confirm", "confirm checkout"}
 
 ORDINALS = {
-    "first": 0, "1st": 0, "one": 0,
-    "second": 1, "2nd": 1, "two": 1,
-    "third": 2, "3rd": 2, "three": 2,
-    "fourth": 3, "4th": 3, "four": 3,
-    "fifth": 4, "5th": 4, "five": 4,
+    "first": 0,
+    "1st": 0,
+    "one": 0,
+    "second": 1,
+    "2nd": 1,
+    "two": 1,
+    "third": 2,
+    "3rd": 2,
+    "three": 2,
+    "fourth": 3,
+    "4th": 3,
+    "four": 3,
+    "fifth": 4,
+    "5th": 4,
+    "five": 4,
     "last": -1,
 }
 
@@ -69,6 +80,26 @@ def keyword_tool(lowered: str) -> str | None:
     return None
 
 
+def _offering(item: Any) -> dict[str, Any]:
+    """One catalogue result, described so the agent can judge it and refer back
+    to it by id."""
+    return {
+        "experience_id": str(item.id),
+        "title": item.title,
+        "destination": item.destination,
+        "category": item.category,
+        "short_description": item.short_description,
+        "price": item.price,
+        "currency": item.currency,
+        "rating": item.rating,
+        "duration_minutes": getattr(item, "duration_minutes", None),
+        "indoor_outdoor": getattr(item, "indoor_outdoor", None),
+        "family_friendly": getattr(item, "family_friendly", None),
+        "availability": getattr(item, "availability", None),
+        "why_ranked": item.reason,
+    }
+
+
 def _join(labels: list[str]) -> str:
     if len(labels) == 1:
         return labels[0]
@@ -84,9 +115,7 @@ def _resolve_referent(products: list[dict[str, Any]], message: str) -> dict[str,
     if not message:
         return products[0]
     lowered = message.casefold()
-    titled = [
-        product for product in products if product["title"].casefold() in lowered
-    ]
+    titled = [product for product in products if product["title"].casefold() in lowered]
     if titled:
         return titled[0]
     for word, index in ORDINALS.items():
@@ -108,9 +137,7 @@ class AssistantService:
         self.recommendations = RecommendationService(data)
         self.settings = get_settings()
 
-    async def create(
-        self, session_id: str, request: ConversationCreate
-    ) -> dict[str, Any]:
+    async def create(self, session_id: str, request: ConversationCreate) -> dict[str, Any]:
         conversation_id = uuid4()
         state = {
             "filters": request.filters.model_dump(mode="json"),
@@ -148,9 +175,7 @@ class AssistantService:
             )
         return conversation_data
 
-    async def get(
-        self, conversation_id: UUID, session_id: str
-    ) -> dict[str, Any]:
+    async def get(self, conversation_id: UUID, session_id: str) -> dict[str, Any]:
         if not database_mode():
             conversation = self.data.conversations.get(conversation_id)
             if conversation and conversation["session_id"] == session_id:
@@ -213,9 +238,7 @@ class AssistantService:
         response: AssistantResponse,
     ) -> None:
         if not database_mode():
-            conversation["messages"].append(
-                {"role": "user", "content": user_message}
-            )
+            conversation["messages"].append({"role": "user", "content": user_message})
             conversation["messages"].append(
                 {
                     "role": "assistant",
@@ -281,16 +304,30 @@ class AssistantService:
             )
         lowered = request.message.casefold().strip()
         self._merge_context(conversation, request.context)
-        planned_tool = None
+        # Let the agent work the request with the tools first. It only falls
+        # through to the single-tool path when reasoning is unavailable, which is
+        # what the budget breaker and demo mode rely on.
+        answer = await self._run_agent(conversation, session_id, request.message)
+        if answer is not None:
+            await self._save_turn(conversation, user_message=request.message, response=answer)
+            return answer
+
+        plan: ToolPlan | None = None
         try:
-            planned_tool = await self.ai.plan_action(request.message, conversation["state"])
+            plan = await self.ai.plan_action(request.message, conversation["state"])
         except Exception:
             logger.exception("Assistant action planning failed")
-            planned_tool = None
+            plan = None
 
-        # The planner decides; keyword matching is only a fallback for when planning
-        # is unavailable (demo mode) or returns nothing.
-        tool = planned_tool or keyword_tool(lowered)
+        # The agent decides and fills its own arguments; keyword matching is only a
+        # fallback for when planning is unavailable (demo mode) or returns nothing.
+        if plan is None:
+            fallback = keyword_tool(lowered)
+            plan = ToolPlan(tool=fallback) if fallback else None
+        tool = plan.tool if plan else None
+        # The agent resolves references itself; fall back to the raw message so the
+        # deterministic path can still pick out an ordinal or a title.
+        referent = (plan.text("reference") if plan else None) or request.message
         if tool == "confirm_simulated_checkout" and not self._confirmation_allowed(
             conversation, lowered
         ):
@@ -308,17 +345,17 @@ class AssistantService:
         elif tool == "prepare_checkout":
             response = await self._prepare_checkout(conversation, session_id)
         elif tool == "add_to_cart":
-            response = await self._add_selected_result(
-                conversation, session_id, request.message
-            )
+            response = await self._add_selected_result(conversation, session_id, referent)
         elif tool == "check_availability":
-            response = await self._availability(conversation, request.message)
+            response = await self._availability(conversation, referent)
         elif tool == "compare_experiences":
             response = await self._compare(conversation)
         elif tool == "get_recommendations":
-            response = await self._recommend(conversation, session_id)
+            response = await self._recommend(conversation, session_id, referent)
         else:
-            response = await self._search(conversation, request.message)
+            response = await self._search(
+                conversation, (plan.text("query") if plan else None) or request.message
+            )
 
         await self._save_turn(
             conversation,
@@ -337,9 +374,7 @@ class AssistantService:
         return lowered in CONFIRM_PHRASES
 
     @staticmethod
-    def _merge_context(
-        conversation: dict[str, Any], context: AssistantContext | None
-    ) -> None:
+    def _merge_context(conversation: dict[str, Any], context: AssistantContext | None) -> None:
         """Fold live storefront state into the conversation.
 
         The storefront and the assistant are two renderings of one session, so
@@ -369,9 +404,7 @@ class AssistantService:
         if context.recently_viewed:
             state["recently_viewed"] = [str(item) for item in context.recently_viewed]
         if context.cart_experience_ids:
-            state["cart_experience_ids"] = [
-                str(item) for item in context.cart_experience_ids
-            ]
+            state["cart_experience_ids"] = [str(item) for item in context.cart_experience_ids]
         if context.focused_experience_id:
             focused = str(context.focused_experience_id)
             state["focused_experience_id"] = focused
@@ -380,6 +413,170 @@ class AssistantService:
                 focused,
                 *[item for item in state.get("last_result_ids", []) if item != focused],
             ]
+
+    async def _run_agent(
+        self, conversation: dict[str, Any], session_id: str, message: str
+    ) -> AssistantResponse | None:
+        """Give the agent the tools and render the answer it curates."""
+        runner = getattr(self.ai, "run_agent", None)
+        if runner is None:
+            return None
+
+        async def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            try:
+                return await self._execute_tool(conversation, session_id, name, arguments)
+            except ApiError as error:
+                # The agent can recover from a refusal; it should see why.
+                return {"error": error.args[1], "detail": error.args[2]}
+
+        try:
+            answer = await runner(message, conversation["state"], execute)
+        except BudgetExceeded:
+            logger.info("Agent reasoning skipped: daily budget reached")
+            return None
+        except Exception:
+            logger.exception("Agent reasoning failed")
+            return None
+        if answer is None:
+            return None
+
+        products: list[AssistantProduct] = []
+        for selection in answer.selections:
+            try:
+                product = await get_product_async(UUID(selection.experience_id), self.data)
+            except (ApiError, ValueError):
+                logger.warning("Agent selected an unknown offering %s", selection.experience_id)
+                continue
+            products.append(
+                self._commerce_product(product, selection.reason or "Matches your request.")
+            )
+        if products:
+            conversation["state"]["last_result_ids"] = [
+                str(product.experience_id) for product in products
+            ]
+        return AssistantResponse(
+            message=answer.message,
+            products=products,
+            clarification=answer.clarification,
+            citations=[
+                {
+                    "experience_id": str(product.experience_id),
+                    "fields": ["title", "price", "availability"],
+                }
+                for product in products
+            ],
+        )
+
+    async def _execute_tool(
+        self,
+        conversation: dict[str, Any],
+        session_id: str,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run one tool and return facts the agent can reason over.
+
+        Every offering carries its experience_id so the agent can refer back to
+        it in final_answer and the application can render it.
+        """
+        state = conversation["state"]
+        filters = SearchFilters.model_validate(state.get("filters", {}))
+        party = [Participant.model_validate(item) for item in state.get("party", [])]
+
+        if name == "search_experiences":
+            exclude = [
+                str(term).strip()
+                for term in arguments.get("exclude", []) or []
+                if str(term).strip()
+            ]
+            if exclude:
+                filters.exclusions = list(dict.fromkeys([*filters.exclusions, *exclude]))
+            destination = arguments.get("destination")
+            if isinstance(destination, str) and destination.strip():
+                filters.destination = destination.strip()
+            budget = arguments.get("max_total_price")
+            if isinstance(budget, int | float):
+                filters.max_total_price = float(budget)
+            limit = arguments.get("limit")
+            result = await self.search.search(
+                SearchRequest(
+                    query=str(arguments.get("query") or ""),
+                    filters=filters,
+                    party=party,
+                    page_size=int(limit) if isinstance(limit, int) and limit > 0 else 8,
+                )
+            )
+            return {
+                "relaxed_preferences": result.relaxed_preferences,
+                "items": [_offering(item) for item in result.items],
+            }
+
+        if name == "get_recommendations":
+            current = await self._selected_product(
+                conversation, str(arguments.get("experience_id") or "")
+            )
+            result = await self.recommendations.recommend(
+                session_id=session_id,
+                placement="complete_your_day",
+                experience_id=current["id"],
+                limit=4,
+                filters=filters,
+                party=party,
+            )
+            return {
+                "anchor_experience_id": str(current["id"]),
+                "items": [_offering(item) for item in result.items],
+            }
+
+        if name == "check_availability":
+            product = await self._selected_product(
+                conversation, str(arguments.get("experience_id") or "")
+            )
+            detail = product_detail(product)
+            return {
+                "experience_id": str(product["id"]),
+                "title": product["title"],
+                "options": [
+                    {
+                        "name": option.name,
+                        "validity_type": option.validity_type,
+                        "slots": [
+                            {
+                                "starts_at": slot.starts_at,
+                                "capacity_remaining": slot.capacity_remaining,
+                                "status": slot.status,
+                            }
+                            for slot in option.slots[:5]
+                        ],
+                    }
+                    for option in detail.options
+                ],
+            }
+
+        if name == "add_to_cart":
+            response = await self._add_selected_result(
+                conversation, session_id, str(arguments.get("experience_id") or "")
+            )
+            return {
+                "outcome": response.message,
+                "items": [
+                    {"experience_id": str(product.experience_id), "title": product.title}
+                    for product in response.products
+                ],
+            }
+
+        if name == "prepare_checkout":
+            response = await self._prepare_checkout(conversation, session_id)
+            return {"outcome": response.message}
+
+        if name == "confirm_simulated_checkout":
+            # A booking is never taken on the agent's say-so alone.
+            return {
+                "error": "confirmation-required",
+                "detail": "Ask the shopper to confirm explicitly before booking.",
+            }
+
+        return {"error": "unknown-tool", "detail": name}
 
     async def _search(self, conversation: dict[str, Any], message: str) -> AssistantResponse:
         filters = SearchFilters.model_validate(conversation["state"].get("filters", {}))
@@ -475,9 +672,7 @@ class AssistantService:
         if not slots:
             return AssistantResponse(message=f"No upcoming slots are available for {detail.title}.")
         slot_text = ", ".join(slot.starts_at.strftime("%d %b %H:%M UTC") for slot in slots)
-        product_view = self._commerce_product(
-            product, "Live demo inventory was checked."
-        )
+        product_view = self._commerce_product(product, "Live demo inventory was checked.")
         product_view = product_view.model_copy(
             update={
                 "actions": [
@@ -503,13 +698,9 @@ class AssistantService:
             ],
         )
 
-    async def _compare(
-        self, conversation: dict[str, Any]
-    ) -> AssistantResponse:
+    async def _compare(self, conversation: dict[str, Any]) -> AssistantResponse:
         ids = conversation["state"].get("last_result_ids", [])[:3]
-        products = [
-            await get_product_async(UUID(item), self.data) for item in ids
-        ]
+        products = [await get_product_async(UUID(item), self.data) for item in ids]
         if len(products) < 2:
             return AssistantResponse(
                 message="Please search for at least two experiences before asking me to compare."
@@ -549,8 +740,11 @@ class AssistantService:
         )
 
     async def _recommend(
-        self, conversation: dict[str, Any], session_id: str
+        self, conversation: dict[str, Any], session_id: str, message: str = ""
     ) -> AssistantResponse:
+        # Cross-sell cannot represent a subject of its own, so a planner that
+        # picks it for a request carrying one would answer a question nobody
+        # asked. Search is the tool that can actually read the message.
         current = await self._selected_product(conversation)
         result = await self.recommendations.recommend(
             session_id=session_id,
@@ -559,8 +753,7 @@ class AssistantService:
             limit=4,
             filters=SearchFilters.model_validate(conversation["state"].get("filters", {})),
             party=[
-                Participant.model_validate(item)
-                for item in conversation["state"].get("party", [])
+                Participant.model_validate(item) for item in conversation["state"].get("party", [])
             ],
         )
         if not result.items:
@@ -597,8 +790,7 @@ class AssistantService:
         product = await self._selected_product(conversation, message)
         option = product["options"][0]
         participants = [
-            Participant.model_validate(item)
-            for item in conversation["state"].get("party", [])
+            Participant.model_validate(item) for item in conversation["state"].get("party", [])
         ] or [Participant(type="adult", count=1)]
         slot = next(
             (
@@ -622,8 +814,7 @@ class AssistantService:
         )
         conversation["state"]["pending_action"] = None
         party_label = ", ".join(
-            f"{participant.count} {participant.type}"
-            f"{'s' if participant.count != 1 else ''}"
+            f"{participant.count} {participant.type}{'s' if participant.count != 1 else ''}"
             for participant in participants
         )
         return AssistantResponse(

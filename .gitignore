@@ -20,3 +20,4 @@ backend/htmlcov/
 data/generated/
 infra/.azure/
 .DS_Store
+backend/app/static/

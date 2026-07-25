@@ -308,6 +308,38 @@ function App() {
     return products.filter((product) => product.category === category)
   }, [category, hasSearched, products])
 
+  // A shopper who just searched wants the answer, not the pitch: summarise the
+  // result set in one line instead of repeating the standing orientation copy,
+  // and take them to the grid so it is not left below the fold.
+  const resultSummary = useMemo(() => {
+    const count = visibleProducts.length
+    const parts = [
+      count === 0
+        ? 'No exact match'
+        : `${count} ${count === 1 ? 'experience' : 'experiences'}`,
+      destination,
+      formatDate(date),
+      `${travellers} ${travellers === 1 ? 'traveller' : 'travellers'}`,
+    ]
+    return parts.join(' · ')
+  }, [visibleProducts.length, destination, date, travellers])
+
+  const resultsRef = useRef<HTMLElement>(null)
+  const pendingScroll = useRef(false)
+
+  useEffect(() => {
+    if (searching || !pendingScroll.current) return
+    pendingScroll.current = false
+    const node = resultsRef.current
+    if (!node) return
+    node.scrollIntoView({
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        ? 'auto'
+        : 'smooth',
+      block: 'start',
+    })
+  }, [searching, visibleProducts])
+
   const destinationOptions = useMemo(() => {
     const names = new Set<string>()
     for (const product of [...products, ...recommendations]) {
@@ -471,6 +503,7 @@ function App() {
 
   const submitSearch = (event: FormEvent) => {
     event.preventDefault()
+    pendingScroll.current = true
     void runSearch()
   }
 
@@ -482,6 +515,7 @@ function App() {
 
   const chooseSuggestion = (suggestion: string) => {
     setQuery(suggestion)
+    pendingScroll.current = true
     void runSearch(suggestion)
   }
 
@@ -981,7 +1015,11 @@ function App() {
           </div>
         </section>
 
-        <section className="discovery-section" id="discover">
+        <section
+          className={`discovery-section${hasSearched ? ' searched' : ''}`}
+          id="discover"
+          ref={resultsRef}
+        >
           <div className="section-intro">
             <div>
               <span className="eyebrow">
@@ -992,10 +1030,14 @@ function App() {
                   ? 'Experiences shaped around your request'
                   : 'Choose the feeling, not just the ticket'}
               </h2>
-              <p>
-                Live availability, practical details, and honest reasons each
-                experience might fit.
-              </p>
+              {hasSearched ? (
+                <p className="result-summary">{resultSummary}</p>
+              ) : (
+                <p>
+                  Live availability, practical details, and honest reasons each
+                  experience might fit.
+                </p>
+              )}
             </div>
             {assistantEnabled && (
               <button className="assistant-cta" onClick={() => openAssistant()}>

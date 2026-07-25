@@ -1,7 +1,7 @@
 from httpx import AsyncClient
 
 from app.api.schemas import ConversationCreate, MessageRequest
-from app.assistant.provider import deterministic_intent
+from app.assistant.provider import ToolPlan, deterministic_intent
 from app.assistant.service import AssistantService
 from app.common.ranking import deterministic_embedding
 from app.common.store import store
@@ -121,7 +121,7 @@ class AzureLikeProvider:
         return deterministic_intent(text)
 
     async def plan_action(self, text: str, state: dict):
-        return "search_experiences"
+        return ToolPlan(tool="search_experiences", arguments={"query": text, "exclusions": []})
 
     async def enhance_assistant(self, prompt: str, facts: list[dict]):
         return "Azure-enhanced grounded recommendations."
@@ -153,7 +153,7 @@ async def test_planner_decision_wins_over_keyword_match(client: AsyncClient):
 
     class PlannerProvider:
         async def plan_action(self, text, state):
-            return "search_experiences"
+            return ToolPlan(tool="search_experiences", arguments={"query": text, "exclusions": []})
 
         async def enhance_assistant(self, prompt, facts):
             return None
@@ -180,7 +180,7 @@ async def test_planner_decision_wins_over_keyword_match(client: AsyncClient):
 async def test_planner_alone_cannot_confirm_a_booking(client: AsyncClient):
     class ConfirmingProvider:
         async def plan_action(self, text, state):
-            return "confirm_simulated_checkout"
+            return ToolPlan(tool="confirm_simulated_checkout")
 
         async def enhance_assistant(self, prompt, facts):
             return None
