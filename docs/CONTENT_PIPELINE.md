@@ -1463,6 +1463,31 @@ translated, every locale resolves to the same text, so eight work items carry
 one distinct document. The two together turn the backfill from thousands of
 requests into hundreds.
 
+#### A request without a deadline is a lease nobody is holding
+
+The provider client was built with no explicit timeout. A worker holds a lease
+while it waits, so an unbounded call means the lease can expire underneath a
+request that is still notionally in flight: the work is handed to another
+replica, the attempt is spent, and nothing anywhere reports a problem. The
+client now has a timeout well below `LEASE_SECONDS`, and the invariant to keep
+is `provider timeout + write time < lease duration`.
+
+Leases are also renewed once the batch request returns, because pre-warming
+spends part of the lease that the rest of the batch still has to write under.
+
+#### A provider saying no is not sixty-four documents asking to be embedded
+
+When a batched request fails, the tempting recovery is to retry the documents
+one at a time. For a rate limit, a timeout or a dropped connection that is
+exactly wrong: the failure said nothing about the documents, so it turns one
+refused request into sixty-four more against a provider already refusing, and
+spends an attempt on every item on the way to retiring all of them.
+
+Transient failures are therefore classified and the whole lease batch is handed
+back untouched, with no attempt consumed — the caller's own pacing is the
+backoff. Anything else may well be a single unembeddable document, and only the
+per-item path can identify it and fail it against the right work item.
+
 #### A deterministic vector never replaces a real one
 
 A fallback vector is worth having when the alternative is no document at all,
@@ -1767,6 +1792,10 @@ first, then revision 2's.
 | **The document the import embedded is the document to store** | It is built from the supplier's fields, but `_apply` skips every field an operator has corrected — so writing it reverted the correction in search while the listing page still showed it, with nothing enqueued to notice. The shortcut is taken only when the canonical text matches (§9.4) |
 | **Deterministic ordering makes concurrent imports safe** | It removes the deadlock, not the race: suppliers, destinations and experiences are created select-then-insert, so two runs meeting the same new entity race to insert it. Imports of a supplier take an advisory lock (§9.4) |
 | **Correctness was the only thing standing between this and production** | The first real deploy failed on throughput, not on a race: the worker embedded one document per round trip, so the backfill of 379 listings across eight locales outran the catalogue job's bound. Batching was the difference between a subsystem that is right and one that can be shipped (§9.4) |
+| **Batching is a pure optimisation** | It moved the provider call outside the handler that returns leases, so a job timeout — the exact failure that had just happened — left all 64 items `leased` with an attempt spent apiece. The optimisation that made the deploy fit reintroduced the defect the handler existed to prevent (§9.4) |
+| **A failed batch should be retried document by document** | For a rate limit or timeout that turns one refused request into 64 more and spends an attempt on each. Transient failures hand the batch back untouched; only non-transient ones fan out, because only they might be one bad document (§9.4) |
+| **The embedding client's default timeout is good enough** | It has none. A worker holds a lease while it waits, so an unbounded request can outlive the lease it is holding — work reassigned, attempt spent, nothing reported (§9.4) |
+| **`replicaRetryLimit: 1` is harmless caution** | It lets one execution outlive the deployment script's wait by a whole replica timeout while still looking like it might succeed, so the deployment fails for a job that is running perfectly well (§9.4) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,
 migration entirely, the `language`/`locale` collision, audit attribution for

@@ -306,8 +306,14 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
     environmentId: environment.id
     configuration: {
       triggerType: 'Manual'
-      replicaTimeout: 1800
-      replicaRetryLimit: 1
+      // Long enough for a cold first backfill: seed, availability, import and
+      // then a document per locale for the whole catalogue.
+      replicaTimeout: 3600
+      // Zero, so one execution means one replica. With a retry, an execution
+      // can outlive the deployment script's wait by a whole replica timeout
+      // while still looking like it might succeed - and the deployment fails
+      // for a job that is, at that moment, running perfectly well.
+      replicaRetryLimit: 0
       manualTriggerConfig: {
         parallelism: 1
         replicaCompletionCount: 1

@@ -539,9 +539,24 @@ async def process_index_work(
 
     completed = 0
     embeddings: dict[str, Any] = {}
-    await _prewarm_embeddings(session_factory, provider, leases, embeddings)
     remaining = list(leases)
     try:
+        # Inside the handler, because this is where the batch request to the
+        # provider happens and a job timeout is a cancellation. Pre-warming
+        # outside it meant the one failure mode that actually took production
+        # down - running out of time - left all 64 items `leased` with an
+        # attempt spent apiece.
+        if not await _prewarm_embeddings(session_factory, provider, leases, embeddings):
+            # The provider, not these records, is what failed. Hand the whole
+            # batch back untouched rather than turning one refused request into
+            # 64 more, and let the caller's own pacing be the backoff.
+            await _release(session_factory, remaining)
+            return 0
+        # Pre-warming spent part of the lease this batch is holding, and the
+        # rest of it is a document write per item. Renew before starting, or a
+        # slow provider means every later item in the batch is racing a deadline
+        # that was set before its embedding was even requested.
+        await _renew(session_factory, remaining)
         for index, (experience_id, locale, token) in enumerate(leases):
             # The current item stays in `remaining` for the whole iteration,
             # including while its failure is being recorded. Dropping it first
@@ -615,6 +630,36 @@ async def _fail(
         logger.exception("Could not record the failure of %s/%s", experience_id, locale)
 
 
+async def _renew(session_factory: Any, leases: Sequence[tuple[Any, str, Any]]) -> None:
+    """Push the deadline out on leases this process is still working through.
+
+    A lease is a promise about how long the work will take, and the batched
+    embedding request is spent before the first document is written - so
+    without this the last item in a batch inherits whatever is left of a
+    deadline set before its own embedding was even asked for. Fencing keeps a
+    late write harmless, but every expiry still costs an attempt, and five of
+    those retire the item.
+    """
+    if not leases:
+        return
+    with suppress(Exception):
+        async with session_factory() as session, session.begin():
+            for experience_id, locale, token in leases:
+                await session.execute(
+                    update(IndexWorkItem)
+                    .where(
+                        IndexWorkItem.experience_id == experience_id,
+                        IndexWorkItem.locale == locale,
+                        IndexWorkItem.lease_token == token,
+                        IndexWorkItem.status == "leased",
+                    )
+                    .values(
+                        leased_until=func.now() + text(f"interval '{LEASE_SECONDS} seconds'"),
+                        updated_at=datetime.now(UTC),
+                    )
+                )
+
+
 async def _release(session_factory: Any, leases: Sequence[tuple[Any, str, Any]]) -> None:
     """Return still-held leases to the queue without consuming an attempt."""
     if not leases:
@@ -643,12 +688,31 @@ async def _release(session_factory: Any, leases: Sequence[tuple[Any, str, Any]])
                 )
 
 
+def _is_transient(error: BaseException) -> bool:
+    """Whether the provider refused this request rather than this input.
+
+    A rate limit, a timeout or a dropped connection says nothing about the
+    documents in the batch, so retrying them one at a time turns one refused
+    request into sixty-four more against a provider that is already saying no -
+    and burns an attempt on every item on the way. Anything else might well be
+    one unembeddable document, which only the per-item path can identify and
+    fail against the right work item.
+    """
+    name = type(error).__name__
+    if isinstance(error, TimeoutError | ConnectionError):
+        return True
+    if any(token in name for token in ("RateLimit", "Timeout", "APIConnection", "InternalServer")):
+        return True
+    status = getattr(error, "status_code", None)
+    return isinstance(status, int) and (status == 429 or status >= 500)
+
+
 async def _prewarm_embeddings(
     session_factory: Any,
     provider: AIProvider,
     leases: list[tuple[Any, ...]],
     embeddings: dict[str, Any],
-) -> None:
+) -> bool:
     """Embed a whole batch in one request rather than one call per document.
 
     The first backfill is the case that matters: a catalogue of several hundred
@@ -657,7 +721,13 @@ async def _prewarm_embeddings(
     runs out of work. Providers embed a list as cheaply as a string, which is
     why the importer has always batched; the worker had not.
 
-    Strictly an optimisation, and written so that it cannot be anything else.
+    Returns whether the provider is worth continuing to ask. A batch that failed
+    for a transient reason - a rate limit, a timeout, a dropped connection -
+    says nothing about these documents, and the caller hands the whole lease
+    batch back rather than retrying it an item at a time.
+
+    Strictly an optimisation as far as the *content* of any document goes, and
+    written so that it cannot be anything else.
     The text is recomputed inside `_process_one` under the item's own lock and
     is only served from here when the hash of that text matches, so an entry
     that is stale, missing, or never populated at all costs an extra call and
@@ -697,15 +767,19 @@ async def _prewarm_embeddings(
                     seen.add(key)
                     texts.append(text)
         if not texts:
-            return
+            return True
         vectors = await provider.embed_many(texts)
         for text, vector in zip(texts, vectors, strict=True):
             embeddings[hashlib.sha256(text.encode()).hexdigest()] = vector
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 - a cache that did not fill is still a cache
-        logger.warning("Batch embedding failed; falling back to one call per document")
+    except Exception as error:  # noqa: BLE001 - classified, not swallowed
         embeddings.clear()
+        if _is_transient(error):
+            logger.warning("Provider refused a batch embedding request: %s", error)
+            return False
+        logger.warning("Batch embedding failed; falling back to one call per document")
+    return True
 
 
 async def _process_one(

@@ -188,8 +188,10 @@ deploy_stack "${login_server}/vietra:latest" "$build_revision"
 
 # The catalogue job imports, reconciles and then drains the index queue, and
 # `run_reindex` deliberately waits out a lease before giving up. Its bound has
-# to match the job's own 1800s timeout rather than the migration's.
-run_job "job-${prefix}-catalog" "Catalog job" 180
+# to outlast the job's own 3600s timeout rather than inherit the migration's,
+# so that a job which fails on time reports as failed rather than as a script
+# that gave up on something still running.
+run_job "job-${prefix}-catalog" "Catalog job" 380
 
 hostname="$(az containerapp show \
   --resource-group "$resource_group" \

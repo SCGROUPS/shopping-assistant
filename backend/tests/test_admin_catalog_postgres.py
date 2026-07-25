@@ -10,6 +10,7 @@ Each of those was broken before this module existed, and each would fail
 silently rather than loudly.
 """
 
+import asyncio
 import os
 from decimal import Decimal
 from uuid import uuid4
@@ -1668,3 +1669,98 @@ async def test_the_worker_embeds_a_batch_in_one_request(factory):
     # whole batch is one request carrying one distinct document.
     assert embedder.batches == 1
     assert embedder.calls == 1
+
+
+async def test_a_timeout_during_the_batch_request_hands_every_lease_back(factory):
+    """The failure that actually took production down must not cost the batch.
+
+    A job timeout arrives as a cancellation, and the batched embedding request
+    is where a worker spends most of its time - so this is the likeliest moment
+    to be cancelled. Pre-warming outside the handler that returns leases left
+    all sixty-four items `leased` with an attempt spent apiece, which is the
+    same defect the handler was written to prevent, reintroduced by the
+    optimisation that made the deploy fit.
+    """
+    from app.catalog import indexing
+    from app.common.models import IndexWorkItem
+
+    await _import()
+    experience = await _only(factory)
+
+    class _Cancelling(_StubEmbedder):
+        async def embed_many(self, texts: list[str]) -> list[list[float]]:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await indexing.process_index_work(
+            factory, _Cancelling(), limit=indexing.DRAIN_BATCH
+        )
+
+    async with factory() as db:
+        rows = list(
+            (
+                await db.scalars(
+                    select(IndexWorkItem).where(
+                        IndexWorkItem.experience_id == experience.id,
+                        IndexWorkItem.status != "done",
+                    )
+                )
+            ).all()
+        )
+    assert rows
+    assert all(row.status == "queued" for row in rows)
+    assert all(row.lease_token is None for row in rows)
+    assert all(row.attempts == 0 for row in rows)
+
+
+async def test_a_refused_batch_is_not_retried_one_document_at_a_time(factory):
+    """A provider saying no is not sixty-four documents asking to be embedded.
+
+    A rate limit or a timeout says nothing about the contents of the batch, so
+    falling back to one call per document turns a single refused request into
+    sixty-four more against a provider already refusing - and spends an attempt
+    on every item on the way to retiring them all.
+    """
+    from app.catalog import indexing
+    from app.common.models import IndexWorkItem
+
+    await _import()
+    experience = await _only(factory)
+
+    class _RateLimited(_StubEmbedder):
+        async def embed_many(self, texts: list[str]) -> list[list[float]]:
+            self.batches += 1
+            raise RuntimeError("rate limited")
+
+    throttled = _RateLimited()
+    throttled_error = type("RateLimitError", (RuntimeError,), {})
+
+    async def refuse(texts: list[str]) -> list[list[float]]:
+        throttled.batches += 1
+        raise throttled_error("429 too many requests")
+
+    throttled.embed_many = refuse  # type: ignore[method-assign]
+
+    completed = await indexing.process_index_work(
+        factory, throttled, limit=indexing.DRAIN_BATCH
+    )
+
+    assert completed == 0
+    assert throttled.batches == 1
+    # Not one call per document, and not one attempt per document either.
+    assert throttled.calls == 0
+
+    async with factory() as db:
+        rows = list(
+            (
+                await db.scalars(
+                    select(IndexWorkItem).where(
+                        IndexWorkItem.experience_id == experience.id,
+                        IndexWorkItem.status != "done",
+                    )
+                )
+            ).all()
+        )
+    assert rows
+    assert all(row.status == "queued" for row in rows)
+    assert all(row.attempts == 0 for row in rows)
