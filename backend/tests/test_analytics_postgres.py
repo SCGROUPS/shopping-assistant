@@ -34,6 +34,11 @@ async def db_factory(monkeypatch):
     engine = create_async_engine(DATABASE_URL or "", pool_pre_ping=True)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
+        # Some models carry pgvector columns. The extension is not enabled by
+        # default even on an image that ships it, and creating it here keeps
+        # the suite runnable against any bare server rather than depending on
+        # setup performed elsewhere.
+        await connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
         await connection.run_sync(Base.metadata.create_all)
     async with factory() as db, db.begin():
         await db.execute(delete(BehaviorEvent))
