@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -6,9 +7,13 @@ from app.api.schemas import (
     ExperienceCard,
     ExperienceDetail,
     OptionView,
+    Participant,
     PriceView,
+    SearchFilters,
     SlotView,
 )
+from app.common import currency as fx
+from app.common import urgency
 from app.common.errors import ApiError
 from app.common.persistence import catalog_product
 from app.common.store import DemoStore, store
@@ -33,6 +38,10 @@ def product_card(
     explanations: list[str] | None = None,
     *,
     reason_code: str | None = None,
+    filters: SearchFilters | None = None,
+    party: Sequence[Participant] = (),
+    demand: dict[str, float] | None = None,
+    display_currency: str | None = None,
 ) -> ExperienceCard:
     price, currency = starting_price(product)
     free_hours = max(
@@ -81,6 +90,20 @@ def product_card(
         currency=currency,
         tags=list(dict.fromkeys(product["interest_tags"] + product["subcategories"])),
         badges=badges,
+        display_price=(
+            fx.convert(price, currency, display_currency)
+            if display_currency and fx.supported(display_currency)
+            and display_currency.upper() != currency.upper()
+            else None
+        ),
+        display_currency=(
+            display_currency.upper()
+            if display_currency and fx.supported(display_currency)
+            and display_currency.upper() != currency.upper()
+            else None
+        ),
+        scarcity=urgency.scarcity(product, filters, party),
+        social_proof=urgency.social_proof(demand),
         reason=" ".join(explanations or []) or None,
         reason_code=reason_code,
         options=options,

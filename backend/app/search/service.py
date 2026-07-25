@@ -635,7 +635,14 @@ class SearchService:
             intent=intent,
             effective_filters=filters,
             items=[
-                product_card(product, _explanations(product, filters, request))
+                product_card(
+                    product,
+                    _explanations(product, filters, request),
+                    filters=filters,
+                    party=request.party,
+                    demand=demand.get(product["id"]),
+                    display_currency=request.display_currency,
+                )
                 for product, _ in page
             ],
             facets=facets,

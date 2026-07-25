@@ -81,6 +81,7 @@ async def list_experiences(
     category: str | None = None,
     limit: int = Query(default=20, ge=1, le=50),
     offset: int = Query(default=0, ge=0),
+    display_currency: str | None = None,
 ) -> ExperienceListResponse:
     products = [
         product
@@ -91,7 +92,10 @@ async def list_experiences(
     ]
     products.sort(key=lambda item: item["popularity_score"], reverse=True)
     return ExperienceListResponse(
-        items=[product_card(product) for product in products[offset : offset + limit]],
+        items=[
+            product_card(product, display_currency=display_currency)
+            for product in products[offset : offset + limit]
+        ],
         total=len(products),
     )
 
@@ -138,6 +142,7 @@ async def recommendations(
     travellers: int = Query(default=0, ge=0, le=20),
     max_total_price: float | None = Query(default=None, ge=0),
     currency: str | None = None,
+    display_currency: str | None = None,
 ) -> RecommendationResponse:
     filters = SearchFilters(
         visit_start=visit_start,
@@ -154,6 +159,7 @@ async def recommendations(
         limit=limit,
         filters=filters,
         party=party,
+        display_currency=display_currency,
     )
 
 
@@ -288,12 +294,26 @@ async def confirm_checkout(
     idempotency_key: IdempotencyHeader,
     session_id: SessionHeader = "demo-session",
 ) -> BookingView:
+    # Read the cart before confirming: confirmation clears it, and a booking
+    # event with no experience attached is invisible to demand stats, so the
+    # highest-weight signal in the product would never reach ranking.
+    cart = await cart_service.get_cart(session_id)
+    booked = [item.experience_id for item in cart.items]
     booking = await booking_service.confirm(
         session_id,
         idempotency_key=idempotency_key,
         customer_details=request.customer_details,
     )
-    await _capture(session_id, EventRequest(event_type="booking_completed"))
+    for experience_id in booked or [None]:
+        await _capture(
+            session_id,
+            EventRequest(
+                event_type="booking_completed",
+                experience_id=experience_id,
+                placement=request.placement,
+                properties={"booking_reference": booking.booking_reference},
+            ),
+        )
     return booking
 
 

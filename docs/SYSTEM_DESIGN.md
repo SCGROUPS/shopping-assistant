@@ -167,10 +167,15 @@ backend/app/
 ├── catalog/        seed.py · ingest                products, embeddings
 ├── commerce/       cart · booking · voucher        simulated purchase
 └── common/         ranking.py · features.py · persistence.py · config.py
+                    urgency.py · currency.py       commercial signals (§10)
+                    analytics.py                   funnel + holdout (§13)
+                    llm_cost.py · embedding_cache.py  cost controls (§11)
 
 frontend/src/
 ├── App.tsx                     storefront shell, filter state, cart
 ├── components/AssistantPanel   assistant surface
+├── components/CartDrawer       cart, cross-sell rail
+├── components/ProductCard      pricing, urgency badges
 ├── lib/presence.ts             assistant presence and friction rules
 ├── lib/api.ts                  API client, SSE, normalization
 └── types.ts                    shared contracts
@@ -519,6 +524,71 @@ Ranking quality is wasted if the funnel leaks. Known leaks and their fixes:
 Graceful relaxation is the highest-ROI item: it converts the site's most common
 failure state from an exit into a conversation.
 
+### 10.1 Honest urgency
+
+`common/urgency.py`. Scarcity and social proof are the easiest features in
+commerce to fake and the fastest way to lose a first-time buyer, so both are
+built to stay **silent by default** and speak only from inventory and
+measured demand.
+
+`scarcity(product, filters, party)` reads the slots the shopper could actually
+book — active options, `AVAILABLE` status, inside the requested date window,
+with `capacity_remaining >= party_size`. It returns `None` when supply is
+comfortable. Three honest statements are possible:
+
+| Condition | Message |
+|---|---|
+| ≤ `BUSY_DAY_THRESHOLD` (3) usable slots, tightest ≤ `SCARCITY_THRESHOLD` (6) | "Only N places left" |
+| ≤ `BUSY_DAY_THRESHOLD` usable slots, capacity comfortable | "Just N times left in your dates" |
+| Plenty of slots, but the tightest ≤ `SCARCITY_THRESHOLD` | "Some times down to N places" |
+
+Because the badge is filter-aware, it is a **statement about the shopper's
+trip**, not about the product: widening dates can legitimately remove it.
+
+`social_proof(stats)` reports only aggregated behavioural events —
+`bookings`, then `cart_adds`, then `views` — each behind
+`SOCIAL_PROOF_FLOOR` (5; views at 4×). It deliberately refuses to dress the
+seeded `review_count` up as recent demand: a review count is not evidence that
+anyone booked recently, and presenting it as such would be the dishonest
+version of this feature. Quiet inventory therefore shows nothing.
+
+The seed models a **demand profile** rather than uniform supply (~12% of
+experiences in demand, ~10% small-group formats on a limited cadence, the rest
+comfortable). Uniform capacity made scarcity permanently silent and left
+`availability_fit` unable to discriminate; the fix belongs in the data, not in
+a lower threshold.
+
+### 10.2 Display currency
+
+`common/currency.py`. Conversion is **presentation-only and server-side**.
+`price`/`currency` remain VND and authoritative; `display_price`/
+`display_currency` are additive fields on `ExperienceCard`. Nothing that
+charges money reads the FX table, and the card always renders the VND amount
+alongside the converted figure, so a tourist can see what their card will
+actually be billed. Because conversion happens server-side, changing currency
+refetches rather than reformatting client-side. Rates are currently static
+(§16).
+
+### 10.3 Cross-sell placement
+
+`complete_your_day` was reachable only through the assistant, which meant the
+highest-intent moment in the funnel — a shopper who has just added an item —
+had no complement offer at all. The cart drawer now renders a cross-sell rail
+sourced from the recommendation engine, tagged with the `cart_cross_sell`
+placement so its contribution is attributable in the funnel report (§13).
+
+### 10.4 Booking attribution
+
+A booking is the heaviest signal the product has: weight 8.0 in the session
+vector and the numerator of every conversion rate. It was being recorded as a
+single event with **no `experience_id`**, so `demand_stats` — which filters on
+that column — discarded every booking. Popularity, conversion lift and social
+proof were all being computed as if nothing had ever been bought. Checkout now
+reads the cart *before* confirmation clears it and emits one
+`booking_completed` per booked experience, carrying the originating surface
+so the assistant-versus-grid comparison survives to the point of sale. The
+client no longer emits a duplicate event of its own.
+
 ---
 
 ## 11. Cost architecture
@@ -603,6 +673,9 @@ Resolved during the MVP build:
 | 7 | §13.1 "the model selects tools" | planner now outranks keyword matching | 1 |
 | 9 | §13.7 cost controls | daily budget breaker degrading to deterministic paths | 5 |
 | 10 | §11.3 "availability is an eligibility gate" | recommendations share `is_eligible` with search | 1 |
+| 13 | §12.4 scarcity and social proof signals | `common/urgency.py`, silent unless earned | 6 |
+| 14 | multi-currency display for tourists | `common/currency.py`, presentation-only | 6 |
+| 15 | cross-sell outside the assistant | cart drawer rail, `cart_cross_sell` placement | 6 |
 
 Outstanding:
 
@@ -611,6 +684,8 @@ Outstanding:
 | 8 | §13.3 ten tools incl. `get_experience_details`, `get_cart`, `remove_from_cart` | seven-value enum, subset implemented | reduced capability |
 | 11 | §11.3 margin term | category take-rate proxy; no real margin data | ranking approximates revenue (§16) |
 | 12 | §13.7 exact cost ceiling | per-process ledger | effective ceiling is N × budget |
+| 16 | email capture and abandoned-cart recovery | not implemented | deferred pending the account-scope decision in §16 |
+| 17 | live FX rates | static table in `currency.py` | displayed prices drift from market (§16) |
 
 ---
 
@@ -698,9 +773,15 @@ work deliberately: better ranking into a leaking funnel returns little.
 12. Persistent shared embedding cache, budget breaker. (Semantic dedupe
     deferred: it needs an embedding to decide, which is the cost it avoids.)
 
-**Phase 6 — commercial levers**
-13. Scarcity, social proof, multi-currency, cross-sell, email capture,
-    abandoned-cart recovery.
+**Phase 6 — commercial levers** ✅
+13. Honest scarcity and social proof (§10.1), display currency (§10.2), cart
+    cross-sell (§10.3), and per-experience booking attribution (§10.4).
+
+    Deferred: **email capture** and **abandoned-cart recovery**. Both require a
+    product decision that is not ours to make — whether accounts are in scope,
+    and what consent basis applies to a tourist's email address under GDPR
+    (§16). Building either behind a guess would create a data-retention
+    obligation we have not designed for.
 
 ---
 
@@ -710,6 +791,9 @@ work deliberately: better ranking into a leaking funnel returns little.
   it; a proxy (category-level take rate) may be required initially.
 - Do we need real supplier availability integration, or does simulated capacity
   remain acceptable through MVP?
-- Which currencies must be supported at launch, and from what FX source?
+- Which currencies must be supported at launch, and from what FX source? Eight
+  are supported today against a static table (`common/currency.py`); a live
+  rate feed with a staleness policy is needed before real money is quoted.
 - Is account creation in scope for abandoned-cart recovery, or is email capture
-  alone sufficient?
+  alone sufficient? This blocks the two deferred Phase 6 items, and carries a
+  consent and retention question for tourist email addresses under GDPR.

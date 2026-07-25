@@ -28,6 +28,12 @@ export type Experience = {
   review_count: number
   price: number
   currency: string
+  /** Presentation only; `price`/`currency` remain authoritative for money. */
+  display_price?: number
+  display_currency?: string
+  /** Present only when the underlying fact is real (see backend urgency.py). */
+  scarcity?: string
+  social_proof?: string
   duration_minutes: number
   tags: string[]
   badges: string[]

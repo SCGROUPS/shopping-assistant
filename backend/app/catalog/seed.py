@@ -926,17 +926,36 @@ def build_seed_catalog(days: int = 30, target_count: int | None = None) -> list[
                 "maximum_age": 2,
             },
         ]
+        # Real marketplaces do not have uniform supply. Seeding every slot with
+        # comfortable capacity made scarcity signalling permanently silent and
+        # availability_fit unable to discriminate, so the seed models a demand
+        # profile instead: a minority of experiences sell through, a few run
+        # limited departures, most are comfortable. Deterministic on the slug so
+        # runs stay reproducible.
+        profile = int(stable_id("demand", slug).int % 100)
+        if profile < 12:
+            capacity_total, base_remaining = 12, 2  # in demand
+        elif profile < 22:
+            capacity_total, base_remaining = 8, 4  # small-group format
+        else:
+            capacity_total, base_remaining = 18, 12
+        # Limited-departure operators do not run every day.
+        cadence = 3 if 12 <= profile < 22 else 1
+
         slots = []
         for day_offset in range(1, days + 1):
+            if (day_offset + index) % cadence:
+                continue
             for hour in source["times"]:
                 starts = datetime.combine(today + timedelta(days=day_offset), time(hour), UTC)
+                remaining = base_remaining + ((index + day_offset + hour) % 5)
                 slots.append(
                     {
                         "id": stable_id("slot", f"{slug}:{starts.isoformat()}"),
                         "starts_at": starts,
                         "ends_at": starts + timedelta(minutes=source["duration"]),
-                        "capacity_total": 18,
-                        "capacity_remaining": 12 + ((index + day_offset + hour) % 7),
+                        "capacity_total": capacity_total,
+                        "capacity_remaining": min(remaining, capacity_total),
                         "status": "AVAILABLE",
                     }
                 )

@@ -2,12 +2,14 @@ import {
   ArrowUpRight,
   Check,
   Clock3,
+  Flame,
   Heart,
   MapPin,
   MessageCircle,
   ShoppingBag,
   Sparkles,
   Star,
+  Users,
 } from 'lucide-react'
 import { useState } from 'react'
 import type { Experience } from '../types'
@@ -101,6 +103,22 @@ export function ProductCard({
             {product.reason}
           </p>
         )}
+        {(product.scarcity || product.social_proof) && (
+          <div className="product-signals">
+            {product.scarcity && (
+              <span className="signal signal-scarcity">
+                <Flame size={13} />
+                {product.scarcity}
+              </span>
+            )}
+            {product.social_proof && (
+              <span className="signal signal-proof">
+                <Users size={13} />
+                {product.social_proof}
+              </span>
+            )}
+          </div>
+        )}
         <div className="product-meta">
           <span className="rating">
             <Star size={14} fill="currentColor" />
@@ -116,9 +134,15 @@ export function ProductCard({
           <div className="price">
             <span>From</span>
             <strong>
-              {money(product.currency, product.price)}
+              {product.display_price != null && product.display_currency
+                ? money(product.display_currency, product.display_price)
+                : money(product.currency, product.price)}
             </strong>
-            <span>per guest</span>
+            <span>
+              {product.display_price != null && product.display_currency
+                ? `per guest · ${money(product.currency, product.price)}`
+                : 'per guest'}
+            </span>
           </div>
           <div className="product-actions">
             {onAsk && (

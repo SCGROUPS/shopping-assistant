@@ -22,6 +22,37 @@ const jsonHeaders = {
   'X-Session-ID': SESSION_ID,
 }
 
+export const SUPPORTED_CURRENCIES = [
+  'VND',
+  'USD',
+  'EUR',
+  'GBP',
+  'AUD',
+  'SGD',
+  'KRW',
+  'JPY',
+] as const
+
+// Display currency is presentation state, so it lives here rather than being
+// threaded through every call signature. The authoritative VND price always
+// travels alongside it, and nothing that charges money reads this.
+let displayCurrency =
+  localStorage.getItem('vietra-display-currency') ?? 'VND'
+
+export const setDisplayCurrency = (currency: string) => {
+  displayCurrency = currency
+  localStorage.setItem('vietra-display-currency', currency)
+}
+
+export const getDisplayCurrency = () => displayCurrency
+
+const withDisplayCurrency = (params: URLSearchParams) => {
+  if (displayCurrency && displayCurrency !== 'VND') {
+    params.set('display_currency', displayCurrency)
+  }
+  return params
+}
+
 class ApiRequestError extends Error {
   readonly status: number
 
@@ -134,6 +165,13 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
     review_count: Number(item.review_count ?? 0),
     price: Number(item.price ?? options[0]?.price ?? 0),
     currency: String(item.currency ?? options[0]?.currency ?? 'VND'),
+    display_price:
+      item.display_price != null ? Number(item.display_price) : undefined,
+    display_currency: item.display_currency
+      ? String(item.display_currency)
+      : undefined,
+    scarcity: item.scarcity ? String(item.scarcity) : undefined,
+    social_proof: item.social_proof ? String(item.social_proof) : undefined,
     duration_minutes: Number(item.duration_minutes ?? 60),
     tags: Array.isArray(item.tags) ? item.tags.map(String) : [],
     badges,
@@ -330,7 +368,9 @@ export const api = {
 
   async listExperiences(): Promise<Experience[]> {
     try {
-      return normalizeProducts(await request('/experiences'))
+      const params = withDisplayCurrency(new URLSearchParams())
+      const query = params.toString() ? `?${params}` : ''
+      return normalizeProducts(await request(`/experiences${query}`))
     } catch (error) {
       allowDemoFallbackOrThrow(error)
       return demoExperiences
@@ -358,6 +398,7 @@ export const api = {
           party: [{ type: 'adult', count: partySize }],
           sort: 'recommended',
           page_size: 24,
+          display_currency: displayCurrency,
         }),
       })
       return {
@@ -395,6 +436,7 @@ export const api = {
         params.set('max_total_price', String(filters.max_total_price))
       }
       if (travellers) params.set('travellers', String(travellers))
+      withDisplayCurrency(params)
       const query = params.toString() ? `?${params}` : ''
       return normalizeProducts(await request(`/recommendations${query}`))
     } catch (error) {
@@ -673,6 +715,7 @@ export const api = {
   async confirmCheckout(
     items: CartItem[],
     customer: { name: string; email: string },
+    placement?: string,
   ): Promise<Voucher> {
     try {
       await request<Record<string, unknown>>(
@@ -689,6 +732,7 @@ export const api = {
         body: JSON.stringify({
           confirmation: 'CONFIRM',
           customer_details: customer,
+          placement,
         }),
       })
       const backendVoucher = booking.voucher as Record<string, unknown>

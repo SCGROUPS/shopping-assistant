@@ -180,6 +180,7 @@ class RecommendationService:
         limit: int = 6,
         filters: SearchFilters | None = None,
         party: Sequence[Participant] = (),
+        display_currency: str | None = None,
     ) -> RecommendationResponse:
         products = await catalog_products(self.data)
         products_by_id = {product["id"]: product for product in products}
@@ -260,7 +261,17 @@ class RecommendationService:
         items = []
         for item_id in diversified_ids:
             product, _score, code, reason = by_id[item_id]
-            items.append(product_card(product, [reason], reason_code=code))
+            items.append(
+                product_card(
+                    product,
+                    [reason],
+                    reason_code=code,
+                    filters=gate,
+                    party=party,
+                    demand=demand.get(product["id"]),
+                    display_currency=display_currency,
+                )
+            )
         return RecommendationResponse(items=items)
 
 

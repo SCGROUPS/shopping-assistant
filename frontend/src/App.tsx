@@ -33,7 +33,12 @@ import { CheckoutModal } from './components/CheckoutModal'
 import { ProductCard } from './components/ProductCard'
 import { VoiceInputButton } from './components/VoiceInputButton'
 import { categories, demoExperiences } from './data/demo'
-import { api } from './lib/api'
+import {
+  SUPPORTED_CURRENCIES,
+  api,
+  getDisplayCurrency,
+  setDisplayCurrency,
+} from './lib/api'
 import {
   detectFriction,
   findScheduleClash,
@@ -183,6 +188,49 @@ function App() {
   // better than manual search". Assumed enabled until the server says
   // otherwise, so a telemetry outage never silently removes the assistant.
   const [assistantEnabled, setAssistantEnabled] = useState(true)
+  const [currency, setCurrency] = useState(getDisplayCurrency())
+  const [crossSell, setCrossSell] = useState<Experience[]>([])
+
+  useEffect(() => {
+    if (!cartOpen || cartItems.length === 0) {
+      setCrossSell([])
+      return
+    }
+    void (async () => {
+      const anchor = cartItems[cartItems.length - 1].experience
+      const suggestions = await api.recommendations(
+        anchor,
+        { ...liveFilters(), destination: anchor.destination },
+        travellers,
+      )
+      const inCart = new Set(cartItems.map((item) => item.experience.id))
+      setCrossSell(suggestions.filter((item) => !inCart.has(item.id)))
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cartOpen, cartItems, travellers])
+
+  const changeCurrency = (next: string) => {
+    setDisplayCurrency(next)
+    setCurrency(next)
+    api.track('filter_applied', { display_currency: next })
+    // Conversion happens server-side, so prices on screen are stale until the
+    // current view is refetched.
+    void (async () => {
+      if (hasSearched) {
+        await runSearch(query, {}, false)
+      } else {
+        const experiences = await api.listExperiences()
+        if (experiences.length) setProducts(experiences)
+      }
+      setRecommendations(
+        await api.recommendations(
+          selectedProduct ?? undefined,
+          liveFilters(),
+          travellers,
+        ),
+      )
+    })()
+  }
 
   const liveFilters = (): SearchFilters => {
     const filters: SearchFilters = {
@@ -694,12 +742,14 @@ function App() {
     name: string
     email: string
   }) => {
-    const confirmation = await api.confirmCheckout(cartItems, customer)
     // Attribute the booking to the surface that sourced the cart, so
-    // "the assistant converts better" becomes a measurable claim.
-    api.track('booking_completed', { items: cartItems.length }, {
-      placement: conversationStarted ? 'assistant' : 'grid',
-    })
+    // "the assistant converts better" becomes a measurable claim. The server
+    // records one event per booked experience, so it is not duplicated here.
+    const confirmation = await api.confirmCheckout(
+      cartItems,
+      customer,
+      conversationStarted ? 'assistant' : 'grid',
+    )
     setVoucher(confirmation)
     setMessages((current) => [
       ...current,
@@ -743,11 +793,22 @@ function App() {
         </nav>
 
         <div className="header-actions">
-          <button className="currency-button">
+          <label className="currency-button">
             <Globe2 size={16} />
-            USD
+            <span className="sr-only">Display currency</span>
+            <select
+              value={currency}
+              onChange={(event) => changeCurrency(event.target.value)}
+              aria-label="Display currency"
+            >
+              {SUPPORTED_CURRENCIES.map((code) => (
+                <option key={code} value={code}>
+                  {code}
+                </option>
+              ))}
+            </select>
             <ChevronDown size={14} />
-          </button>
+          </label>
           <button
             className="cart-button"
             onClick={() => setCartOpen(true)}
@@ -1399,6 +1460,14 @@ function App() {
         }}
         onCheckPlan={assistantEnabled ? checkMyPlan : undefined}
         clashing={findScheduleClash(cartItems) !== null}
+        crossSell={crossSell}
+        onAddCrossSell={(product) => {
+          api.track('recommendation_clicked', {}, {
+            experienceId: product.id,
+            placement: 'cart_cross_sell',
+          })
+          void addToCart(product)
+        }}
       />
 
       <CheckoutModal
