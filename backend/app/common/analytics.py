@@ -138,14 +138,19 @@ async def funnel_report(data: DemoStore = store) -> dict[str, Any]:
                 else:
                     booked_sessions.add(anonymous_id)
 
+            # The JSON path must be a single expression object. Building it
+            # twice yields two bind parameters, which PostgreSQL sees as two
+            # different expressions and rejects with a GROUPING error — a
+            # failure that only appears against a real database.
+            trigger = BehaviorEvent.properties["trigger"].astext.label("trigger")
             nudge_rows = await db.execute(
                 select(
                     BehaviorEvent.event_type,
-                    BehaviorEvent.properties["trigger"].astext,
+                    trigger,
                     func.count(),
                 )
                 .where(BehaviorEvent.event_type.in_(list(NUDGE_EVENTS)))
-                .group_by(BehaviorEvent.event_type, BehaviorEvent.properties["trigger"].astext)
+                .group_by(BehaviorEvent.event_type, trigger)
             )
             for event_type, trigger, count in nudge_rows.all():
                 nudges[trigger or "unknown"][NUDGE_EVENTS[event_type]] += int(count)

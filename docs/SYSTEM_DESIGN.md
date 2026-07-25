@@ -685,6 +685,7 @@ Outstanding:
 | 11 | §11.3 margin term | category take-rate proxy; no real margin data | ranking approximates revenue (§16) |
 | 12 | §13.7 exact cost ceiling | per-process ledger | effective ceiling is N × budget |
 | 16 | email capture and abandoned-cart recovery | not implemented | deferred pending the account-scope decision in §16 |
+| 18 | full-journey integration coverage over PostgreSQL | gated on `POSTGRES_SEEDED_TEST_DATABASE_URL`; needs a seeded catalogue and an LLM provider, so CI covers analytics SQL only | database-only defects outside analytics still reach deployment |
 | 17 | live FX rates | static table in `currency.py` | displayed prices drift from market (§16) |
 
 ---
@@ -710,6 +711,12 @@ Every stage carries a `placement`, set by the frontend at the point of action:
 
 Rates are reported as `null`, never `0`, when there is no evidence — an
 unmeasured rate is unknown, and rendering it as 0% looks like failure.
+
+Analytics has two implementations — an in-memory one for demo mode and a SQL
+one for the database — and only the first was reachable from CI. The SQL branch
+shipped a `GROUP BY` defect that no demo-mode test could detect, and a
+deployment found it. CI now runs a throwaway PostgreSQL service so the SQL
+aggregation is executed on every change (`tests/test_analytics_postgres.py`).
 
 ### 13.2 The assistant holdout
 

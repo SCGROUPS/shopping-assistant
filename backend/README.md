@@ -34,6 +34,23 @@ uv run pyright
 
 Tests use the deterministic in-memory catalog and require neither PostgreSQL nor Azure.
 
+Two suites are gated behind environment variables, because the database code
+paths are separate implementations from demo mode and cannot be exercised
+without a server:
+
+| Variable | Enables | Needs |
+|---|---|---|
+| `POSTGRES_TEST_DATABASE_URL` | `test_analytics_postgres.py` — SQL aggregation in `common/analytics.py` | a bare PostgreSQL server |
+| `POSTGRES_SEEDED_TEST_DATABASE_URL` | `test_postgres_integration.py` — full application journey | a seeded catalogue via `DATABASE_URL`, plus an LLM provider |
+
+CI runs the first against a throwaway `pgvector/pgvector:pg17` service. Run it
+locally the same way:
+
+```bash
+createdb vietra_test
+POSTGRES_TEST_DATABASE_URL="postgresql+psycopg://$(whoami)@127.0.0.1:5432/vietra_test" uv run pytest
+```
+
 ## PostgreSQL
 
 Set an async SQLAlchemy URL and run the initial migration:
