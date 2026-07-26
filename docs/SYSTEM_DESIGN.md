@@ -1091,6 +1091,30 @@ work deliberately: better ranking into a leaking funnel returns little.
     (§16). Building either behind a guess would create a data-retention
     obligation we have not designed for.
 
+**Phase 7 — content ownership and languages** — in progress.
+
+The roadmap above assumes Trippass is the source of inventory. It is not; it
+is reference data. Everything real must be authored by a human operator or
+submitted by a partner through an API, and it must be sellable in more than
+one language. That work has its own specification —
+`docs/CONTENT_PIPELINE.md` — and its own nine-step sequence, because it
+changes the identity model and cannot be sketched as a roadmap bullet.
+
+Where it stands, in this document's terms (full detail in §12.1 there):
+
+- **Shipped**: the multilingual schema, translation pipeline, per-locale
+  analysis, fallback chains and the indexing outbox; the publish gate; the
+  intent-extraction probe, deploy gate and alerting described in §13.
+- **Gated**: locale-aware resolution is complete but `enabled_locales` is
+  `["en"]`. Eight locales are *supported*; one is *served*. Nothing has been
+  translated yet and six locales have no interface strings.
+- **Not started**: the authoring API (content still enters through
+  `POST /admin/imports` and the CLI), partner staging and approval, and the
+  authoring console.
+
+The honest reading: Vietra can now understand and index eight languages, and
+still speaks one. The remaining work is content and copy, not architecture.
+
 ---
 
 ## 16. Open questions

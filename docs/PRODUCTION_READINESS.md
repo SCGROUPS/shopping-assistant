@@ -310,6 +310,41 @@ without these:
 
 ---
 
+## 4a. Status since this document was written
+
+This document assessed a revision that has since shipped, and two things
+changed that its verdicts depended on. Recorded here rather than by editing
+the verdicts above, because the reasoning is still correct and only the facts
+moved.
+
+**Silent degradation is no longer silent.** §2.2 and §2.3 both rested on the
+assumption that a failure in the assistant would be noticed. It would not have
+been: the storefront fell back to keyword parsing twice and ran that way for
+days with every dashboard green, because the fallback path raises nothing and
+increments no counter. That class is now closed at four points — a startup
+probe that asks the deployment the question production asks, a readiness
+endpoint that refuses to call a revision ready before that probe answers, a
+deploy gate that fails a revision that came up with no model configured, and
+three Azure Monitor rules with an email recipient attached. Severity 0 means
+the storefront is being keyword-parsed; the merely-unverified case is
+deliberately lower, so that the sev-0 rule stays worth waking up for.
+
+**The deploy gate was itself the defect twice.** Both earlier versions passed a
+deploy that had completely failed. Measuring a deliberately broken revision
+showed why: `provisioningState`, `healthState`, `runningState` and the shared
+ingress *all* report a dead revision as healthy, because traffic weight is
+assigned before readiness and the shared hostname is answered by the previous
+revision. Only the revision's own FQDN tells the truth. Anyone tempted to
+simplify that check back to a control-plane field should read the measurement
+in `scripts/deploy.sh` first.
+
+**Multilingual is built but not yet served.** Eight locales are supported by
+the schema, translation pipeline, fallback chains, per-locale analysis and the
+index; one (`en`) is enabled. The gap is content and interface copy, not
+capability — see `docs/CONTENT_PIPELINE.md` §12.1 for the step-by-step state.
+
+---
+
 ## 5. Recommended sequence after this revision
 
 1. Close the availability gap (blocker 1) — nothing else matters if the product

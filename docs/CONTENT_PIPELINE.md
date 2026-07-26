@@ -1857,6 +1857,49 @@ release depends on a schema that a running instance has not yet seen.* Steps
 0–6 close the live defect and deliver all seven added languages; 7–9 build the
 sourcing capability that replaces Trippass as the origin of inventory.
 
+### 12.1 Implementation status
+
+Current as of the deployment of `main` that landed migration 0007 and the
+intent alerting. Written against what is *running in production*, not against
+what is merged, because those diverged once already and the gap was the whole
+subject of §1.2. Anything below marked shipped can be checked from outside:
+the endpoint answers, the migration is applied, the alert rule exists.
+
+| Step | State | Where it stands |
+|---|---|---|
+| 0 Tokenizer | **shipped** | Multilingual analysis is in the index build |
+| 1 Schema + compatible release | **shipped** | Migrations 0004–0007 applied. Identity, locale columns, overrides, translation state, jobs, indexing outbox |
+| 2 Multilingual eval suite | **shipped, failing by design** | Gates the locales that are still off. It is supposed to be red until §12.1's "not started" rows are done |
+| 3 Translation pipeline | **shipped** | `app/content/`: fingerprints, leases, glossary, spend caps, review split. Driven by `enqueue-translations` and `translate` |
+| 4 Locale-aware resolution | **shipped, gated** | Readers are locale-aware end to end; `enabled_locales` defaults to `["en"]` and production sets no override, so exactly one locale is live |
+| 5 Backfill | **not started** | No translated inventory exists yet. This is the gate on step 6, not a code gap |
+| 6 Switcher, UI strings | **partial** | `LocaleContext` and the switcher exist. `frontend/src/lib/i18n.ts` carries `en` and `vi` dictionaries only; the other six have none |
+| 7 Authoring API + publish gate | **partial** | The publish gate is shipped and enforced on both the operator path and the importer. The authoring API is not: content still arrives via `POST /admin/imports` and the CLI, so there is no way for an operator to write a listing field by field |
+| 8 Partner ingestion | **not started** | No staging, no submission endpoint, no approval API. §8 is spec only |
+| 9 Authoring console | **not started** | Depends on 7 and 8 |
+
+**The honest summary of the multilingual work**: the machinery is built and the
+storefront still speaks one language. Every layer that has to *understand* a
+locale does — schema, translation pipeline, fallback chains, per-locale
+analysis, embeddings, the index. What is missing is content and copy, not
+capability: nothing has been translated yet (step 5), and six of the eight
+locales have no interface strings (step 6). `SUPPORTED_LOCALES` lists all
+eight because that is what the system can *handle*; `enabled_locales` lists
+`en` because that is what it can currently *serve*. The distinction is
+deliberate (§3.4) and the gap between the two lists is the remaining work.
+
+`vi` is the nearest to ready and is still off on purpose: the Vietnamese
+`meeting_point` review queue has not been worked, and publishing a listing
+whose meeting point is wrong is worse than publishing no Vietnamese at all.
+
+**Not part of the sequence, shipped alongside it**: the intent-extraction
+outage class described in §1.2 and §1.4 is now gated and alerted. A startup
+probe asks the deployment the question production asks; readiness will not
+call a revision ready before that probe has a verdict; the deploy refuses a
+revision that came up with no model configured; and three Azure Monitor rules
+report the outcome, severity 0 when the storefront is being keyword-parsed.
+Production currently reports `intent deployment accepted our request`.
+
 ---
 
 ## 13. Where earlier revisions were wrong

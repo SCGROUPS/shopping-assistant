@@ -84,11 +84,35 @@ The validated default PostgreSQL region is Central US. Set
 
 ## Validate
 
+`scripts/deploy.sh` already gates on most of this and will fail the deploy
+rather than leave a broken revision serving. Three things it checks are worth
+knowing about, because each was a real outage:
+
+- **A revision that came up with no model configured is a failure**, even
+  though it returns HTTP 200 from `/health/ready`. The probe records "not
+  applicable" and readiness passes, so this is the quietest way for the
+  storefront to end up answering every shopper with keyword matching.
+- **Readiness is asked of the revision's own FQDN, not the shared ingress.**
+  The shared hostname is answered by the *previous* revision while a new one is
+  still starting, and traffic weight is assigned before readiness — so every
+  control-plane field reports a dead deploy as healthy for about ten minutes.
+  The measurement behind this is recorded in the script; do not simplify it
+  back to `healthState` or `runningState`.
+- **The revision is identified by build stamp**, not by "newest", so the gate
+  cannot pass by inspecting somebody else's deploy.
+
+A green deploy that could not verify the model says so explicitly rather than
+reporting plain success.
+
 ```bash
 APP_URL="https://<container-app-hostname>"
 
 curl --fail "$APP_URL/health/live"
 curl --fail "$APP_URL/health/ready"
+
+# The intent probe's verdict. `probe.ok: false`, or a detail containing
+# "not applicable", means the storefront is not being understood.
+curl --fail "$APP_URL/api/v1/health" | jq .intent_extraction
 
 az containerapp job execution list \
   --resource-group "rg-${VIETRA_PREFIX}-poc" \
@@ -136,12 +160,36 @@ Cognitive Services token from the active Azure CLI login.
   backups without high availability.
 - ACR uses Basic.
 - Embeddings use 512 dimensions and are generated in batches.
-- Intent extraction uses `gpt-5-nano`; richer prose uses `gpt-5.4-mini`.
+- Intent extraction and prose both use `gpt-5.4-mini`. Intent used to be
+  pointed at a nano deployment; that deployment no longer exists, and the name
+  is decided only by the defaults in `infra/bicep/main.bicep` so that the
+  template and the running service cannot drift apart. Setting
+  `AZURE_OPENAI_INTENT_DEPLOYMENT` by hand on the container app is how an
+  earlier outage looked fixed until the next deploy silently reverted it.
 - The image generator uses `gpt-image-1-mini` at low quality and only creates
   the small reusable image set.
 
 The deployment remains capped at one replica for predictable POC cost.
 Application state is PostgreSQL-backed outside explicit demo mode.
+
+## Alerting
+
+Three Azure Monitor scheduled-query rules deploy with the stack, all notifying
+the `ALERT_EMAIL` recipient through the `ag-<prefix>-intent` action group. If
+`ALERT_EMAIL` is unset the rules still deploy and are still visible in the
+portal, but nobody is *told* — which is how two intent outages ran for days
+while every dashboard read healthy.
+
+| Severity | Rule | Means |
+|---|---|---|
+| 0 | `intent-probe-rejected` | The storefront is being keyword-parsed: either the deployment refuses our requests, or no model is configured at all |
+| 1 | `intent-extraction-failing` | Extraction is erroring at a rate above the threshold |
+| 3 | `intent-probe-unverified` | The probe could not reach a verdict. The revision is serving normally; this is not a page |
+
+The severity split is deliberate. Sev 0 fires only when shoppers are demonstrably
+not being understood, so that it stays worth waking up for. A probe that merely
+timed out, or a network appliance returning 403, lands at sev 3 — the model
+being unreachable is not evidence that our requests are wrong.
 
 ## Security boundaries
 
