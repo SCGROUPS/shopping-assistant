@@ -27,6 +27,40 @@ const TEXT_ATTRIBUTES = new Set([
   'placeholder',
 ])
 
+// Object properties whose values a shopper reads. A string only has to be
+// written *somewhere* to be rendered later: the nudges lived in `presence.ts`,
+// the assistant's replies in `api.ts` and the welcome line in a module-level
+// constant, and all of them reached the screen while a check that read only
+// markup reported the interface fully translated. Matching on the property
+// name catches the string where it is written instead.
+//
+// `raw` is here on purpose. `LocalizedText` accepts `{ raw }` for prose the
+// assistant service wrote in the shopper's language, so a literal in that
+// position is English being carried past the type.
+const TEXT_PROPERTIES = new Set([
+  'alt',
+  'ariaLabel',
+  'caption',
+  'description',
+  'heading',
+  'hint',
+  'label',
+  'message',
+  'opener',
+  'placeholder',
+  'prompt',
+  'raw',
+  'summary',
+  'text',
+  'title',
+])
+
+// Sample catalogue content, not interface chrome. In production every one of
+// these fields is served from the database already translated, so the English
+// here is a fixture standing in for supplier data rather than a string the
+// application is responsible for translating.
+const CONTENT_FIXTURES = new Set(['src/data/demo.ts'])
+
 // Operator tooling, not storefront. The console is used by staff who author in
 // Vietnamese or English and it has its own language policy; the shopper-facing
 // chrome gate does not speak for it. Listed explicitly, and the number of
@@ -52,28 +86,56 @@ const walkFiles = (dir, out = []) => {
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry)
     if (statSync(full).isDirectory()) walkFiles(full, out)
-    else if (entry.endsWith('.tsx')) out.push(full)
+    else if (entry.endsWith('.tsx') || entry.endsWith('.ts')) out.push(full)
   }
   return out
 }
 
+// Pulls the translatable literals out of an expression, following the shapes
+// English actually hides in: a plain string, a template with substitutions
+// (`Ask Mai about ${title}` - the sentence is in the spans), and both arms of
+// a ternary, which is what a half-translated line looks like.
+const collectText = (expression, emit) => {
+  if (!expression) return
+  if (
+    ts.isStringLiteral(expression) ||
+    ts.isNoSubstitutionTemplateLiteral(expression)
+  ) {
+    if (!isAllowed(expression.text)) emit(expression)
+  } else if (ts.isTemplateExpression(expression)) {
+    if (!isAllowed(expression.head.text)) emit(expression.head)
+    for (const span of expression.templateSpans) {
+      if (!isAllowed(span.literal.text)) emit(span.literal)
+    }
+  } else if (ts.isConditionalExpression(expression)) {
+    collectText(expression.whenTrue, emit)
+    collectText(expression.whenFalse, emit)
+  }
+}
+
 const findings = []
 let operatorSkipped = 0
+let fixtureSkipped = 0
 
 for (const file of walkFiles(SRC)) {
   const relativePath = relative(ROOT, file)
   const operatorOnly = OPERATOR_ONLY.has(relativePath)
+  const fixture = CONTENT_FIXTURES.has(relativePath)
   const source = ts.createSourceFile(
     file,
     readFileSync(file, 'utf8'),
     ts.ScriptTarget.Latest,
     true,
-    ts.ScriptKind.TSX,
+    file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
   )
 
   const report = (node, text) => {
     if (operatorOnly) {
       operatorSkipped += 1
+      return
+    }
+    if (fixture) {
+      fixtureSkipped += 1
       return
     }
     const { line } = source.getLineAndCharacterOfPosition(node.getStart(source))
@@ -104,30 +166,22 @@ for (const file of walkFiles(SRC)) {
       node.parent &&
       (ts.isJsxElement(node.parent) || ts.isJsxFragment(node.parent))
     ) {
-      const strings = []
-      const collect = (expression) => {
-        if (
-          ts.isStringLiteral(expression) ||
-          ts.isNoSubstitutionTemplateLiteral(expression)
-        ) {
-          strings.push(expression)
-        } else if (ts.isTemplateExpression(expression)) {
-          // `Ask Mai about ${title}` - a sentence with a hole in it. The
-          // English lives in the literal spans, so it needs a dictionary key
-          // with a placeholder, not a template.
-          if (!isAllowed(expression.head.text)) strings.push(expression.head)
-          for (const span of expression.templateSpans) {
-            if (!isAllowed(span.literal.text)) strings.push(span.literal)
-          }
-        } else if (ts.isConditionalExpression(expression)) {
-          collect(expression.whenTrue)
-          collect(expression.whenFalse)
-        }
-      }
-      collect(node.expression)
-      for (const literal of strings) {
-        if (!isAllowed(literal.text)) report(literal, literal.text)
-      }
+      collectText(node.expression, (literal) => report(literal, literal.text))
+    }
+
+    // A text-bearing property in an object literal:
+    //   { label: 'Questions before you book?' }
+    // regardless of which file it sits in or how far it travels before it is
+    // rendered. Also covers `{ raw: 'English' }`, which would otherwise be a
+    // hole straight through `LocalizedText`.
+    if (
+      ts.isPropertyAssignment(node) &&
+      (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name)) &&
+      TEXT_PROPERTIES.has(node.name.text)
+    ) {
+      collectText(node.initializer, (literal) =>
+        report(literal, literal.text),
+      )
     }
 
     // Attribute values a shopper reads: aria-label="Close"
@@ -163,8 +217,12 @@ for (const file of walkFiles(SRC)) {
   visit(source)
 }
 
-const skipNote = operatorSkipped
-  ? ` (${operatorSkipped} operator-console string(s) skipped by policy)`
+const skipped = [
+  operatorSkipped ? `${operatorSkipped} operator-console` : '',
+  fixtureSkipped ? `${fixtureSkipped} demo-fixture` : '',
+].filter(Boolean)
+const skipNote = skipped.length
+  ? ` (${skipped.join(', ')} string(s) skipped by policy)`
   : ''
 
 if (findings.length) {

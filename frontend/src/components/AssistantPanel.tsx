@@ -21,7 +21,8 @@ import type {
 import { hasReviews } from '../lib/rating'
 import { VoiceInputButton } from './VoiceInputButton'
 import { useLocale, useT } from '../lib/useLocale'
-import { formatMoney } from '../lib/format'
+import { bcp47, formatMoney } from '../lib/format'
+import { resolveText } from '../lib/i18n'
 
 type AssistantPanelProps = {
   open: boolean
@@ -99,8 +100,12 @@ export function AssistantPanel({
     }
 
     window.speechSynthesis.cancel()
-    const utterance = new SpeechSynthesisUtterance(message.text)
-    utterance.lang = 'en-US'
+    const utterance = new SpeechSynthesisUtterance(
+      resolveText(locale, message.text),
+    )
+    // Reading Vietnamese text with an en-US voice is unintelligible, so the
+    // voice follows the message, not the build.
+    utterance.lang = bcp47(locale)
     utterance.rate = 0.95
     const clearSpeakingMessage = () =>
       setSpeakingMessageId((current) =>
@@ -152,7 +157,7 @@ export function AssistantPanel({
             )}
             <div className="message-content">
               <div className="message-copy">
-                <p>{message.text}</p>
+                <p>{resolveText(locale, message.text)}</p>
                 {message.role === 'assistant' && canSpeak && (
                   <button
                     className="message-audio"
@@ -190,7 +195,7 @@ export function AssistantPanel({
                           : [
                               {
                                 type: 'ADD_TO_CART' as const,
-                                label: 'Add to trip',
+                                label: { key: 'assistant.action.addToCart' as const },
                                 experience_id: product.id,
                               },
                             ]
@@ -242,7 +247,7 @@ export function AssistantPanel({
                                 }
                                 data-product-id={product.id}
                                 aria-label={t('card.a11y.action', {
-                                  action: action.label,
+                                  action: resolveText(locale, action.label),
                                   title: product.title,
                                 })}
                                 onClick={() => onAction(action, [product])}
@@ -252,7 +257,7 @@ export function AssistantPanel({
                                 ) : (
                                   <Check size={13} />
                                 )}
-                                {action.label}
+                                {resolveText(locale, action.label)}
                               </button>
                             ))}
                           </div>
@@ -294,7 +299,7 @@ export function AssistantPanel({
                         ) : (
                           <Check size={16} />
                         )}
-                        {action.label}
+                        {resolveText(locale, action.label)}
                       </button>
                     ))}
                 </div>

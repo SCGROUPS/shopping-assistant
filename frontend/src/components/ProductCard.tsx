@@ -13,7 +13,7 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import type { Experience } from '../types'
-import { NEW_LISTING_LABEL, hasReviews } from '../lib/rating'
+import { NEW_LISTING_KEY, hasReviews } from '../lib/rating'
 import { useLocale } from '../lib/useLocale'
 import { formatCount, formatMoney } from '../lib/format'
 
@@ -128,7 +128,7 @@ export function ProductCard({
               <span>({formatCount(locale, product.review_count)})</span>
             </span>
           ) : (
-            <span className="rating new-listing">{NEW_LISTING_LABEL}</span>
+            <span className="rating new-listing">{t(NEW_LISTING_KEY)}</span>
           )}
           <span>
             <Clock3 size={14} />

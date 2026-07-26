@@ -46,7 +46,8 @@ import {
 import { formatCount, formatDate as intlDate, formatMoney } from './lib/format'
 import { LocaleProvider } from './lib/LocaleContext'
 import { buildTranslator } from './lib/useLocale'
-import { chromeReady, isFallback, translate } from './lib/i18n'
+import { chromeReady, isFallback, resolveText, translate } from './lib/i18n'
+import type { LocalizedText } from './lib/i18n'
 import {
   detectFriction,
   findScheduleClash,
@@ -54,7 +55,7 @@ import {
   type FrictionSignal,
   type Nudge,
 } from './lib/presence'
-import { NEW_LISTING_LABEL, hasReviews } from './lib/rating'
+import { NEW_LISTING_KEY, hasReviews } from './lib/rating'
 import type {
   AssistantAction,
   AssistantContext,
@@ -68,12 +69,12 @@ import type {
 const initialMessage: AssistantMessage = {
   id: 'welcome',
   role: 'assistant',
-  text: 'Xin chào! I can turn a few preferences into a thoughtful Central Vietnam plan. I will check timing, travel fit, and availability before you book.',
+  text: { key: 'assistant.welcome' },
   products: [demoExperiences[0], demoExperiences[1], demoExperiences[5]],
   actions: [
     {
       type: 'APPLY_FILTER',
-      label: 'Show family favourites',
+      label: { key: 'assistant.action.familyFavourites' },
       value: 'family',
     },
   ],
@@ -125,10 +126,10 @@ const emptyAdvanced: AdvancedFilters = {
 }
 
 const durationChoices = [
-  { label: 'Up to 2 hours', value: 120 },
-  { label: 'Up to 4 hours', value: 240 },
-  { label: 'Up to a full day', value: 600 },
-]
+  { key: 'filter.duration.120', value: 120 },
+  { key: 'filter.duration.240', value: 240 },
+  { key: 'filter.duration.600', value: 600 },
+] as const
 
 const ratingChoices = [4.0, 4.5, 4.8]
 
@@ -294,8 +295,19 @@ function App() {
         // fetches; leaving them pointing at a language the page is not
         // showing would make the next request disagree with the screen.
         setPreferredLocale(previousPreference)
-        void api.setLocale(previous).catch(() => undefined)
-        setAppError(translate(previous, 'error.localeSwitch'))
+        try {
+          // Awaited rather than fired and forgotten: `finally` re-enables the
+          // switcher, and re-enabling it while the session is still set to the
+          // language we failed to switch to lets the next attempt start from a
+          // server state nobody has seen.
+          await api.setLocale(previous)
+          setAppError(translate(previous, 'error.localeSwitch'))
+        } catch {
+          // The rollback failed too, so the session's language is now unknown
+          // and the page cannot restore it. Only a reload re-derives it from
+          // the server, so say that rather than inviting another attempt.
+          setAppError(translate(previous, 'error.localeSession'))
+        }
       } finally {
         if (generation === localeGeneration.current) setSwitchingLocale(false)
       }
@@ -549,7 +561,7 @@ function App() {
         timestamp: new Date(),
       },
     ])
-    if (reason.prompt) void sendAssistantMessage(reason.prompt)
+    if (reason.prompt) void sendAssistantMessage(resolveText(locale, reason.prompt))
   }
 
   const runSearch = async (
@@ -588,22 +600,31 @@ function App() {
       if (announce && isConversationalQuery(searchQuery)) {
         const best = result.items.slice(0, 3)
         const relaxed = result.relaxedPreferences.length
-          ? ` I relaxed ${result.relaxedPreferences.join(', ')} to keep these bookable.`
+          ? t('assistant.relaxedSuffix', {
+              list: result.relaxedPreferences.join(', '),
+            })
           : ''
+        const announcement: LocalizedText = best.length
+          ? {
+              key: 'assistant.searchMatched',
+              vars: { query: searchQuery, relaxed },
+            }
+          : { key: 'assistant.searchNoMatch', vars: { query: searchQuery } }
         setMessages((current) => [
           ...current,
           {
             id: crypto.randomUUID(),
             role: 'assistant',
-            text: best.length
-              ? `I translated “${searchQuery}” into a few practical preferences. These have the strongest overall fit; I can compare them or shape them into a half-day plan.${relaxed}`
-              : `I could not find a live match for “${searchQuery}”. Try relaxing the destination, date, or activity preferences and I will search again.`,
+            text: announcement,
             products: best,
             actions: best[0]
               ? [
                   {
                     type: 'ADD_TO_CART',
-                    label: `Reserve ${best[0].title}`,
+                    label: {
+                      key: 'assistant.action.reserveNamed',
+                      vars: { title: best[0].title },
+                    },
                     experience_id: best[0].id,
                   },
                 ]
@@ -614,7 +635,7 @@ function App() {
         openAssistant()
       }
     } catch {
-      setAppError('Search could not reach the live catalog. Your current results are unchanged.')
+      setAppError(t('error.search'))
     } finally {
       setSearching(false)
     }
@@ -683,7 +704,10 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          text: `I could not reserve ${product.title} because its availability changed. Please choose another time or experience.`,
+          text: {
+            key: 'assistant.reserveFailed',
+            vars: { title: product.title },
+          },
           timestamp: new Date(),
         },
       ])
@@ -697,12 +721,15 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          text: `${product.title} is in your trip. I rechecked the selected option and price. You can review the complete booking without leaving our conversation.`,
+          text: {
+            key: 'assistant.addedToTrip',
+            vars: { title: product.title },
+          },
           products: [product],
           actions: [
             {
               type: 'START_CHECKOUT',
-              label: 'Review and purchase',
+              label: { key: 'assistant.action.reviewPurchase' },
             },
           ],
           timestamp: new Date(),
@@ -742,7 +769,8 @@ function App() {
     const userMessage: AssistantMessage = {
       id: crypto.randomUUID(),
       role: 'user',
-      text,
+      // The shopper's own words: already in their language, no key exists.
+      text: { raw: text },
       timestamp: new Date(),
     }
     setMessages((current) => [...current, userMessage])
@@ -777,7 +805,7 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          text: 'I could not reach the live catalog just now. Your cart is unchanged, so please try that request again.',
+          text: { key: 'assistant.catalogUnreachable' },
           timestamp: new Date(),
         },
       ])
@@ -883,7 +911,10 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          text: `I could not remove ${item.experience.title}. Refresh the cart and try again.`,
+          text: {
+            key: 'assistant.removeFailed',
+            vars: { title: item.experience.title },
+          },
           timestamp: new Date(),
         },
       ])
@@ -909,7 +940,10 @@ function App() {
       {
         id: crypto.randomUUID(),
         role: 'assistant',
-        text: `Booked! Your reference is ${confirmation.booking_reference}. I kept all vouchers together so they are easy to find on the day.`,
+        text: {
+          key: 'assistant.booked',
+          vars: { reference: confirmation.booking_reference },
+        },
         timestamp: new Date(),
       },
     ])
@@ -939,7 +973,10 @@ function App() {
           <a href="#discover">{t('app.nav.discover')}</a>
           <a href="#recommendations">{t('app.nav.curated')}</a>
           {assistantEnabled && (
-            <button onClick={() => openAssistant()}>
+            <button
+              data-testid="assistant-open"
+              onClick={() => openAssistant()}
+            >
               <Sparkles size={15} />
               {t('app.cta.askMai')}
             </button>
@@ -1299,7 +1336,7 @@ function App() {
                         }))
                       }
                     >
-                      {choice.label}
+                      {t(choice.key)}
                     </button>
                   ))}
                 </div>
@@ -1591,7 +1628,7 @@ function App() {
         <div className={`assistant-fab-dock ${nudge ? 'nudged' : ''}`}>
           {nudge && (
             <div className="assistant-nudge" role="status">
-              <p>{nudge.label}</p>
+              <p>{resolveText(locale, nudge.label)}</p>
               <button
                 className="nudge-dismiss"
                 aria-label={t('app.a11y.dismissSuggestion')}
@@ -1732,7 +1769,7 @@ function App() {
                   </>
                 ) : (
                   <span>
-                    {NEW_LISTING_LABEL} · {t('app.detail.noReviews')}
+                    {t(NEW_LISTING_KEY)} · {t('app.detail.noReviews')}
                   </span>
                 )}
               </div>

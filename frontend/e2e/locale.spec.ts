@@ -211,3 +211,29 @@ test('a failed switch does not leave the preference ahead of the page', async ({
     'vi',
   )
 })
+
+test('the assistant speaks the shopper\'s language before the service replies', async ({
+  page,
+}) => {
+  // The regression this exists for: the coverage gate reported Vietnamese
+  // complete while every line the *client* composes - the greeting, the
+  // nudges, the error replies - was still English, because it was written in
+  // `.ts` modules and object literals rather than in markup. A dictionary the
+  // gate can see is not the same as an interface the shopper can read.
+  await page.route('**/api/v1/session/context', (route) =>
+    route.fulfill({ json: bootstrap(['en', 'vi'], 'vi') }),
+  )
+  await page.goto('/')
+  await page.getByTestId('assistant-open').click()
+
+  const assistant = page.getByRole('dialog')
+  await expect(assistant).toBeVisible()
+  // Asserted on the Vietnamese text rather than on "not the English string":
+  // an empty panel would satisfy the negative form.
+  await expect(
+    assistant.getByText('Xin chào! Chỉ với một vài sở thích'),
+  ).toBeVisible()
+  await expect(
+    assistant.getByRole('button', { name: 'Xem lựa chọn cho gia đình' }),
+  ).toBeVisible()
+})

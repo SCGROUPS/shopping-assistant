@@ -1,3 +1,5 @@
+import type { LocalizedText } from './lib/i18n'
+
 export type ExperienceOption = {
   id: string
   name: string
@@ -110,7 +112,7 @@ export type AssistantAction = {
     | 'PREPARE_CHECKOUT'
     | 'CONFIRM_SIMULATED_CHECKOUT'
     | 'VIEW_VOUCHER'
-  label: string
+  label: LocalizedText
   experience_id?: string
   option_id?: string
   slot_id?: string
@@ -120,7 +122,7 @@ export type AssistantAction = {
 export type AssistantMessage = {
   id: string
   role: 'assistant' | 'user'
-  text: string
+  text: LocalizedText
   products?: Experience[]
   actions?: AssistantAction[]
   filters?: SearchFilters

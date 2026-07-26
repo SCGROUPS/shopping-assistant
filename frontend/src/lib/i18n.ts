@@ -233,6 +233,70 @@ const en = {
     'The live Vietra service is unavailable. Please try again shortly.',
   'error.localeSwitch':
     'We could not switch languages just now. Please try again.',
+  'error.search':
+    'Search could not reach the live catalog. Your current results are unchanged.',
+  'error.localeSession':
+    'We could not restore your language settings. Please reload the page.',
+
+  'product.newListing': 'Newly listed',
+
+  'filter.duration.120': 'Up to 2 hours',
+  'filter.duration.240': 'Up to 4 hours',
+  'filter.duration.600': 'Up to a full day',
+
+  // Messages the client composes itself. Anything the assistant *service*
+  // returns is already in the shopper's language and is carried as `raw`.
+  'assistant.welcome':
+    'Xin chào! I can turn a few preferences into a thoughtful Central Vietnam plan. I will check timing, travel fit, and availability before you book.',
+  'assistant.defaultReply': 'I found a few experiences that fit.',
+  'assistant.reserveFailed':
+    'I could not reserve {title} because its availability changed. Please choose another time or experience.',
+  'assistant.addedToTrip':
+    '{title} is in your trip. I rechecked the selected option and price. You can review the complete booking without leaving our conversation.',
+  'assistant.catalogUnreachable':
+    'I could not reach the live catalog just now. Your cart is unchanged, so please try that request again.',
+  'assistant.removeFailed':
+    'I could not remove {title}. Refresh the cart and try again.',
+  'assistant.booked':
+    'Booked! Your reference is {reference}. I kept all vouchers together so they are easy to find on the day.',
+
+  'assistant.action.familyFavourites': 'Show family favourites',
+  'assistant.action.reviewPurchase': 'Review and purchase',
+  'assistant.action.addToCart': 'Add to trip',
+  'assistant.action.checkAvailability': 'Check times',
+  'assistant.action.prepareCheckout': 'Review checkout',
+  'assistant.action.confirmSimulated': 'Confirm demo purchase',
+  'assistant.action.viewVoucher': 'View voucher',
+  'assistant.action.continue': 'Continue',
+  'assistant.action.addNamed': 'Add {title}',
+  'assistant.action.reserveNamed': 'Reserve {title}',
+  'assistant.searchMatched':
+    'I translated “{query}” into a few practical preferences. These have the strongest overall fit; I can compare them or shape them into a half-day plan.{relaxed}',
+  'assistant.searchNoMatch':
+    'I could not find a live match for “{query}”. Try relaxing the destination, date, or activity preferences and I will search again.',
+  'assistant.relaxedSuffix':
+    ' I relaxed {list} to keep these bookable.',
+
+  'nudge.checkout.label': 'Questions before you book?',
+  'nudge.checkout.opener':
+    'You are at checkout. Ask me anything about cancellation, meeting points, or what to bring before you confirm.',
+  'nudge.clash.label': 'These two clash at {time} — want me to re-time one?',
+  'nudge.clash.opener':
+    '“{first}” and “{second}” overlap at {time}. I can move one to a later slot or another day.',
+  'nudge.clash.prompt': '{first} and {second} overlap. Can you re-time one?',
+  'nudge.zeroResults.label': 'Nothing matched — want me to widen the dates?',
+  'nudge.zeroResults.opener':
+    'Nothing was bookable with those constraints. I can widen the dates or drop the least important preference — your accessibility needs stay untouched.',
+  'nudge.zeroResults.prompt':
+    'Nothing matched. Can you widen my dates and try again?',
+  'nudge.comparison.label': 'Want me to compare these?',
+  'nudge.comparison.opener':
+    'You have looked at a few of these. I can compare them on price, timing, and what the day actually feels like.',
+  'nudge.comparison.prompt':
+    'Compare the experiences I have been looking at.',
+  'nudge.refinement.label': 'Narrowing this down? I can help.',
+  'nudge.refinement.opener':
+    'You have refined this a few times. Tell me what the day should feel like and I will do the narrowing for you.',
 } as const
 
 export type MessageKey = keyof typeof en
@@ -242,7 +306,17 @@ export type MessageKey = keyof typeof en
 // rather than blank. `missingKeys` below is what turns that from a silent
 // state into a reportable one, so the enablement gate can refuse a locale
 // whose chrome is not finished.
-type Dictionary = Partial<Record<MessageKey, string>>
+// The CLDR categories, not English's two. Deriving the whole key set from `en`
+// meant a dictionary could only ever hold `_one` and `_other`, so French
+// `_many` or Polish `_few` would be a type error in precisely the language
+// that needs them - the dictionary would be structurally unable to store the
+// correct translation. The *base* set still comes from English, so a key that
+// exists nowhere in the source is still rejected.
+type PluralCategory = 'zero' | 'one' | 'two' | 'few' | 'many' | 'other'
+type PluralKey = `${PluralBase}_${PluralCategory}`
+type DictionaryKey = MessageKey | PluralKey
+
+type Dictionary = Partial<Record<DictionaryKey, string>>
 
 const vi: Dictionary = {
   'nav.experiences': 'Trải nghiệm',
@@ -455,6 +529,70 @@ const vi: Dictionary = {
     'Dịch vụ Vietra hiện không khả dụng. Vui lòng thử lại sau giây lát.',
   'error.localeSwitch':
     'Chúng tôi chưa thể chuyển ngôn ngữ lúc này. Vui lòng thử lại.',
+  'error.search':
+    'Không thể kết nối tới kho trải nghiệm. Kết quả hiện tại của bạn không thay đổi.',
+  'error.localeSession':
+    'Chúng tôi không khôi phục được cài đặt ngôn ngữ. Vui lòng tải lại trang.',
+
+  'product.newListing': 'Mới đăng',
+
+  'filter.duration.120': 'Tối đa 2 giờ',
+  'filter.duration.240': 'Tối đa 4 giờ',
+  'filter.duration.600': 'Tối đa một ngày',
+
+  'assistant.welcome':
+    'Xin chào! Chỉ với một vài sở thích, tôi có thể dựng nên một hành trình miền Trung chu đáo. Tôi sẽ kiểm tra thời gian, mức độ phù hợp và tình trạng chỗ trước khi bạn đặt.',
+  'assistant.defaultReply': 'Tôi tìm được một vài trải nghiệm phù hợp.',
+  'assistant.reserveFailed':
+    'Tôi không thể giữ chỗ {title} vì tình trạng chỗ đã thay đổi. Vui lòng chọn khung giờ hoặc trải nghiệm khác.',
+  'assistant.addedToTrip':
+    'Đã thêm {title} vào hành trình của bạn. Tôi đã kiểm tra lại lựa chọn và giá. Bạn có thể xem toàn bộ đơn đặt ngay trong cuộc trò chuyện này.',
+  'assistant.catalogUnreachable':
+    'Tôi chưa kết nối được tới kho trải nghiệm. Giỏ hàng của bạn không thay đổi, vui lòng thử lại yêu cầu đó.',
+  'assistant.removeFailed':
+    'Tôi không thể xoá {title}. Hãy tải lại giỏ hàng và thử lại.',
+  'assistant.booked':
+    'Đã đặt xong! Mã đặt chỗ của bạn là {reference}. Tôi đã gom tất cả voucher lại một chỗ để bạn dễ tìm trong ngày đi.',
+
+  'assistant.action.familyFavourites': 'Xem lựa chọn cho gia đình',
+  'assistant.action.reviewPurchase': 'Xem lại và thanh toán',
+  'assistant.action.addToCart': 'Thêm vào hành trình',
+  'assistant.action.checkAvailability': 'Xem khung giờ',
+  'assistant.action.prepareCheckout': 'Xem lại thanh toán',
+  'assistant.action.confirmSimulated': 'Xác nhận đặt thử',
+  'assistant.action.viewVoucher': 'Xem voucher',
+  'assistant.action.continue': 'Tiếp tục',
+  'assistant.action.addNamed': 'Thêm {title}',
+  'assistant.action.reserveNamed': 'Giữ chỗ {title}',
+  'assistant.searchMatched':
+    'Tôi đã chuyển “{query}” thành một vài tiêu chí cụ thể. Đây là những lựa chọn phù hợp nhất; tôi có thể so sánh chúng hoặc sắp thành một lịch trình nửa ngày.{relaxed}',
+  'assistant.searchNoMatch':
+    'Tôi không tìm được lựa chọn nào còn chỗ cho “{query}”. Hãy thử nới lỏng điểm đến, ngày hoặc loại hoạt động, tôi sẽ tìm lại.',
+  'assistant.relaxedSuffix':
+    ' Tôi đã nới lỏng {list} để giữ được chỗ đặt.',
+
+  'nudge.checkout.label': 'Bạn có câu hỏi nào trước khi đặt không?',
+  'nudge.checkout.opener':
+    'Bạn đang ở bước thanh toán. Hãy hỏi tôi bất cứ điều gì về chính sách huỷ, điểm hẹn hoặc những thứ cần mang theo trước khi xác nhận.',
+  'nudge.clash.label': 'Hai hoạt động này trùng giờ lúc {time} — tôi đổi giờ một cái nhé?',
+  'nudge.clash.opener':
+    '“{first}” và “{second}” trùng nhau lúc {time}. Tôi có thể dời một hoạt động sang khung giờ muộn hơn hoặc sang ngày khác.',
+  'nudge.clash.prompt':
+    '{first} và {second} bị trùng giờ. Bạn đổi giúp tôi một cái được không?',
+  'nudge.zeroResults.label':
+    'Không có kết quả nào — tôi mở rộng khoảng ngày nhé?',
+  'nudge.zeroResults.opener':
+    'Không có lựa chọn nào còn chỗ với các điều kiện đó. Tôi có thể mở rộng khoảng ngày hoặc bỏ bớt tiêu chí ít quan trọng nhất — các nhu cầu hỗ trợ tiếp cận của bạn vẫn được giữ nguyên.',
+  'nudge.zeroResults.prompt':
+    'Không có kết quả nào. Bạn mở rộng khoảng ngày rồi thử lại giúp tôi nhé?',
+  'nudge.comparison.label': 'Bạn muốn tôi so sánh những lựa chọn này không?',
+  'nudge.comparison.opener':
+    'Bạn đã xem qua một vài lựa chọn. Tôi có thể so sánh chúng theo giá, thời gian và cảm nhận thực tế của cả ngày.',
+  'nudge.comparison.prompt':
+    'Hãy so sánh những trải nghiệm tôi vừa xem.',
+  'nudge.refinement.label': 'Bạn đang thu hẹp lựa chọn? Để tôi giúp nhé.',
+  'nudge.refinement.opener':
+    'Bạn đã lọc lại vài lần rồi. Hãy nói cho tôi biết bạn muốn ngày hôm đó như thế nào, tôi sẽ thu hẹp giúp bạn.',
 }
 
 const dictionaries: Record<string, Dictionary> = { en, vi }
@@ -488,6 +626,27 @@ export const translate = (
   vars?: MessageVars,
 ): string => interpolate(dictionaries[locale]?.[key] ?? en[key], vars)
 
+/**
+ * Text that has not been rendered yet, and therefore still has a language.
+ *
+ * The i18n build check reads TSX and can only see a string where it is written.
+ * It cannot follow one stored in an object, returned from a `.ts` module, or
+ * put into state and rendered three files away - which is how every nudge,
+ * error and assistant line escaped it. So the *type* carries the obligation
+ * instead: a field of this type accepts a dictionary key, or `raw` text that
+ * the writer is asserting is already in the shopper's language.
+ *
+ * `raw` exists because the assistant service answers in the shopper's language
+ * and that prose has no key. The build check flags a `raw` built from a string
+ * literal, so it cannot be used to smuggle English past the gate.
+ */
+export type LocalizedText =
+  | { key: MessageKey; vars?: MessageVars }
+  | { raw: string }
+
+export const resolveText = (locale: string, text: LocalizedText): string =>
+  'raw' in text ? text.raw : translate(locale, text.key, text.vars)
+
 // The bases of the counted messages, derived from the `_other` form every
 // language has. Typed from the dictionary so a mistyped base is a build error.
 export type PluralBase = {
@@ -507,12 +666,14 @@ export const translatePlural = (
   const category = pluralCategories(locale).includes('other')
     ? new Intl.PluralRules(bcp47(locale)).select(count)
     : 'other'
-  const dictionary = dictionaries[locale] ?? en
-  const key = `${base}_${category}` as MessageKey
+  const dictionary: Dictionary = dictionaries[locale] ?? en
+  const key = `${base}_${category}` as DictionaryKey
   const template =
     dictionary[key] ??
-    dictionary[`${base}_other` as MessageKey] ??
-    en[key] ??
+    dictionary[`${base}_other` as DictionaryKey] ??
+    // English cannot supply a category it does not have, so the fallback for a
+    // missing `_many` is English's `_other`, not a lookup that returns nothing.
+    en[key as MessageKey] ??
     en[`${base}_other` as MessageKey]
   return interpolate(template ?? base, { count, ...vars })
 }
@@ -535,7 +696,7 @@ export const missingKeys = (locale: string): string[] => {
   }
   for (const base of bases) {
     for (const category of pluralCategories(locale)) {
-      const key = `${base}_${category}` as MessageKey
+      const key = `${base}_${category}` as DictionaryKey
       if (!dictionary[key]) missing.push(key)
     }
   }

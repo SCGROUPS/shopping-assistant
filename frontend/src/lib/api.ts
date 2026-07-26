@@ -1,5 +1,6 @@
 import { demoExperiences } from '../data/demo'
 import { formatTime } from './format'
+import type { LocalizedText, MessageKey } from './i18n'
 import type {
   AssistantAction,
   ContentFieldMeta,
@@ -142,22 +143,36 @@ const allowDemoFallbackOrThrow = (error: unknown) => {
   throw error
 }
 
-const actionLabels: Record<string, string> = {
-  ADD_TO_CART: 'Add to trip',
-  CHECK_AVAILABILITY: 'Check times',
-  PREPARE_CHECKOUT: 'Review checkout',
-  CONFIRM_SIMULATED_CHECKOUT: 'Confirm demo purchase',
-  VIEW_VOUCHER: 'View voucher',
+// The service sends an action `type`; the words on the button are ours, so they
+// belong to the dictionary rather than to this map.
+const actionLabels: Record<string, MessageKey> = {
+  ADD_TO_CART: 'assistant.action.addToCart',
+  CHECK_AVAILABILITY: 'assistant.action.checkAvailability',
+  PREPARE_CHECKOUT: 'assistant.action.prepareCheckout',
+  CONFIRM_SIMULATED_CHECKOUT: 'assistant.action.confirmSimulated',
+  VIEW_VOUCHER: 'assistant.action.viewVoucher',
 }
+
+/**
+ * Prose the assistant service wrote, which is already in the shopper's language
+ * because the request carried their locale. It has no dictionary key and must
+ * not acquire one. When the service says nothing, the fallback is ours, so it
+ * does have a key.
+ */
+const assistantProse = (value: unknown): LocalizedText =>
+  typeof value === 'string' && value.trim()
+    ? { raw: value }
+    : { key: 'assistant.defaultReply' }
 
 const normalizeAssistantAction = (
   action: Record<string, unknown>,
 ): AssistantAction => ({
   type: String(action.type) as AssistantAction['type'],
-  label:
-    String(action.label ?? '') ||
-    actionLabels[String(action.type)] ||
-    'Continue',
+  // A label the service sent is prose it wrote in the shopper's language;
+  // anything we choose ourselves has to come from the dictionary.
+  label: action.label
+    ? { raw: String(action.label) }
+    : { key: actionLabels[String(action.type)] ?? 'assistant.action.continue' },
   experience_id: action.experience_id
     ? String(action.experience_id)
     : undefined,
@@ -661,10 +676,7 @@ export const api = {
       return {
         id: crypto.randomUUID(),
         role: 'assistant',
-        text:
-          (response.message as string) ??
-          (response.text as string) ??
-          'I found a few experiences that fit.',
+        text: assistantProse(response.message ?? response.text),
         products,
         actions,
         filters: statePatch.filters as SearchFilters | undefined,
@@ -672,50 +684,26 @@ export const api = {
       }
     } catch (error) {
       if (!conversationId.startsWith('demo-') || !ALLOW_DEMO_FALLBACK) throw error
-      const lower = text.toLowerCase()
-      let matches = visibleProducts.length ? visibleProducts : demoExperiences
-      let reply =
-        'I balanced your interests, travel time, availability, and guest ratings. These are the strongest options.'
-
-      if (lower.includes('wheelchair') || lower.includes('accessible')) {
-        matches = demoExperiences.filter(
-          (product) => product.accessibility_features?.length,
-        )
-        reply =
-          'These options publish accessibility details. Ba Na Hills has the strongest step-free route, while the cooking class is the easiest lower-energy choice.'
-      } else if (lower.includes('family') || lower.includes('child')) {
-        matches = demoExperiences.filter(
-          (product) => product.family_friendly,
-        )
-        reply =
-          'For families, I would prioritise short transfers, flexible cancellation, and experiences with natural breaks. The basket boat is the easiest win.'
-      } else if (lower.includes('food') || lower.includes('eat')) {
-        matches = demoExperiences.filter(
-          (product) => product.category === 'Food',
-        )
-        reply =
-          'These are the best hands-on food experiences. Choose the street-food walk for energy and variety, or the cooking class for a slower shared activity.'
-      } else if (lower.includes('rain') || lower.includes('indoor')) {
-        matches = demoExperiences.filter((product) =>
-          ['Wellness', 'Food'].includes(product.category),
-        )
-        reply =
-          'For wet weather, I would keep the plan flexible and mostly covered. This pairing gives you local flavour plus a restorative finish.'
-      } else if (lower.includes('checkout') || lower.includes('book')) {
-        reply =
-          'Your selection can be reserved now. I will recheck the price and time before opening the secure demo checkout.'
-      }
+      // This path exists so the demo renders with no backend. It deliberately
+      // does not interpret the shopper's words: keyword matching on `text` was
+      // a second, worse assistant that answered in English and disagreed with
+      // the real one. Understanding the request is the model's job, so with no
+      // model reachable this offers what is already on screen and says so.
+      const matches = visibleProducts.length ? visibleProducts : demoExperiences
 
       return {
         id: crypto.randomUUID(),
         role: 'assistant',
-        text: reply,
+        text: { key: 'assistant.defaultReply' },
         products: matches.slice(0, 3),
         actions: matches[0]
           ? [
               {
                 type: 'ADD_TO_CART',
-                label: `Add ${matches[0].title}`,
+                label: {
+                  key: 'assistant.action.addNamed',
+                  vars: { title: matches[0].title },
+                },
                 experience_id: matches[0].id,
               },
             ]

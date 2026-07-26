@@ -1,6 +1,7 @@
 import type { CartItem } from '../types'
 import { getResolvedLocale } from './api'
 import { formatDate } from './format'
+import type { LocalizedText } from './i18n'
 
 /**
  * Assistant presence rules — see docs/SYSTEM_DESIGN.md §8.
@@ -20,11 +21,11 @@ export type FrictionSignal =
 export type Nudge = {
   signal: FrictionSignal
   /** One line shown on the launcher. Never opens the panel by itself. */
-  label: string
+  label: LocalizedText
   /** The assistant's opening line once the shopper accepts the offer. */
-  opener: string
+  opener: LocalizedText
   /** Pre-filled message sent on behalf of the shopper, when one makes sense. */
-  prompt?: string
+  prompt?: LocalizedText
 }
 
 export type PresenceState = {
@@ -101,9 +102,8 @@ export function detectFriction(state: PresenceState): Nudge | null {
   if (state.checkoutOpen) {
     return {
       signal: 'checkout-hesitation',
-      label: 'Questions before you book?',
-      opener:
-        'You are at checkout. Ask me anything about cancellation, meeting points, or what to bring before you confirm.',
+      label: { key: 'nudge.checkout.label' },
+      opener: { key: 'nudge.checkout.opener' },
     }
   }
 
@@ -112,38 +112,48 @@ export function detectFriction(state: PresenceState): Nudge | null {
     const [first, second] = clash
     return {
       signal: 'schedule-clash',
-      label: `These two clash at ${clockTime(first)} — want me to re-time one?`,
-      opener: `“${first.experience.title}” and “${second.experience.title}” overlap at ${clockTime(first)}. I can move one to a later slot or another day.`,
-      prompt: `${first.experience.title} and ${second.experience.title} overlap. Can you re-time one?`,
+      label: { key: 'nudge.clash.label', vars: { time: clockTime(first) } },
+      opener: {
+        key: 'nudge.clash.opener',
+        vars: {
+          first: first.experience.title,
+          second: second.experience.title,
+          time: clockTime(first),
+        },
+      },
+      prompt: {
+        key: 'nudge.clash.prompt',
+        vars: {
+          first: first.experience.title,
+          second: second.experience.title,
+        },
+      },
     }
   }
 
   if (state.hasSearched && state.resultCount === 0) {
     return {
       signal: 'zero-results',
-      label: 'Nothing matched — want me to widen the dates?',
-      opener:
-        'Nothing was bookable with those constraints. I can widen the dates or drop the least important preference — your accessibility needs stay untouched.',
-      prompt: 'Nothing matched. Can you widen my dates and try again?',
+      label: { key: 'nudge.zeroResults.label' },
+      opener: { key: 'nudge.zeroResults.opener' },
+      prompt: { key: 'nudge.zeroResults.prompt' },
     }
   }
 
   if (state.viewedCount >= 3) {
     return {
       signal: 'comparison',
-      label: 'Want me to compare these?',
-      opener:
-        'You have looked at a few of these. I can compare them on price, timing, and what the day actually feels like.',
-      prompt: 'Compare the experiences I have been looking at.',
+      label: { key: 'nudge.comparison.label' },
+      opener: { key: 'nudge.comparison.opener' },
+      prompt: { key: 'nudge.comparison.prompt' },
     }
   }
 
   if (state.refinementsSinceEngagement >= 3) {
     return {
       signal: 'refinement-loop',
-      label: 'Narrowing this down? I can help.',
-      opener:
-        'You have refined this a few times. Tell me what the day should feel like and I will do the narrowing for you.',
+      label: { key: 'nudge.refinement.label' },
+      opener: { key: 'nudge.refinement.opener' },
     }
   }
 
