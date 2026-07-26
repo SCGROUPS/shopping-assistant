@@ -827,10 +827,16 @@ class AzureOpenAIProvider:
                     "schema": schema,
                 }
             },
-            # The floor this model offers - "minimal" is nano's word and mini
-            # rejects it outright. Extraction is a transcription job against a
-            # strict schema, so there is nothing here worth spending reasoning
-            # tokens on.
+            # Effort values are per-model and the two we run disagree: "minimal"
+            # is accepted by gpt-5-nano and rejected by gpt-5.4-*, and "none" is
+            # the exact reverse. So this line is only correct in company with the
+            # deployment name declared in infra/bicep/main.bicep, and a change to
+            # either alone takes intent extraction down. It has happened twice.
+            # Both times the failure was invisible: extract_intent raises, search
+            # falls back to deterministic parsing, and the endpoint answers HTTP
+            # 200 with a full page of unfiltered products, because that is also
+            # what it does when it understands nothing. test_intent_request_shape
+            # pins the two files together so neither can move on its own.
             reasoning={"effort": "none"},
             max_output_tokens=800,
         )

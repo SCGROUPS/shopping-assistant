@@ -145,6 +145,14 @@ jobs:
           AZURE_POSTGRES_LOCATION: centralus
         run: ./scripts/deploy.sh
 
+      # Runs before the browser journeys because it is the cheaper question and
+      # the more fundamental one. The journeys drive the storefront and pass so
+      # long as products render, which they do even when the service has stopped
+      # understanding requests entirely - that is exactly how a total intent
+      # failure survived a deploy and days of green pipelines.
+      - name: Verify the deployment still understands requests
+        run: python3 backend/scripts/smoke_deployment.py "${{ steps.deploy.outputs.app_url }}"
+
       - uses: pnpm/action-setup@v4
         with:
           version: 10.26.2
