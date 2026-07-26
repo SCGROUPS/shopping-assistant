@@ -4,8 +4,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.common.locales import DEFAULT_LOCALE
-
 ParticipantType = Literal["adult", "child", "infant", "senior", "student"]
 
 
@@ -150,7 +148,11 @@ class ExperienceCard(BaseModel):
     # client that ignores this keeps working, and one that reads it can label
     # a description that fell back to English or has gone stale. A client that
     # cannot tell fallback from translation cannot tell us either.
-    locale: str = DEFAULT_LOCALE
+    #
+    # Required, with no default. A default of English is indistinguishable
+    # from "whoever built this card forgot to say", and the second one is a
+    # mistranslation reported to nobody.
+    locale: str
     content_meta: dict[str, ContentFieldMeta] = Field(default_factory=dict)
 
 
@@ -184,18 +186,18 @@ class SearchResponse(BaseModel):
     # On the envelope, not only on the cards. Zero results is exactly the case
     # where a client most needs to know which corpus was searched, and exactly
     # the case where there is no card to carry it.
-    locale: str = DEFAULT_LOCALE
+    locale: str
 
 
 class ExperienceListResponse(BaseModel):
     items: list[ExperienceCard]
     total: int
-    locale: str = DEFAULT_LOCALE
+    locale: str
 
 
 class RecommendationResponse(BaseModel):
     items: list[ExperienceCard]
-    locale: str = DEFAULT_LOCALE
+    locale: str
 
 
 class EventRequest(BaseModel):

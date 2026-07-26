@@ -24,6 +24,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.common.field_policy import fields_never_served_stale
 from app.common.locales import DEFAULT_LOCALE, fallback_chain
 from app.common.models import Experience, ExperienceTranslation, TranslationField
 
@@ -47,12 +48,11 @@ TRANSLATED_FIELDS: tuple[str, ...] = (
 PROVENANCE_SOURCE = "source"
 PROVENANCE_UNKNOWN = "unknown"
 
-# Fields where showing text that describes a previous version of the product is
-# worse than showing the current text in the wrong language. Meeting directions
-# are operational data: a stale one sends a traveller to a place the tour no
-# longer departs from, and "it was in Vietnamese" is not the complaint that
-# generates. Prose can be a day behind; an address cannot.
-CURRENT_ONLY_FIELDS: frozenset[str] = frozenset({"meeting_point"})
+# Which fields refuse stale text is decided in `common/field_policy.py`, beside
+# the decision about which fields need review, because both answer "what
+# happens if this string is wrong?" and holding them apart is how a field ends
+# up review-gated *and* stale-served - a combination nobody would choose.
+CURRENT_ONLY_FIELDS: frozenset[str] = fields_never_served_stale()
 
 
 @dataclass(frozen=True)

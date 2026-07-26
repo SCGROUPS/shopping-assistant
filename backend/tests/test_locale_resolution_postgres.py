@@ -8,21 +8,27 @@ proves it stays shared.
 """
 
 import os
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
 import pytest
 from conftest import create_postgres_schema, reset_postgres
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.cart.service import CartService
 from app.catalog import indexing
 from app.common.config import Settings, get_settings
 from app.common.locales import negotiate_locale, parse_accept_language
 from app.common.models import (
+    Cart,
+    CartItem,
     Destination,
     Experience,
+    ExperienceOption,
     ExperienceTranslation,
+    ShoppingSession,
     Supplier,
     TranslationField,
 )
@@ -33,6 +39,7 @@ from app.common.resolution import (
     resolution_chain,
     resolve_experience_text,
 )
+from app.content import coverage
 from app.content.enqueue import enqueue_experience_translations
 
 DATABASE_URL = os.getenv("POSTGRES_TEST_DATABASE_URL")
@@ -661,3 +668,188 @@ async def test_the_assistant_searches_the_locale_the_request_resolved(api_client
     assert all(item == "vi" for item in seen), (
         f"the assistant searched {seen}, not the locale the request resolved"
     )
+
+
+async def test_falling_back_to_english_is_not_counted_as_korean_coverage(factory):
+    """A shopper who reads English text has not been served Korean.
+
+    Korean has had no job enqueued and no translation published, so every
+    field resolves to the English source. Counting a resolved, non-empty
+    string as coverage would report this catalogue ready for Korean.
+    """
+    async with factory() as session:
+        reports = await coverage.locale_coverage(session, ("ko",))
+
+    [korean] = reports
+    assert korean.totals().translated == 0
+    assert korean.as_dict()["overall"]["percent"] == 0.0
+    # And the fields are not absent: they fell back to the English source,
+    # which is what a Korean shopper would actually be shown.
+    assert korean.as_dict()["fields"]["title"]["fallback"] == 1
+
+
+async def test_an_empty_catalogue_reports_zero_percent_not_a_hundred(factory):
+    """`0 of 0` is arithmetically undefined and operationally dangerous.
+
+    Guarding it by returning 100 - or by letting a naive `part/whole` raise and
+    be caught into a default - makes a locale with nothing in it pass the gate
+    designed to catch exactly that. Zero is the honest answer: no experience
+    has been translated, because there is no experience.
+    """
+    async with factory() as session:
+        await session.execute(delete(Experience).where(Experience.id == EXPERIENCE_ID))
+        await session.commit()
+
+    async with factory() as session:
+        [report] = await coverage.locale_coverage(session, ("vi",))
+
+    assert report.experiences == 0
+    assert report.as_dict()["overall"]["total"] == 0
+    assert report.as_dict()["overall"]["percent"] == 0.0
+
+
+async def test_coverage_counts_a_blank_field_as_missing_not_translated(factory):
+    """A blank is content nobody wrote; a fallback is a translation not yet done.
+
+    Merging them lets a catalogue of empty meeting points report itself fully
+    covered, and the two need entirely different work to fix.
+    """
+    async with factory() as session:
+        await session.execute(
+            update(Experience).where(Experience.id == EXPERIENCE_ID).values(meeting_point="")
+        )
+        await session.commit()
+
+    async with factory() as session:
+        [report] = await coverage.locale_coverage(session, ("vi",))
+
+    assert report.as_dict()["fields"]["meeting_point"]["missing"] == 1
+    assert report.as_dict()["fields"]["meeting_point"]["translated"] == 0
+    assert report.as_dict()["fields"]["meeting_point"]["fallback"] == 0
+
+
+async def test_coverage_reports_a_published_translation_as_translated(factory):
+    await _publish(
+        factory,
+        "vi",
+        title="Đi bộ đèn lồng Hội An",
+        short_description="Đi bộ buổi tối",
+        description="Một chuyến đi bộ có hướng dẫn.",
+        meeting_point="Chùa Cầu",
+    )
+
+    async with factory() as session:
+        [report] = await coverage.locale_coverage(session, ("vi",))
+
+    overall = report.as_dict()["overall"]
+    assert overall["translated"] == 4
+    assert overall["fallback"] == 0
+    assert overall["percent"] == 100.0
+
+
+async def test_coverage_agrees_with_the_page_about_a_stale_meeting_point(factory):
+    """Coverage is measured through the resolver, so policy cannot diverge.
+
+    `meeting_point` refuses stale text and falls back to the source. A separate
+    SQL predicate over `translation_fields` would call that row `current` and
+    report Vietnamese fully covered, while the Vietnamese page shows English
+    directions. Counting what the resolver returned is what keeps the two
+    answers the same answer.
+    """
+    await _publish(
+        factory,
+        "vi",
+        title="Đi bộ đèn lồng Hội An",
+        short_description="Đi bộ buổi tối",
+        description="Một chuyến đi bộ có hướng dẫn.",
+        meeting_point="Chùa Cầu",
+    )
+    async with factory() as session:
+        await session.execute(
+            update(Experience)
+            .where(Experience.id == EXPERIENCE_ID)
+            .values(meeting_point="Tan Ky House", title="Hoi An lantern walk at dusk")
+        )
+        await enqueue_experience_translations(session, EXPERIENCE_ID, locales=["vi"])
+        await session.commit()
+
+    async with factory() as session:
+        [report] = await coverage.locale_coverage(session, ("vi",))
+
+    fields = report.as_dict()["fields"]
+    assert fields["meeting_point"]["fallback"] == 1
+    assert fields["meeting_point"]["translated"] == 0
+    # Both source strings moved, so both translations are stale. Prose is still
+    # served in Vietnamese and counted as covered, because the alternative -
+    # falling back on every edit - blanks a whole locale until the worker
+    # catches up. Only the meeting point refuses.
+    assert fields["title"]["translated"] == 1
+    assert fields["title"]["stale"] == 1
+    assert report.queued >= 1
+
+
+async def test_the_checkout_review_names_products_in_the_shopper_s_language(factory):
+    """The cart was localised; checkout preparation was not.
+
+    `validate_db` defaulted its locale to English, and `/checkout/prepare`
+    simply did not pass one - so a Vietnamese shopper read a Vietnamese cart
+    and then paid against an English one. "Is this the thing I chose?" is the
+    worst question to raise at the moment of payment, which is the whole
+    reason the cart resolves titles at all.
+
+    The locale is now a required keyword argument rather than a defaulted one,
+    so the next call site that forgets fails to type-check instead of quietly
+    switching language mid-purchase. This test covers the behaviour; the
+    signature covers the ones nobody has written yet.
+    """
+    await _publish(factory, "vi", title="Đi bộ đèn lồng Hội An")
+
+    option_id, cart_id, session_row_id = uuid4(), uuid4(), None
+    async with factory() as session:
+        shopping_session = ShoppingSession(anonymous_id=f"cart-locale-{uuid4()}", currency="VND")
+        session.add(shopping_session)
+        await session.flush()
+        session_row_id = shopping_session.id
+        session.add(
+            ExperienceOption(
+                id=option_id,
+                experience_id=EXPERIENCE_ID,
+                external_id="opt-1",
+                name="Standard",
+                description="Standard entry",
+                validity_type="fixed",
+                confirmation_type="instant",
+                cancellation_policy_code="flex",
+            )
+        )
+        session.add(Cart(id=cart_id, session_id=shopping_session.id, currency="VND"))
+        await session.flush()
+        session.add(
+            CartItem(
+                cart_id=cart_id,
+                experience_id=EXPERIENCE_ID,
+                option_id=option_id,
+                participants=[{"type": "adult", "count": 2}],
+                unit_prices=[
+                    {
+                        "participant_type": "adult",
+                        "amount": "100000",
+                        "currency": "VND",
+                    }
+                ],
+                quantity=2,
+                quoted_total=Decimal("200000"),
+                quote_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+    carts = CartService()
+    async with factory() as session:
+        _cart, vietnamese = await carts.validate_db(session, session_row_id, locale="vi")
+        _cart, english = await carts.validate_db(session, session_row_id, locale="en")
+
+    assert vietnamese.items[0].experience_title == "Đi bộ đèn lồng Hội An"
+    # The English request must still get English, or the test would pass on a
+    # service that ignored the argument and always returned Vietnamese.
+    assert english.items[0].experience_title == "Hoi An lantern walk"

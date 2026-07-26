@@ -33,6 +33,7 @@ from app.common.database import session_factory
 from app.common.errors import ApiError
 from app.common.models import Operator
 from app.common.runtime_config import get_value
+from app.content import coverage as translation_coverage
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
 
@@ -134,6 +135,28 @@ async def audit_trail(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> dict[str, Any]:
     return {"entries": await catalog_ops.recent_audit(limit, entity_id)}
+
+
+@router.get("/translations")
+async def translation_coverage_report(
+    principal: ReadAccess,
+    locale: str | None = None,
+) -> dict[str, Any]:
+    """Per-locale readiness, measured by resolving as a shopper would.
+
+    This is the gate for enabling a locale (spec 12, step 6). It reports
+    `fallback` separately from `missing` because they need different work: a
+    fallback is a translation that has not happened yet, and a blank is content
+    an operator never wrote. Enabling a locale on the strength of a number that
+    merged the two would ship a storefront of empty meeting points.
+    """
+    if session_factory is None:
+        raise ApiError(503, "Unavailable", "Database is not configured", "coverage-unavailable")
+    wanted = (locale,) if locale else None
+    async with session_factory() as session:
+        reports = await translation_coverage.locale_coverage(session, wanted)
+        spend = await translation_coverage.spend_today(session)
+    return {"locales": [item.as_dict() for item in reports], "spend": spend}
 
 
 @router.get("/settings")

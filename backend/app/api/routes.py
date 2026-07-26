@@ -44,7 +44,7 @@ from app.common.config import get_settings
 from app.common.database import database_ready
 from app.common.errors import ApiError
 from app.common.llm_cost import ledger
-from app.common.locales import canonical_locale, negotiate_locale
+from app.common.locales import DEFAULT_LOCALE, canonical_locale, negotiate_locale
 from app.common.models import BehaviorEvent
 from app.common.persistence import (
     catalog_products,
@@ -86,6 +86,7 @@ async def search(
     await _capture(
         session_id,
         EventRequest(event_type="search_submitted", query_id=result.query_id),
+        chosen,
     )
     return result
 
@@ -127,6 +128,7 @@ async def experience_detail(
     await _capture(
         session_id,
         EventRequest(event_type="experience_viewed", experience_id=experience_id),
+        locale,
     )
     return product_detail(product)
 
@@ -134,13 +136,16 @@ async def experience_detail(
 @router.get("/experiences/{experience_id}/availability")
 async def availability(
     experience_id: UUID,
+    locale: RequestLocale,
     visit_start: datetime | None = None,
     session_id: SessionHeader = "demo-session",
 ) -> dict[str, Any]:
-    product = await get_product_async(experience_id)
+    product = await get_product_async(experience_id, locale=locale)
     detail = product_detail(product, visit_start)
     await _capture(
-        session_id, EventRequest(event_type="availability_checked", experience_id=experience_id)
+        session_id,
+        EventRequest(event_type="availability_checked", experience_id=experience_id),
+        locale,
     )
     return {
         "experience_id": experience_id,
@@ -230,10 +235,8 @@ async def conversation_message(
         else "text/event-stream" in http_request.headers.get("accept", "").casefold()
     )
     if not wants_stream:
-        response = await assistant_service.respond(
-            conversation_id, session_id, body, locale=locale
-        )
-        await _capture(session_id, EventRequest(event_type="assistant_message_sent"))
+        response = await assistant_service.respond(conversation_id, session_id, body, locale=locale)
+        await _capture(session_id, EventRequest(event_type="assistant_message_sent"), locale)
         return JSONResponse(jsonable_encoder(response))
 
     async def events():
@@ -245,6 +248,7 @@ async def conversation_message(
             await _capture(
                 session_id,
                 EventRequest(event_type="assistant_message_sent"),
+                locale,
             )
             yield _sse("text_delta", {"delta": response.message})
             if response.products:
@@ -274,9 +278,7 @@ async def conversation_message(
 
 
 @router.get("/cart", response_model=CartView)
-async def get_cart(
-    locale: RequestLocale, session_id: SessionHeader = "demo-session"
-) -> CartView:
+async def get_cart(locale: RequestLocale, session_id: SessionHeader = "demo-session") -> CartView:
     return await cart_service.get_cart(session_id, locale)
 
 
@@ -291,6 +293,7 @@ async def add_cart_item(
     await _capture(
         session_id,
         EventRequest(event_type="cart_item_added", experience_id=request.experience_id),
+        locale,
     )
     return result
 
@@ -307,10 +310,11 @@ async def remove_cart_item(
 
 @router.post("/checkout/prepare", response_model=CheckoutPrepareResponse)
 async def prepare_checkout(
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
 ) -> CheckoutPrepareResponse:
-    cart = await cart_service.validate(session_id)
-    await _capture(session_id, EventRequest(event_type="checkout_started"))
+    cart = await cart_service.validate(session_id, locale)
+    await _capture(session_id, EventRequest(event_type="checkout_started"), locale)
     return CheckoutPrepareResponse(
         cart=cart,
         ready=True,
@@ -322,17 +326,19 @@ async def prepare_checkout(
 async def confirm_checkout(
     request: CheckoutConfirmRequest,
     idempotency_key: IdempotencyHeader,
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
 ) -> BookingView:
     # Read the cart before confirming: confirmation clears it, and a booking
     # event with no experience attached is invisible to demand stats, so the
     # highest-weight signal in the product would never reach ranking.
-    cart = await cart_service.get_cart(session_id)
+    cart = await cart_service.get_cart(session_id, locale)
     booked = [item.experience_id for item in cart.items]
     booking = await booking_service.confirm(
         session_id,
         idempotency_key=idempotency_key,
         customer_details=request.customer_details,
+        locale=locale,
     )
     for experience_id in booked or [None]:
         await _capture(
@@ -343,6 +349,7 @@ async def confirm_checkout(
                 placement=request.placement,
                 properties={"booking_reference": booking.booking_reference},
             ),
+            locale,
         )
     return booking
 
@@ -448,7 +455,11 @@ async def set_session_locale(
                 LOCALE_PREFERENCE_KEY: chosen,
             }
             await db.commit()
-    return {"locale": chosen, "requested": body.locale, "enabled_locales": list(settings.enabled_locales)}
+    return {
+        "locale": chosen,
+        "requested": body.locale,
+        "enabled_locales": list(settings.enabled_locales),
+    }
 
 
 @router.get("/analytics/funnel")
@@ -479,7 +490,16 @@ async def api_health() -> dict[str, Any]:
     }
 
 
-async def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
+async def _capture(
+    session_id: str, request: EventRequest, locale: str = DEFAULT_LOCALE
+) -> dict[str, Any]:
+    """Record an event, always stamped with the locale it happened in.
+
+    Stamped here rather than at each call site because a locale recorded on
+    nine events out of ten is worse than none: the tenth looks like English
+    traffic, and the conclusion drawn from the mix - "nobody uses Korean" - is
+    the one that gets a locale switched off.
+    """
     allowed = {
         "search_submitted",
         "search_results_viewed",
@@ -510,6 +530,7 @@ async def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
         for key, value in request.properties.items()
         if key.casefold() not in {"message", "text", "email", "phone", "name"}
     }
+    safe_properties.setdefault("locale", locale)
     if not database_mode():
         event = {
             "id": len(store.events) + 1,

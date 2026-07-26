@@ -842,6 +842,7 @@ class AssistantService:
                 participants=participants,
             ),
             f"assistant-{conversation['id']}-{await self._conversation_message_count(conversation['id'])}",
+            self._locale(conversation),
         )
         conversation["state"]["pending_action"] = None
         party_label = ", ".join(
@@ -865,7 +866,7 @@ class AssistantService:
     async def _prepare_checkout(
         self, conversation: dict[str, Any], session_id: str
     ) -> AssistantResponse:
-        cart = await self.carts.validate(session_id)
+        cart = await self.carts.validate(session_id, self._locale(conversation))
         conversation["state"]["pending_action"] = "CONFIRM_CHECKOUT"
         return AssistantResponse(
             message=(
@@ -893,6 +894,7 @@ class AssistantService:
         booking = await self.bookings.confirm(
             session_id,
             idempotency_key=f"assistant-checkout-{conversation['id']}",
+            locale=self._locale(conversation),
         )
         conversation["state"]["pending_action"] = None
         return AssistantResponse(

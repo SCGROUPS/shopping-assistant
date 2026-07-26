@@ -273,18 +273,27 @@ class CartService:
             )
             return response
 
-    async def validate(self, session_id: str) -> CartView:
+    async def validate(self, session_id: str, locale: str = DEFAULT_LOCALE) -> CartView:
         if not database_mode():
             return self._demo_validate(session_id)
         factory = require_session_factory()
         async with factory() as db, db.begin():
             shopping_session = await ensure_session(db, session_id)
-            _cart, view = await self.validate_db(db, shopping_session.id)
+            _cart, view = await self.validate_db(db, shopping_session.id, locale=locale)
             return view
 
     async def validate_db(
-        self, db, shopping_session_id: UUID, *, lock_slots: bool = False
+        self, db, shopping_session_id: UUID, *, locale: str, lock_slots: bool = False
     ) -> tuple[Cart, CartView]:
+        """`locale` is required and keyword-only, deliberately.
+
+        The previous signature defaulted it to English, and the checkout path
+        simply did not pass it: a shopper read a Vietnamese cart and then paid
+        against an English one, which is precisely the moment "is this what I
+        chose?" must not arise. A default here cannot distinguish "English was
+        requested" from "nobody said", so it is gone, and a future call site
+        that forgets is a type error rather than a quiet mistranslation.
+        """
         cart = await self._active_cart(db, shopping_session_id)
         if cart is None:
             raise ApiError(
@@ -324,7 +333,7 @@ class CartService:
                         "A selected experience is no longer available",
                         "cart-revalidation",
                     )
-        return cart, await self._db_view(db, cart)
+        return cart, await self._db_view(db, cart, locale)
 
     async def _active_cart(self, db, shopping_session_id: UUID) -> Cart | None:
         return await db.scalar(
@@ -353,7 +362,7 @@ class CartService:
         )
         return CartView.model_validate(record.response) if record else None
 
-    async def _db_view(self, db, cart: Cart, locale: str = DEFAULT_LOCALE) -> CartView:
+    async def _db_view(self, db, cart: Cart, locale: str) -> CartView:
         rows = await db.execute(
             select(CartItem, Experience, ExperienceOption.name)
             .join(Experience, Experience.id == CartItem.experience_id)

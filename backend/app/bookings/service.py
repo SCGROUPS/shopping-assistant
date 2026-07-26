@@ -11,6 +11,7 @@ from sqlalchemy import select
 from app.api.schemas import BookingView, VoucherView
 from app.cart.service import CartService
 from app.common.errors import ApiError
+from app.common.locales import DEFAULT_LOCALE
 from app.common.models import (
     AvailabilitySlot,
     Booking,
@@ -45,6 +46,7 @@ class BookingService:
         *,
         idempotency_key: str,
         customer_details: dict[str, str] | None = None,
+        locale: str = DEFAULT_LOCALE,
     ) -> BookingView:
         if not database_mode():
             return self._demo_confirm(
@@ -69,7 +71,7 @@ class BookingService:
                 return BookingView.model_validate(repeated.response)
 
             cart, cart_view = await self.carts.validate_db(
-                db, shopping_session.id, lock_slots=True
+                db, shopping_session.id, locale=locale, lock_slots=True
             )
             existing = await db.scalar(
                 select(Booking).where(Booking.cart_id == cart.id)
