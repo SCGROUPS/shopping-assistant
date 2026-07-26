@@ -312,6 +312,27 @@ latest_revision="$(az containerapp revision list \
   --name "$app_name" \
   --query "sort_by([], &properties.createdTime)[-1].name" \
   --output tsv)"
+
+# "Newest" is a guess at "the one I just made". Control-plane lag right after
+# the deployment returns, or an update that produced no new revision at all,
+# both leave the newest revision belonging to a previous run - and then every
+# check below interrogates a revision that was already healthy and passes. The
+# image carries the stamp this run generated, so ask it rather than assume.
+stamped_build="$(az containerapp revision show \
+  --resource-group "$resource_group" \
+  --name "$app_name" \
+  --revision "$latest_revision" \
+  --query "properties.template.containers[0].env[?name=='BUILD_REVISION'].value | [0]" \
+  --output tsv 2>/dev/null || true)"
+if [[ "$stamped_build" != "$build_revision" ]]; then
+  echo "" >&2
+  echo "Deployment failed: the newest revision is not the one this run built." >&2
+  echo "  newest revision ${latest_revision} carries build '${stamped_build}'" >&2
+  echo "  this run built '${build_revision}'" >&2
+  echo "  Checking its health would report on somebody else's deploy." >&2
+  exit 1
+fi
+
 revision_hostname="$(az containerapp revision show \
   --resource-group "$resource_group" \
   --name "$app_name" \
@@ -324,15 +345,28 @@ app_url="https://$(az containerapp show \
   --query properties.configuration.ingress.fqdn \
   --output tsv)"
 revision_url="https://${revision_hostname}"
-echo "  waiting on revision ${latest_revision}"
+echo "  waiting on revision ${latest_revision} (build ${build_revision})"
 
-# Reads the revision's console log for a verdict the HTTP check cannot reach.
-# The container's readiness probe is itself /health/ready, so a revision the
-# intent probe rejected never has a ready replica, and its FQDN answers
-# nothing at all - there is no 503 body to parse. The reason it failed only
-# exists in its logs.
+# Reads the revision's console log for a verdict the HTTP check cannot reach:
+# a revision the intent probe rejected never gets a ready replica, so its FQDN
+# answers nothing and there is no body to parse. Measured at ~35s against a
+# scaled-to-zero revision, and it wakes a replica to answer, so it is bounded
+# and called only once readiness has already been failing for a while.
+# `timeout` is coreutils: present on the CI runner, absent on a stock macOS,
+# where an unguarded call would fail the deploy on the developer's own laptop
+# for a reason that has nothing to do with the deploy.
+if command -v timeout >/dev/null 2>&1; then
+  bounded=(timeout 60)
+elif command -v gtimeout >/dev/null 2>&1; then
+  bounded=(gtimeout 60)
+else
+  bounded=()
+fi
+
 probe_verdict() {
-  az containerapp logs show \
+  # Expanded this way because bash 3.2 with `set -u` treats an empty array
+  # as an unbound variable and aborts - which is the macOS path above.
+  ${bounded[@]+"${bounded[@]}"} az containerapp logs show \
     --resource-group "$resource_group" \
     --name "$app_name" \
     --revision "$latest_revision" \
@@ -342,7 +376,11 @@ probe_verdict() {
 
 ready_body=""
 deploy_failure=""
-for _ in {1..60}; do
+# Bounded by wall clock, not by iteration count. The checks below cost between
+# a second and ninety, so "60 iterations" was anywhere from ten minutes to an
+# hour and a quarter - on the failure path, where a fast answer matters most.
+deadline=$((SECONDS + 600))
+while (( SECONDS < deadline )); do
   # Asked of the revision directly. This also activates it from zero, which is
   # the state a fresh revision sits in until something knocks.
   ready_body="$(curl --silent --max-time 30 "${revision_url}/health/ready" || true)"
@@ -350,16 +388,29 @@ for _ in {1..60}; do
     break
   fi
 
-  # A settled "no" from the intent probe. The verdict is recorded once per
-  # process and only a new revision can change it, so spending the remaining
-  # minutes re-asking is minutes of a known answer.
-  verdict="$(probe_verdict)"
-  if echo "$verdict" | grep -qE 'rejected and never overturned|probe skipped'; then
-    deploy_failure="the intent probe rejected revision ${latest_revision}"
-    break
+  # Only once readiness has had a fair chance, because this call is expensive.
+  if (( SECONDS > deadline - 540 )); then
+    # Any rejection at all. The probe returns as soon as two attempts are
+    # rejected, so "rejected and never overturned" is not logged on the real
+    # outage - and needs more attempt-retries than the deadline allows, so it
+    # cannot be logged under the supervisor at any point. Matching only that
+    # line meant matching the one line that never appears.
+    if probe_verdict | grep -q 'rejected'; then
+      deploy_failure="the intent probe rejected revision ${latest_revision}"
+      break
+    fi
   fi
   sleep 10
 done
+
+# A revision with no model configured is *ready* - the probe records "not
+# applicable" and readiness returns 200 - so it sails through the loop above.
+# That is the quietest form of the outage this gate exists to stop: nothing
+# raises, nothing is counted, and every shopper is answered by keyword
+# matching. Checked after the loop precisely because it looks like success.
+if [[ -z "$deploy_failure" ]] && echo "$ready_body" | grep -q 'no Azure OpenAI endpoint is configured'; then
+  deploy_failure="revision ${latest_revision} came up with no model configured; every search would be keyword-parsed"
+fi
 
 if [[ -z "$deploy_failure" ]] && ! echo "$ready_body" | grep -q '"status": *"ready"'; then
   deploy_failure="revision ${latest_revision} never became ready"
@@ -373,7 +424,7 @@ if [[ -n "$deploy_failure" ]]; then
     --resource-group "$resource_group" \
     --name "$app_name" \
     --revision "$latest_revision" \
-    --query "{runningState:properties.runningState, healthState:properties.healthState, replicas:properties.replicas}" \
+    --query "{runningState:properties.runningState, healthState:properties.healthState}" \
     --output json >&2 2>/dev/null || true
   echo "  Its logs said:" >&2
   probe_verdict | sed 's/^/    /' >&2
