@@ -111,10 +111,18 @@ async def test_the_model_only_names_constraint_fields_the_service_maps(query: st
     schema enum now, so this is what proves the enum is doing its job against
     the live model rather than only in a fixture.
     """
+    # The catalogue's own vocabulary, because the request production sends
+    # carries it and the schema is built from it. Asking without it was not a
+    # weaker version of this test but a different one: the category and
+    # destination enums collapse to [null], so the model is answering a question
+    # production never asks and the constraint fields it picks need not match.
+    categories, destinations = await _catalogue_vocabulary()
     provider = _provider()
     seen: set[str] = set()
     for _ in range(RUNS):
-        intent = await provider.extract_intent(query)
+        intent = await provider.extract_intent(
+            query, categories=categories, destinations=destinations
+        )
         seen.update(str(c.get("field", "")).casefold() for c in intent.hard_constraints)
 
     unmapped = sorted(field for field in seen if field and field not in CONSTRAINT_FIELDS)
