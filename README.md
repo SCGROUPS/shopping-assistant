@@ -124,3 +124,7 @@ idempotency state are PostgreSQL-backed outside explicit demo mode.
   Azure with GitHub OIDC, wait for catalog seeding and readiness, then execute
   the desktop and mobile Playwright journeys against the live application.
 - Documentation-only and demo-data-only changes do not trigger deployment.
+
+## License
+
+Released under the [MIT License](LICENSE).
