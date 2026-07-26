@@ -26,9 +26,9 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, func, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -74,6 +74,9 @@ class Leased:
     source_language: str
 
 
+# Failures that will recur no matter how often they are retried. Reviving these
+# every two hours spends money to be wrong on a schedule; they stay terminal
+# until the source, the recipe or an operator changes.
 class GlossaryViolation(RuntimeError):
     """The model translated a term it was told to leave alone.
 
@@ -82,13 +85,31 @@ class GlossaryViolation(RuntimeError):
     """
 
 
+# Failures that recur no matter how often they are retried. Reviving these every
+# two hours spends money to be wrong on a schedule, so they stay terminal until
+# the source, the recipe or an operator changes - each of which produces a new
+# fingerprint and therefore a new job.
+#
+# A glossary violation is deterministic: the same source under the same recipe
+# will go on omitting the same term. `asyncio.TimeoutError` deliberately is not
+# here - a slow provider is the textbook transient failure.
+PERMANENT_FAILURES: tuple[type[Exception], ...] = (GlossaryViolation, ValueError)
+
+
+def classify(exc: Exception) -> str:
+    return "permanent" if isinstance(exc, PERMANENT_FAILURES) else "transient"
+
+
 async def lease_jobs(session: AsyncSession, *, limit: int) -> list[Leased]:
     """Claim up to `limit` jobs, skipping any another worker holds.
 
     `SKIP LOCKED` rather than `NOWAIT`: two workers running concurrently is the
     normal case, and the second should take different work rather than fail.
     """
-    now = datetime.now(UTC)
+    # The database clock, not this process's. A worker whose container clock runs
+    # a few minutes fast would otherwise declare its own live lease expired and
+    # hand its job to a second worker, and both would translate and commit.
+    now = func.now()
     token = uuid.uuid4()
 
     claimable = (
@@ -113,7 +134,7 @@ async def lease_jobs(session: AsyncSession, *, limit: int) -> list[Leased]:
             .values(
                 status="leased",
                 lease_token=token,
-                leased_until=now + timedelta(seconds=LEASE_SECONDS),
+                leased_until=now + text(f"interval '{LEASE_SECONDS} seconds'"),
                 attempts=TranslationJob.attempts + 1,
             )
             .returning(
@@ -307,7 +328,9 @@ async def commit_translation(
     return True
 
 
-async def fail_job(session: AsyncSession, job: Leased, detail: str) -> bool:
+async def fail_job(
+    session: AsyncSession, job: Leased, detail: str, kind: str = "transient"
+) -> bool:
     """Release the lease and record why, parking the job at the attempt cap.
 
     Returns True when this was the last attempt. The field is only marked
@@ -324,6 +347,7 @@ async def fail_job(session: AsyncSession, job: Leased, detail: str) -> bool:
             lease_token=None,
             leased_until=None,
             error_detail=detail[:2000],
+            failure_kind=kind,
         )
         .returning(TranslationJob.id)
     )
@@ -357,7 +381,7 @@ async def sweep_stalled_leases(session: AsyncSession) -> int:
         update(TranslationJob)
         .where(
             TranslationJob.status == "leased",
-            TranslationJob.leased_until < datetime.now(UTC),
+            TranslationJob.leased_until < func.now(),
             TranslationJob.attempts >= MAX_ATTEMPTS,
         )
         .values(
@@ -397,22 +421,50 @@ async def revive_failed_jobs(session: AsyncSession) -> int:
     )
     revived = await session.execute(
         update(TranslationJob)
-        .where(TranslationJob.status == "failed", live)
-        .values(status="queued", attempts=0, lease_token=None, leased_until=None)
-        .returning(TranslationJob.id, TranslationJob.entity_id)
-    )
-    rows = revived.all()
-    for _, entity_id in rows:
-        await session.execute(
-            update(TranslationField)
-            .where(
-                TranslationField.entity_type == ENTITY_EXPERIENCE,
-                TranslationField.entity_id == entity_id,
-                TranslationField.status == "failed",
-            )
-            .values(status="pending")
+        .where(
+            TranslationJob.status == "failed",
+            # NULL is "written by a release that did not classify failures".
+            # Left alone rather than assumed safe: an unclassified failure that
+            # is actually deterministic would otherwise be retried forever.
+            TranslationJob.failure_kind == "transient",
+            live,
         )
-    return len(rows)
+        .values(status="queued", attempts=0, lease_token=None, leased_until=None)
+        .returning(
+            TranslationJob.entity_id,
+            TranslationJob.field,
+            TranslationJob.locale,
+            TranslationJob.fingerprint,
+            TranslationJob.generation,
+        )
+    )
+    targets = revived.all()
+    if not targets:
+        return 0
+
+    # Exactly the fields whose job came back, not every failed field on the
+    # experience. A field whose failed job is for a fingerprint the catalogue
+    # has moved past is dead work; flipping it to `pending` would leave it
+    # pending forever with no job to service it, and no longer visible as
+    # failed to whoever might have fixed it.
+    await session.execute(
+        update(TranslationField)
+        .where(
+            TranslationField.entity_type == ENTITY_EXPERIENCE,
+            TranslationField.status == "failed",
+            # Fingerprint and generation included, so a field that failed at a
+            # newer generation while this ran is not woken by an older job.
+            tuple_(
+                TranslationField.entity_id,
+                TranslationField.field,
+                TranslationField.locale,
+                TranslationField.desired_fingerprint,
+                TranslationField.generation,
+            ).in_([tuple(row) for row in targets]),
+        )
+        .values(status="pending")
+    )
+    return len(targets)
 
 
 async def _run_one(session_factory, translator, job: Leased, *, hold_all: bool) -> str:
@@ -465,7 +517,7 @@ async def _run_one(session_factory, translator, job: Leased, *, hold_all: bool) 
 async def _defer(session_factory, job: Leased, detail: str) -> str:
     """Hand the job back untouched, including its attempt."""
     async with session_factory() as session:
-        await session.execute(
+        handed_back = await session.execute(
             update(TranslationJob)
             .where(_still_ours(job))
             .values(
@@ -475,16 +527,21 @@ async def _defer(session_factory, job: Leased, detail: str) -> str:
                 attempts=TranslationJob.attempts - 1,
                 error_detail=detail[:2000],
             )
+            .returning(TranslationJob.id)
         )
         await session.commit()
-    return "deferred"
+    # If the fence missed, this worker no longer owned the job and deferring is
+    # not what happened to it. Reporting `deferred` would stop the drain loop
+    # over a job somebody else is already running.
+    return "deferred" if handed_back.scalar_one_or_none() is not None else "superseded"
 
 
 async def _record_failure(session_factory, job: Leased, exc: Exception) -> str:
     detail = f"{type(exc).__name__}: {exc}"
+    kind = classify(exc)
     try:
         async with session_factory() as session:
-            terminal = await fail_job(session, job, detail)
+            terminal = await fail_job(session, job, detail, kind=kind)
             await session.commit()
     except Exception:  # noqa: BLE001
         # Even recording the failure failed. The lease still expires, and
@@ -494,7 +551,12 @@ async def _record_failure(session_factory, job: Leased, exc: Exception) -> str:
         return "failed"
     logger.warning(
         "translation.failed",
-        extra={"job_id": str(job.job_id), "terminal": terminal, "detail": detail},
+        extra={
+            "job_id": str(job.job_id),
+            "terminal": terminal,
+            "kind": kind,
+            "detail": detail,
+        },
     )
     return "failed" if terminal else "retrying"
 

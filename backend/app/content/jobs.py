@@ -78,7 +78,7 @@ async def drain_translations(
         "failed": 0,
         "deferred": 0,
     }
-    translator = make_translator(provider)
+    translator = make_translator(provider, session_factory)
 
     if revive:
         async with session_factory() as session:

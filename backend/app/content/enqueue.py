@@ -105,7 +105,17 @@ async def enqueue_experience_translations(
     without the work to retranslate it — the same invariant the indexing outbox
     depends on, for the same reason.
     """
-    experience = await session.get(Experience, experience_id)
+    # The experience row is locked *first*, and its text and the recipe are read
+    # only afterwards. Reading them before the lock is a lost update wearing a
+    # lock's clothing: a glossary invalidation reads source S0 and recipe R1, a
+    # source editor commits S1/R0 while the invalidation waits for the field
+    # lock, and the invalidation then writes the S0/R1 it is still holding. The
+    # true state is S1/R1, and no job describes it.
+    #
+    # Every source writer already holds this row lock, because changing a title
+    # *is* an UPDATE of this row - so ordering experience-then-fields here is
+    # enough to serialise the two without asking callers to remember anything.
+    experience = await session.get(Experience, experience_id, with_for_update=True)
     if experience is None:
         return 0
 
@@ -184,6 +194,9 @@ async def enqueue_experience_translations(
                     desired = desired_fingerprint(
                         source=source, recipe=recipe, provenance=provenance
                     )
+                    # `source` and `recipe` were both computed under the
+                    # experience lock this transaction holds, so they cannot
+                    # have moved while we waited for the row lock here.
                     if row.desired_fingerprint == desired:
                         continue
                     generation = row.generation + 1

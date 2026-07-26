@@ -9,6 +9,7 @@ recoverable by retrying.
 
 import asyncio
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
@@ -18,6 +19,7 @@ from conftest import create_postgres_schema, reset_postgres
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.common.config import get_settings
 from app.common.llm_cost import BudgetExceeded
 from app.common.models import (
     Destination,
@@ -29,14 +31,21 @@ from app.common.models import (
     TranslationGlossary,
     TranslationJob,
 )
+from app.content import spend
 from app.content import translator as translator_module
 from app.content.enqueue import (
     enqueue_experience_translations,
     mark_manual_translation,
 )
+from app.content.fingerprints import (
+    desired_fingerprint,
+    recipe_fingerprint,
+    source_fingerprint,
+)
 from app.content.translator import (
     MAX_ATTEMPTS,
     GlossaryViolation,
+    classify,
     commit_translation,
     drain,
     fail_job,
@@ -254,6 +263,13 @@ async def test_manual_fields_never_get_a_machine_job(factory):
     # ...but no machine may be dispatched to overwrite the human.
     assert await _jobs(factory, field="description", locale="fr") == []
     assert len(await _jobs(factory, field="description")) == 6
+
+
+async def _lease_all(factory):
+    async with factory() as session:
+        jobs = await lease_jobs(session, limit=200)
+        await session.commit()
+    return {(job.field, job.locale): job for job in jobs}
 
 
 async def _lease_one(factory, *, field="title", locale="vi"):
@@ -718,3 +734,242 @@ async def test_running_out_of_budget_defers_rather_than_failing(factory):
         return f"[vi] {job.source_text}"
 
     assert (await drain(factory, recovered, limit=10))["published"] == 4
+
+
+async def test_reviving_does_not_wake_fields_whose_work_is_dead(factory):
+    """A failed job for a fingerprint the catalogue moved past is dead work.
+
+    Reviving it would queue a translation of text nobody has any more, and the
+    field it belongs to already has a live job at the next generation.
+
+    This covers the EXISTS filter only. The accompanying field-level scoping in
+    `revive_failed_jobs` is defensive: a field cannot currently be `failed`
+    while its job is dead, because anything that moves `desired_fingerprint`
+    also sets the field back to `pending`. It is written narrowly anyway,
+    because that reasoning depends on an invariant three call sites away.
+    """
+    await _enqueue(factory, locales=["vi"])
+
+    async def always_down(*, job, glossary):
+        raise RuntimeError("provider unavailable")
+
+    for _ in range(MAX_ATTEMPTS):
+        await drain(factory, always_down, limit=10)
+        async with factory() as session:
+            await session.execute(
+                update(TranslationJob).values(leased_until=datetime.now(UTC) - timedelta(seconds=1))
+            )
+            await session.commit()
+
+    assert {f.status for f in await _fields(factory, locale="vi")} == {"failed"}
+
+    # The title moves on. Its failed job now answers a fingerprint nobody wants,
+    # and enqueueing creates a fresh job at the next generation.
+    async with factory() as session:
+        await session.execute(
+            update(Experience).where(Experience.id == EXPERIENCE_ID).values(title="A new title")
+        )
+        await session.commit()
+    assert await _enqueue(factory, locales=["vi"]) == 1
+
+    async with factory() as session:
+        # Three fields revive; the title's dead job does not.
+        assert await revive_failed_jobs(session) == 3
+        await session.commit()
+
+    title = (await _fields(factory, field="title", locale="vi"))[0]
+    assert title.status == "pending"  # from the enqueue, not from the revival
+    assert title.generation == 1
+    dead = [j for j in await _jobs(factory, field="title", locale="vi") if j.generation == 0]
+    assert dead[0].status == "failed"
+
+
+async def test_a_source_edit_and_a_glossary_bump_cannot_erase_each_other(factory):
+    """The one that commits second must produce a job describing *both*.
+
+    Reading the source text and the glossary revision before taking the field
+    lock is a lost update wearing a lock's clothing: the invalidation reads
+    S0/R1, waits, and then writes the stale pair it is still holding over the
+    editor's S1/R0. The true desired state is S1/R1 and nothing describes it.
+    """
+    await _enqueue(factory, locales=["ja"])
+    async with factory() as session:
+        assert await revive_failed_jobs(session) == 0  # nothing failed; sanity
+        await session.commit()
+
+    started = asyncio.Event()
+    editor_committed = asyncio.Event()
+
+    async def edit_the_source():
+        async with factory() as session:
+            await session.execute(
+                update(Experience)
+                .where(Experience.id == EXPERIENCE_ID)
+                .values(title="Hoi An lantern cruise")
+            )
+            await enqueue_experience_translations(session, EXPERIENCE_ID, locales=["ja"])
+            started.set()
+            # Hold the transaction open so the other caller is forced to wait on
+            # the experience lock rather than racing past it.
+            await asyncio.sleep(0.3)
+            await session.commit()
+        editor_committed.set()
+
+    async def bump_the_glossary():
+        await started.wait()
+        async with factory() as session:
+            session.add(
+                TranslationGlossary(
+                    term="Hoi An", target_locale="ja", do_not_translate=True, revision=9
+                )
+            )
+            await session.flush()
+            await enqueue_experience_translations(session, EXPERIENCE_ID, locales=["ja"])
+            await session.commit()
+
+    await asyncio.gather(edit_the_source(), bump_the_glossary())
+    assert editor_committed.is_set()
+
+    # The surviving desired fingerprint must be the one computed from the new
+    # title *and* the new glossary revision. Recomputing it here from the final
+    # state of both inputs is the only check that cannot be satisfied by a
+    # stale pair that happens to differ from the original.
+    async with factory() as session:
+        experience = await session.get(Experience, EXPERIENCE_ID)
+        expected = desired_fingerprint(
+            source=source_fingerprint(
+                text=experience.title, source_language="en", locale="ja"
+            ),
+            recipe=recipe_fingerprint(
+                prompt_version=get_settings().translation_prompt_version,
+                glossary_revision=9,
+                model=get_settings().translation_deployment,
+            ),
+            provenance="machine",
+        )
+
+    row = (await _fields(factory, field="title", locale="ja"))[0]
+    assert row.desired_fingerprint == expected
+    # And a job exists for exactly that pair, or the work is invisible.
+    jobs = await _jobs(factory, field="title", locale="ja")
+    assert any(
+        job.fingerprint == expected and job.generation == row.generation for job in jobs
+    )
+
+
+async def test_a_deterministic_failure_is_not_revived_every_two_hours(factory):
+    """Reviving is for outages, not for wrong answers.
+
+    The scheduled worker runs `--revive` every two hours. Without a way to tell
+    the two apart it re-runs a translation that has no chance of succeeding -
+    a glossary term this source will never produce - and pays for the failure
+    on every cycle, forever, while never surfacing that a human is needed.
+
+    The transient job beside it proves the filter is a distinction and not a
+    switch that turned reviving off.
+    """
+    await _enqueue(factory, locales=["vi", "ja"])
+
+    # One lease call takes everything, so both jobs come from the same batch.
+    leased = await _lease_all(factory)
+    doomed = leased[("title", "vi")]
+    flaky = leased[("title", "ja")]
+
+    # Straight to the last attempt: what is under test is what happens after a
+    # job gives up, not how many tries it takes to get there.
+    doomed = replace(doomed, attempts=MAX_ATTEMPTS)
+    flaky = replace(flaky, attempts=MAX_ATTEMPTS)
+
+    async with factory() as session:
+        await fail_job(
+            session,
+            doomed,
+            "GlossaryViolation: missing 'Hoi An'",
+            kind=classify(GlossaryViolation("missing")),
+        )
+        await fail_job(
+            session, flaky, "TimeoutError: read timeout", kind=classify(TimeoutError())
+        )
+        await session.commit()
+
+    async with factory() as session:
+        assert await revive_failed_jobs(session) == 1
+        await session.commit()
+
+    by_locale = {job.locale: job for job in await _jobs(factory, field="title")}
+    assert by_locale["ja"].status == "queued"
+    assert by_locale["vi"].status == "failed"
+    assert by_locale["vi"].failure_kind == "permanent"
+    assert by_locale["vi"].attempts == 1, "a dead job must not have its attempts refunded"
+
+
+async def test_an_unclassified_failure_is_left_where_it_is(factory):
+    """Rows written before this release say NULL, which means "unknown".
+
+    Treating unknown as transient would revive exactly the deterministic
+    failures the classification exists to stop, on the one deploy where the
+    backlog of them is largest.
+    """
+    await _enqueue(factory, locales=["vi"])
+    job = await _lease_one(factory, field="title", locale="vi")
+
+    job = replace(job, attempts=MAX_ATTEMPTS)
+
+    async with factory() as session:
+        await fail_job(session, job, "boom")
+        await session.execute(
+            update(TranslationJob)
+            .where(TranslationJob.id == job.job_id)
+            .values(failure_kind=None)
+        )
+        await session.commit()
+
+    async with factory() as session:
+        assert await revive_failed_jobs(session) == 0
+        await session.commit()
+
+    assert (await _jobs(factory, field="title", locale="vi"))[0].status == "failed"
+
+
+async def test_the_daily_budget_is_not_refunded_by_restarting_the_worker(factory):
+    """The ceiling has to outlive the process, because the process is a cron job.
+
+    A per-process ledger resets on every scheduled run. At the deployed cadence
+    of every two hours that turns a $25/day ceiling into $300/day. Two separate
+    sessions here stand in for two runs - and for two concurrent lanes, which
+    have the same problem.
+    """
+    limit = 0.05
+
+    async with factory() as first:
+        assert await spend.reserve(first, limit, Decimal("0.04")) is True
+        await first.commit()
+
+    async with factory() as second:
+        assert await spend.reserve(second, limit, Decimal("0.04")) is False, (
+            "a second process must see what the first already spent"
+        )
+        await second.commit()
+
+    async with factory() as session:
+        assert await spend.spent_today(session) == Decimal("0.0400"), (
+            "a refused reservation must not charge"
+        )
+
+
+async def test_an_overrun_is_recorded_rather_than_hidden(factory):
+    """Settling above the ceiling is correct: the money already left.
+
+    The reservation is an estimate. When the real cost comes back higher the
+    ledger has to say so, even though that puts the day over budget, because the
+    alternative is a ledger that under-reports and a ceiling that drifts up.
+    """
+    limit = 1.0
+    async with factory() as session:
+        assert await spend.reserve(session, limit, Decimal("0.01")) is True
+        await spend.settle(session, Decimal("0.01"), Decimal("2.50"))
+        await session.commit()
+
+    async with factory() as session:
+        assert await spend.spent_today(session) == Decimal("2.5000")
+        assert await spend.reserve(session, limit) is False

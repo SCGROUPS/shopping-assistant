@@ -10,12 +10,14 @@ mapping back onto columns becomes a parsing problem rather than a lookup.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any
 
 from app.common.config import get_settings
-from app.common.llm_cost import BudgetExceeded, ledger
+from app.common.llm_cost import BudgetExceeded, estimate_cost
 from app.common.locales import LOCALE_NAMES
 from app.common.models import TranslationGlossary
+from app.content import spend as budget
 from app.content.translator import Leased
 
 _SYSTEM = (
@@ -53,12 +55,29 @@ def build_glossary_instruction(terms: list[TranslationGlossary]) -> str:
     return " ".join(lines)
 
 
-def make_translator(provider: Any):
+def _call_cost(response: Any, model: str) -> Decimal:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return Decimal("0")
+    cost = estimate_cost(
+        model,
+        float(getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0),
+        float(getattr(usage, "output_tokens", 0) or getattr(usage, "completion_tokens", 0) or 0),
+    )
+    return Decimal(str(cost))
+
+
+def make_translator(provider: Any, session_factory: Any = None):
     """Bind a provider into the callable `drain` expects.
 
     `drain` takes a callable rather than a provider so tests can substitute a
     deterministic function without a network, and so a future human-translation
     path can be dropped in at the same seam.
+
+    `session_factory` is separate from the worker's session on purpose: the
+    reservation must commit whether or not the translation that follows
+    succeeds. Reserving inside the caller's transaction would roll the charge
+    back on failure and let a persistently failing provider bill without limit.
     """
 
     async def translate(*, job: Leased, glossary: list[TranslationGlossary]) -> str:
@@ -69,10 +88,15 @@ def make_translator(provider: Any):
             return ""
 
         settings = get_settings()
-        if ledger.exhausted(settings.translation_daily_budget):
-            raise BudgetExceeded(
-                f"Daily translation budget of ${settings.translation_daily_budget:.2f} reached"
-            )
+        budget_limit = settings.translation_daily_budget
+        if session_factory is not None:
+            async with session_factory() as session:
+                claimed = await budget.reserve(session, budget_limit)
+                await session.commit()
+            if not claimed:
+                raise BudgetExceeded(
+                    f"Daily translation budget of ${budget_limit:.2f} reached"
+                )
         target = LOCALE_NAMES.get(job.locale, job.locale)
         system = _SYSTEM.format(target=target)
         instruction = build_glossary_instruction(glossary)
@@ -99,6 +123,17 @@ def make_translator(provider: Any):
             max_output_tokens=2000,
         )
         provider._record(response, settings.translation_deployment, "translation")
+        if session_factory is not None:
+            # Reconciled outside the worker's transaction for the same reason it
+            # was reserved outside it: the money left regardless of what the
+            # commit guards decide about the text.
+            async with session_factory() as session:
+                await budget.settle(
+                    session,
+                    budget.ESTIMATE,
+                    _call_cost(response, settings.translation_deployment),
+                )
+                await session.commit()
         payload = json.loads(response.output_text or "{}")
         translated = (payload.get("translation") or "").strip()
         if not translated:

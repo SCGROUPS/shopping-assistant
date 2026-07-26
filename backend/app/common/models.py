@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -646,6 +647,10 @@ class TranslationJob(Base, TimestampMixin):
             "generation",
             name="ux_translation_job_target",
         ),
+        CheckConstraint(
+            "failure_kind IS NULL OR failure_kind IN ('transient', 'permanent')",
+            name="ck_translation_job_failure_kind",
+        ),
     )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     entity_type: Mapped[str] = mapped_column(String(20))
@@ -661,6 +666,26 @@ class TranslationJob(Base, TimestampMixin):
     leased_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     error_detail: Mapped[str | None] = mapped_column(Text)
+    # 'transient' or 'permanent'. Only transient failures are revived: retrying
+    # a provider outage is correct, retrying a wrong answer is a standing order
+    # to keep being wrong. NULL means a release that predates the distinction.
+    failure_kind: Mapped[str | None] = mapped_column(String(20))
+
+
+class TranslationSpend(Base):
+    """The daily translation ceiling, in the only place that survives a restart.
+
+    The in-memory cost ledger cannot hold this: a scheduled container starts a
+    new process every run, so a per-process daily budget resets on every cycle
+    and is not a daily budget at all. Spend is *reserved* before the call and
+    reconciled after, so eight concurrent lanes cannot each pass a check that
+    none of them has yet paid for.
+    """
+
+    __tablename__ = "translation_spend"
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 4), default=0, server_default=text("0"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class TranslationGlossary(Base, TimestampMixin):
