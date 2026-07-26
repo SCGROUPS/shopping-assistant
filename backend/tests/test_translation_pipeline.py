@@ -25,7 +25,7 @@ from openai import (
     NotFoundError,
     RateLimitError,
 )
-from sqlalchemy import select, text, update
+from sqlalchemy import event, select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.common.config import get_settings
@@ -43,8 +43,10 @@ from app.common.models import (
 from app.content import spend
 from app.content import translator as translator_module
 from app.content.enqueue import (
+    EXPERIENCE_FIELDS,
     enqueue_experience_translations,
     mark_manual_translation,
+    target_locales,
 )
 from app.content.fingerprints import (
     desired_fingerprint,
@@ -54,6 +56,7 @@ from app.content.fingerprints import (
 from app.content.translator import (
     MAX_ATTEMPTS,
     GlossaryViolation,
+    _retry_after,
     classify,
     commit_translation,
     drain,
@@ -489,6 +492,7 @@ async def test_a_clean_drain_publishes_and_marks_current(factory):
         "published": 4,
         "superseded": 0,
         "retrying": 0,
+        "throttled": 0,
         "failed": 0,
         "deferred": 0,
     }
@@ -1122,3 +1126,199 @@ async def test_a_settlement_cannot_credit_a_day_it_never_charged(factory):
         assert await spend.spent_today(session) == Decimal("0"), (
             "today must not absorb yesterday's correction"
         )
+
+
+async def test_enqueueing_an_experience_does_not_scale_round_trips_with_locales(factory):
+    """Statement count is a correctness property when the database is elsewhere.
+
+    The application runs in a different Azure region from PostgreSQL, so every
+    statement costs a real round trip. Inserting each field row and each job
+    individually is 4 fields x 7 locales x 2 = 56 of them per experience, which
+    added ten minutes to the catalogue job across the live catalogue. The work
+    is decided in memory and written in two statements instead.
+
+    Pinned rather than described, because this is exactly the kind of thing a
+    later refactor reintroduces while every behavioural test still passes.
+    """
+    statements: list[str] = []
+
+    async with factory() as session:
+        connection = await session.connection()
+
+        def record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement.split()[0].upper())
+
+        event.listen(connection.sync_connection.engine, "before_cursor_execute", record)
+        try:
+            enqueued = await enqueue_experience_translations(session, EXPERIENCE_ID)
+            await session.commit()
+        finally:
+            event.remove(connection.sync_connection.engine, "before_cursor_execute", record)
+
+    locales = len(target_locales("en"))
+    assert enqueued == len(EXPERIENCE_FIELDS) * locales
+
+    inserts = statements.count("INSERT")
+    assert inserts == 2, (
+        f"one insert for the field rows and one for the jobs, got {inserts}: {statements}"
+    )
+    assert len(statements) <= 6, (
+        f"a fixed cost per experience, not one per locale, got {len(statements)}"
+    )
+
+
+async def test_a_rate_limit_does_not_cost_the_job_an_attempt(factory):
+    """429 is the provider pacing us, not the translation being wrong.
+
+    The first production run parked the entire catalogue in `failed` inside
+    ninety seconds: eight lanes against a 10K TPM deployment collect 429s faster
+    than the quota window refills, and each one consumed an attempt, so every
+    job burned all five without a single real failure. The work is untouched, so
+    the attempt has to be handed back.
+    """
+    await _enqueue(factory, locales=["vi"])
+
+    request = httpx.Request("POST", "https://example.invalid/openai")
+    limited = RateLimitError(
+        "slow down",
+        response=httpx.Response(429, request=request, headers={"retry-after": "1"}),
+        body=None,
+    )
+
+    async def rate_limited(*, job, glossary):
+        raise limited
+
+    counts = await drain(factory, rate_limited, limit=4)
+    assert counts["throttled"] == 4
+    assert counts["failed"] == 0 and counts["retrying"] == 0
+
+    for job in await _jobs(factory):
+        assert job.status == "queued"
+        assert job.attempts == 0, "a throttled job must be exactly as it was"
+        assert job.failure_kind is None
+
+    # And the same jobs are still fully available to a worker that gets through.
+    async def succeeds(*, job, glossary):
+        return f"[vi] {job.source_text}"
+
+    counts = await drain(factory, succeeds, limit=4)
+    assert counts["published"] == 4
+
+
+async def test_throttling_is_reported_apart_from_a_spent_budget(factory):
+    """The two mean opposite things: one says slow down, the other says stop.
+
+    Collapsing a 429 into `deferred` ends the drain loop, which would leave a
+    rate-limited deployment translating a single batch every two hours - the
+    backlog would never close.
+    """
+    assert "throttled" in (await drain(factory, _echo, limit=1))
+
+
+def test_a_retry_after_header_is_believed_but_not_blindly(factory):
+    request = httpx.Request("POST", "https://example.invalid/openai")
+
+    def limited(headers):
+        return RateLimitError(
+            "slow down",
+            response=httpx.Response(429, request=request, headers=headers),
+            body=None,
+        )
+
+    def within_jitter(actual: float, base: float) -> bool:
+        # Jittered upwards by up to 25%, so three lanes do not wake together and
+        # reproduce the burst that earned the 429.
+        return base <= actual <= base * 1.25
+
+    assert within_jitter(_retry_after(limited({"retry-after": "7"})), 7.0)
+    # No header at all: guessing short is how a retry storm starts.
+    assert within_jitter(_retry_after(limited({})), translator_module.DEFAULT_RETRY_AFTER)
+    assert within_jitter(
+        _retry_after(limited({"retry-after": "banana"})), translator_module.DEFAULT_RETRY_AFTER
+    )
+    # A provider returning something absurd must not idle the worker until its
+    # replica timeout kills it.
+    # The cap is applied after the jitter, or it is 25% higher than it says.
+    assert _retry_after(limited({"retry-after": "99999"})) == translator_module.MAX_RETRY_AFTER
+    # The jitter is real, not a constant multiplier.
+    assert len({_retry_after(limited({"retry-after": "10"})) for _ in range(20)}) > 1
+
+
+async def test_a_permanently_throttled_run_ends_itself_without_spending_attempts(factory):
+    """The replica timeout is not a safe way to end a run.
+
+    Container Apps kills the process at 3000s, and it kills it mid-batch: jobs
+    are still leased with their attempts already spent, and nothing gets the
+    chance to hand them back. Five throttled executions would park the queue
+    exactly as five genuine failures do - which is the bug this whole change
+    exists to fix, reappearing one level up.
+
+    So the run carries its own deadline and stops on its own terms.
+    """
+    await _enqueue(factory, locales=["vi", "ja"])
+    before = {(job.field, job.locale): job.attempts for job in await _jobs(factory)}
+
+    request = httpx.Request("POST", "https://example.invalid/openai")
+
+    async def always_limited(*, job, glossary):
+        raise RateLimitError(
+            "slow down",
+            response=httpx.Response(429, request=request, headers={"retry-after": "1"}),
+            body=None,
+        )
+
+    # A deadline already in the past: every job is handed back at the semaphore
+    # without ever reaching the provider.
+    counts = await drain(
+        factory,
+        always_limited,
+        limit=8,
+        deadline=asyncio.get_running_loop().time() - 1,
+    )
+    assert counts["leased"] == 8
+    assert counts["deferred"] == 8
+    assert counts["failed"] == 0
+
+    after = {(job.field, job.locale): job.attempts for job in await _jobs(factory)}
+    assert after == before, "a run that ran out of time must cost nothing"
+    assert {job.status for job in await _jobs(factory)} == {"queued"}
+
+
+async def test_a_deadline_that_has_not_passed_does_not_interfere(factory):
+    """The deadline must only fire when it has actually been reached."""
+    await _enqueue(factory, locales=["vi"])
+    counts = await drain(
+        factory, _echo, limit=4, deadline=asyncio.get_running_loop().time() + 300
+    )
+    assert counts["published"] == 4 and counts["deferred"] == 0
+
+
+async def test_a_job_queued_behind_a_slow_lane_is_not_started_after_the_deadline(factory):
+    """The deadline check has to sit *after* the semaphore, not before it.
+
+    Checked before, a job that waits minutes for a lane passes a deadline that
+    was still in the future when it queued, then starts work the replica timeout
+    will kill in flight - leased, with its attempt spent. This is the case the
+    placement exists for, and the past-deadline test does not prove it.
+    """
+    await _enqueue(factory, locales=["vi"])
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.3
+    started: list[str] = []
+
+    async def slow_first(*, job, glossary):
+        started.append(job.field)
+        if len(started) == 1:
+            # Holds the only lane until the deadline has passed.
+            await asyncio.sleep(0.6)
+        return f"[vi] {job.source_text}"
+
+    counts = await drain(factory, slow_first, limit=4, concurrency=1, deadline=deadline)
+
+    assert len(started) == 1, f"only the lane holder may reach the provider, got {started}"
+    assert counts["published"] == 1
+    assert counts["deferred"] == 3
+
+    deferred = [job for job in await _jobs(factory) if job.status == "queued"]
+    assert len(deferred) == 3
+    assert {job.attempts for job in deferred} == {0}

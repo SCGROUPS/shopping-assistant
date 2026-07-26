@@ -13,6 +13,8 @@ import json
 from decimal import Decimal
 from typing import Any
 
+from openai import RateLimitError
+
 from app.common.config import get_settings
 from app.common.llm_cost import BudgetExceeded, estimate_cost
 from app.common.locales import LOCALE_NAMES
@@ -111,25 +113,35 @@ def make_translator(provider: Any, session_factory: Any = None):
         if instruction:
             system = f"{system} {instruction}"
 
-        response = await provider.client.responses.create(
-            model=settings.translation_deployment,
-            input=[
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": f"<source_text>{source}</source_text>",
+        try:
+            response = await provider.client.responses.create(
+                model=settings.translation_deployment,
+                input=[
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": f"<source_text>{source}</source_text>",
+                    },
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "translation",
+                        "schema": _SCHEMA,
+                        "strict": True,
+                    }
                 },
-            ],
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "translation",
-                    "schema": _SCHEMA,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=2000,
-        )
+                max_output_tokens=2000,
+            )
+        except RateLimitError:
+            # A rejected request is not a billed request. Keeping its
+            # reservation would let a throttled hour consume the whole day's
+            # budget on calls that produced nothing and cost nothing.
+            if session_factory is not None:
+                async with session_factory() as session:
+                    await budget.settle(session, charged_day, budget.ESTIMATE, Decimal(0))
+                    await session.commit()
+            raise
         provider._record(response, settings.translation_deployment, "translation")
         if session_factory is not None:
             # Reconciled outside the worker's transaction for the same reason it

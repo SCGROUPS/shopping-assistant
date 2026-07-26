@@ -45,12 +45,21 @@ class Settings(BaseSettings):
     # The batch is latency bound, so this is what decides whether a backfill
     # finishes overnight. Bounded because the provider rate limits, and each
     # lane holds a database session for the length of a model call.
-    translation_concurrency: int = 8
+    # Sized against the deployment's tokens-per-minute quota, not against
+    # what the event loop could manage. Eight lanes against a 10K TPM
+    # deployment spend most of their time collecting 429s.
+    translation_concurrency: int = 3
     # Translation runs in its own container, so this ceiling is its own and
     # cannot starve the storefront. Hitting it defers work to the next run
     # rather than failing it: a backfill that stops early is resumable, and a
     # backfill that burns its attempts against a spending limit is not.
     translation_daily_budget: float = 25.0
+    # Comfortably inside the container job's 3000s replica timeout. The timeout
+    # is not a safe way to end a run: it kills the process while jobs are still
+    # leased with their attempts already spent, so five throttled executions
+    # would park the queue exactly as five real failures do. This deadline is
+    # what lets the run hand its work back instead.
+    translation_run_seconds: float = 2400.0
 
     assistant_max_tool_rounds: int = 3
     assistant_max_session_turns: int = 12

@@ -24,11 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from openai import APIConnectionError
+from openai import APIConnectionError, RateLimitError
 from sqlalchemy import and_, func, select, text, tuple_, update
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -571,6 +572,22 @@ async def _run_one(session_factory, translator, job: Leased, *, hold_all: bool) 
             timeout=settings.translation_timeout_seconds,
         )
         verify_glossary(job.source_text, translated, terms)
+    except RateLimitError as exc:
+        # Backpressure, not failure. The provider is telling us to come back,
+        # and the work is untouched - so this must not cost an attempt. It did:
+        # the first production run put the whole catalogue into `failed` in
+        # ninety seconds, because eight lanes against a 10K TPM deployment burn
+        # five attempts each faster than the quota window refills.
+        #
+        # The sleep is inside the semaphore deliberately. It holds the lane, so
+        # a rate-limited batch stops asking instead of spinning through its
+        # remaining jobs at full speed to collect the same 429.
+        await asyncio.sleep(_retry_after(exc))
+        outcome = await _defer(session_factory, job, f"rate limited: {exc}")
+        # If the fence missed, this worker no longer owns the job and nothing
+        # was handed back - reporting `throttled` would keep the drain looping
+        # over work somebody else has.
+        return "throttled" if outcome == "deferred" else outcome
     except BudgetExceeded as exc:
         # Not a failure of this job: the work is fine, we simply declined to pay
         # for it right now. Consuming an attempt would mean a spending ceiling
@@ -598,6 +615,32 @@ async def _run_one(session_factory, translator, job: Leased, *, hold_all: bool) 
         return await _record_failure(session_factory, job, exc)
 
     return "published" if published else "superseded"
+
+
+# Long enough to let a per-minute quota window actually refill. A one-second
+# retry against a TPM limit is just a second 429.
+DEFAULT_RETRY_AFTER = 20.0
+MAX_RETRY_AFTER = 120.0
+
+
+def _retry_after(exc: Exception) -> float:
+    """How long the provider asked us to wait, when it says so.
+
+    Guessing is what produces a retry storm; the header exists precisely so we
+    do not have to. Capped so a provider returning something absurd cannot idle
+    the worker until its replica timeout kills it.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    raw = headers.get("retry-after") if headers else None
+    try:
+        wait = min(max(float(raw), 1.0), MAX_RETRY_AFTER)  # pyright: ignore[reportArgumentType]
+    except (TypeError, ValueError):
+        wait = DEFAULT_RETRY_AFTER
+    # Jittered, or every lane wakes at the same instant and reproduces the burst
+    # that earned the 429 in the first place. Capped *after* jitter: a ceiling
+    # that the jitter can exceed by 25% is not the ceiling the deployment budget
+    # was reasoned against.
+    return min(wait * (1.0 + random.random() * 0.25), MAX_RETRY_AFTER)
 
 
 async def _defer(session_factory, job: Leased, detail: str) -> str:
@@ -654,6 +697,7 @@ async def drain(
     limit: int | None = None,
     hold_all: bool = False,
     concurrency: int | None = None,
+    deadline: float | None = None,
 ) -> dict[str, int]:
     """Work the queue once. Each job commits in its own transaction.
 
@@ -682,6 +726,11 @@ async def drain(
         "retrying": 0,
         "failed": 0,
         "deferred": 0,
+        # Counted apart from `deferred` because they mean opposite things to the
+        # caller: a spent budget means stop, a rate limit means slow down. One
+        # 429 collapsing into `deferred` would end the whole drain and leave the
+        # backlog to a job that runs every two hours.
+        "throttled": 0,
     }
     if not jobs:
         return counts
@@ -690,6 +739,13 @@ async def drain(
 
     async def guarded(job: Leased) -> str:
         async with gate:
+            # Checked after acquiring, not before. Under throttling a job can
+            # sit on this semaphore for minutes while the deadline passes, and
+            # starting it then means the replica timeout kills it mid-flight -
+            # still leased, with its attempt already spent. Handing it back is
+            # the difference between a run that ends and a run that is killed.
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                return await _defer(session_factory, job, "run deadline reached")
             return await _run_one(session_factory, translator, job, hold_all=hold_all)
 
     for outcome in await asyncio.gather(*(guarded(job) for job in jobs)):
