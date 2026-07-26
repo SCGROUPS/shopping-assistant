@@ -140,6 +140,12 @@ jobs:
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
           ADMIN_BOOTSTRAP_KEY: ${{ secrets.ADMIN_BOOTSTRAP_KEY }}
+          # Without this the alert rules still deploy and still evaluate
+          # correctly - they simply have no recipient attached, so they fire
+          # into an empty action group. That is indistinguishable from working
+          # until the day something breaks and nobody is paged, which is the
+          # failure mode the rules were written to end.
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
           VIETRA_PREFIX: ${{ vars.VIETRA_PREFIX }}
           AZURE_LOCATION: eastus2
           AZURE_POSTGRES_LOCATION: centralus
