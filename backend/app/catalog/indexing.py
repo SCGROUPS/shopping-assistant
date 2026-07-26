@@ -26,7 +26,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import case, func, select, text, true, update
+from sqlalchemy import case, func, select, text, true, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -286,6 +286,42 @@ async def retire_satisfied_work(
     )
 
 
+async def retire_satisfied_work_bulk(
+    session: AsyncSession,
+    satisfied: Sequence[tuple[uuid.UUID, str, str]],
+) -> None:
+    """`retire_satisfied_work` for a whole page, in one statement.
+
+    Reconciliation calls this once per page rather than once per locale. The
+    common case is a catalogue where nothing changed, which used to spend one
+    round trip per (experience, locale) discovering there was nothing to
+    retire - thousands of them, against a database in another region.
+
+    The guard is unchanged: same fingerprint, same unleased statuses. Only the
+    number of statements is different.
+    """
+    if not satisfied:
+        return
+    await session.execute(
+        update(IndexWorkItem)
+        .where(
+            IndexWorkItem.status.in_(["queued", "failed"]),
+            tuple_(
+                IndexWorkItem.experience_id,
+                IndexWorkItem.locale,
+                IndexWorkItem.fingerprint,
+            ).in_(satisfied),
+        )
+        .values(
+            status="done",
+            lease_token=None,
+            leased_until=None,
+            error_detail=None,
+            updated_at=datetime.now(UTC),
+        )
+    )
+
+
 async def resolution_chain(experience: Experience, locale: str) -> tuple[str, ...]:
     """Locales to try for `locale`, in order, for this particular record."""
     return _resolution_chain(experience, locale)
@@ -312,7 +348,21 @@ async def resolved_document_text(
     displays, and neither side's tests would fail.
     """
     resolved = await resolve_experience_text(session, [experience], locale)
-    fields = resolved[experience.id]
+    return document_text_from_resolved(experience, destination_name, resolved[experience.id])
+
+
+def document_text_from_resolved(
+    experience: Experience,
+    destination_name: str,
+    fields: dict[str, Any],
+) -> str:
+    """Compose the indexed text from fields already resolved in bulk.
+
+    Split out so reconciliation can resolve a whole page in two queries and
+    still build byte-identical text to the single-record path. If these ever
+    diverged, a reconciliation pass would compute a fingerprint the indexer
+    could never reproduce, and every row would look permanently stale.
+    """
     parts: list[str] = [
         fields["title"].value,
         destination_name,
@@ -964,24 +1014,47 @@ async def reconcile_page(
     if not rows:
         return 0, None
 
-    enqueued = 0
-    for experience, destination_name in rows:
-        stored = {
-            locale: fingerprint
-            for locale, fingerprint in (
-                await session.execute(
-                    select(
-                        ExperienceSearchDocument.locale,
-                        ExperienceSearchDocument.index_fingerprint,
-                    ).where(ExperienceSearchDocument.experience_id == experience.id)
-                )
-            ).all()
-        }
+    destination_names = {experience.id: name for experience, name in rows}
+    experiences = [experience for experience, _ in rows]
+    experience_ids = [experience.id for experience in experiences]
+
+    # Every stored fingerprint on the page in one query, not one query per
+    # record. Keyed by (experience, locale) because that is what the walk asks.
+    stored = {
+        (experience_id, locale): fingerprint
+        for experience_id, locale, fingerprint in (
+            await session.execute(
+                select(
+                    ExperienceSearchDocument.experience_id,
+                    ExperienceSearchDocument.locale,
+                    ExperienceSearchDocument.index_fingerprint,
+                ).where(ExperienceSearchDocument.experience_id.in_(experience_ids))
+            )
+        ).all()
+    }
+
+    # Text resolution is bulk by design (see `resolve_experience_text`), so it
+    # is called once per locale for the whole page. Records are grouped by the
+    # locales they actually need, which differ by source language.
+    by_locale: dict[str, list[Experience]] = {}
+    for experience in experiences:
         for locale in indexed_locales(experience):
-            text = await resolved_document_text(session, experience, destination_name, locale)
-            fingerprint = index_fingerprint(text, locale)
-            if stored.get(locale) == fingerprint:
-                await retire_satisfied_work(session, experience.id, locale, fingerprint)
+            by_locale.setdefault(locale, []).append(experience)
+    resolved = {
+        locale: await resolve_experience_text(session, wanted, locale)
+        for locale, wanted in by_locale.items()
+    }
+
+    enqueued = 0
+    satisfied: list[tuple[uuid.UUID, str, str]] = []
+    for experience in experiences:
+        for locale in indexed_locales(experience):
+            document = document_text_from_resolved(
+                experience, destination_names[experience.id], resolved[locale][experience.id]
+            )
+            fingerprint = index_fingerprint(document, locale)
+            if stored.get((experience.id, locale)) == fingerprint:
+                satisfied.append((experience.id, locale, fingerprint))
                 continue
             # Counted from what the write actually changed, not from what we
             # intended, so a reconciliation that collided with pending work does
@@ -989,6 +1062,7 @@ async def reconcile_page(
             enqueued += await enqueue_reindex(
                 session, experience.id, locale, fingerprint, only_if_idle=True
             )
+    await retire_satisfied_work_bulk(session, satisfied)
     return enqueued, rows[-1][0].id
 
 

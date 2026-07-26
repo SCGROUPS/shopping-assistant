@@ -1307,6 +1307,72 @@ async def test_the_production_reconcile_path_commits_every_page(factory, monkeyp
     assert queued == stale
 
 
+async def test_reconciling_an_unchanged_catalogue_does_not_cost_a_query_per_locale(
+    factory, monkeypatch
+):
+    """The common case is a catalogue where nothing changed. It must be cheap.
+
+    Reconciliation used to ask the database one question per (experience,
+    locale): resolve the text, then try to retire work that was not there. On
+    the deployed catalogue that is thousands of round trips to another Azure
+    region, and it cost roughly six minutes of every deployment to establish
+    that there was nothing to do.
+
+    The bound is expressed in statements rather than seconds because that is
+    the property that actually decides the runtime, and unlike a timing it
+    does not depend on where the test happens to run. It is deliberately loose
+    - the point is that the cost follows pages and locales, not the size of the
+    catalogue.
+    """
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    from app.catalog import indexing
+
+    products = 8
+    await upsert_catalog(
+        [
+            to_catalog_product(
+                {**RAW, "product_id": f"CHEAP{n}", "name": f"Marble Mountains Half Day {n}"},
+                FACETS,
+                days=3,
+            )
+            for n in range(products)
+        ],
+        supplier_external_id="TRIPPASS",
+        supplier_name="Trippass",
+        ai_provider=_StubEmbedder(),
+    )
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+    monkeypatch.setattr(database, "session_factory", factory, raising=False)
+
+    # Bring the index fully current first, so the pass being measured is the
+    # no-op one. A pass that still had work to enqueue would be measuring
+    # something else entirely.
+    await indexing.run_reconcile()
+    await indexing.process_index_work(factory, _StubEmbedder(), limit=500)
+
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", record)
+    try:
+        stale = await indexing.run_reconcile()
+    finally:
+        event.remove(Engine, "before_cursor_execute", record)
+
+    assert stale == 0, "nothing changed, so nothing should have been enqueued"
+    # One page: the walk, the stored fingerprints, two resolution queries per
+    # locale, one bulk retirement, and the empty page that ends the walk. The
+    # per-locale version of this issued over 150.
+    assert len(statements) < 40, (
+        f"reconciling {products} unchanged records took {len(statements)} statements; "
+        "the per-record round trips are back"
+    )
+
+
 async def test_a_drain_that_builds_nothing_still_reports_its_backlog(factory, monkeypatch):
     """ "The queue stopped producing" is not "the queue is empty".
 
