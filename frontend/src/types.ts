@@ -13,6 +13,17 @@ export type ExperienceOption = {
   }>
 }
 
+/** Where one displayed string came from, and whether it is still current. */
+export type ContentFieldMeta = {
+  locale: string
+  /** source | manual | machine | imported | unknown */
+  provenance: string
+  /** Published, but the source has changed since. */
+  stale: boolean
+  /** The locale the shopper asked for, which may not be the one served. */
+  requested?: string
+}
+
 export type Experience = {
   id: string
   slug: string
@@ -38,6 +49,15 @@ export type Experience = {
   tags: string[]
   badges: string[]
   reason?: string
+  /**
+   * Per-field provenance from the backend. Kept rather than discarded because
+   * it is the only way the UI can tell a translated string from an English one
+   * that merely arrived in a Vietnamese response - which is the difference
+   * between a working page and one that quietly lies about its coverage.
+   */
+  content_meta?: Record<string, ContentFieldMeta>
+  /** The locale the server actually resolved this record in. */
+  locale?: string
   available?: boolean
   instant_confirmation?: boolean
   free_cancellation?: boolean

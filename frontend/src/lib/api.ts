@@ -1,6 +1,8 @@
 import { demoExperiences } from '../data/demo'
+import { formatTime } from './format'
 import type {
   AssistantAction,
+  ContentFieldMeta,
   AssistantContext,
   AssistantMessage,
   CartItem,
@@ -17,15 +19,24 @@ const SESSION_ID =
   localStorage.getItem('vietra-session-id') ?? crypto.randomUUID()
 localStorage.setItem('vietra-session-id', SESSION_ID)
 
-// A function, not a constant. As an object literal evaluated once at module
-// load it captured whatever the locale was at start-up, so switching language
-// would have changed the header on requests that happened to build their own
-// and left it stale on the ten that spread this. Making it a call means the
-// compiler finds every one of those sites instead of leaving one behind.
-const jsonHeaders = () => ({
-  'Content-Type': 'application/json',
+// One function builds every header set. The first attempt had two - a
+// conditional `Accept-Language` in `request()` and an unconditional one here -
+// and because explicit headers win over the spread, this one's empty string
+// silently overwrote the browser's own language on search, events, SSE and
+// every cart mutation. A shopper could have browsed in Vietnamese and searched
+// in English. Two places deciding one header is the same bug as two lists of
+// the same fields: it does not fail, it disagrees.
+const baseHeaders = (): Record<string, string> => ({
   'X-Session-ID': SESSION_ID,
-  'Accept-Language': preferredLocale,
+  // Omitted, never empty. An empty `Accept-Language` is a claim about
+  // language; absence lets the server fall back to the browser's own header,
+  // which is a better guess than ours.
+  ...(preferredLocale ? { 'Accept-Language': preferredLocale } : {}),
+})
+
+const jsonHeaders = (): Record<string, string> => ({
+  ...baseHeaders(),
+  'Content-Type': 'application/json',
 })
 
 // Endonyms: a language menu is read by someone who cannot yet read the page,
@@ -65,6 +76,14 @@ export const setPreferredLocale = (locale: string) => {
 
 export const getPreferredLocale = () => preferredLocale
 
+// What the server said it actually served, which is what times and counts
+// produced down here must be formatted in. `preferredLocale` is a request and
+// can differ; formatting to a language the page is not in is the same mistake
+// as the switcher showing an unconfirmed choice.
+let resolvedLocale = 'en'
+
+export const getResolvedLocale = () => resolvedLocale
+
 // Display currency is presentation state, so it lives here rather than being
 // threaded through every call signature. The authoritative VND price always
 // travels alongside it, and nothing that charges money reads this.
@@ -98,12 +117,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: {
-      'X-Session-ID': SESSION_ID,
-      // Before the spread, so an explicit per-call header still wins, and
-      // omitted entirely when the shopper has expressed no preference - an
-      // empty `Accept-Language` is a claim about language, and the browser's
-      // own header is a better guess than ours.
-      ...(preferredLocale ? { 'Accept-Language': preferredLocale } : {}),
+      ...baseHeaders(),
       ...init?.headers,
     },
   })
@@ -147,6 +161,28 @@ const normalizeAssistantAction = (
   slot_id: action.slot_id ? String(action.slot_id) : undefined,
 })
 
+const normalizeContentMeta = (
+  value: unknown,
+): Record<string, ContentFieldMeta> | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([field, meta]) => {
+      if (!meta || typeof meta !== 'object') return null
+      const record = meta as Record<string, unknown>
+      return [
+        field,
+        {
+          locale: String(record.locale ?? ''),
+          provenance: String(record.provenance ?? 'unknown'),
+          stale: record.stale === true,
+          requested: record.requested ? String(record.requested) : undefined,
+        },
+      ] as const
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+  return entries.length ? Object.fromEntries(entries) : undefined
+}
+
 const normalizeExperience = (item: Record<string, unknown>): Experience => {
   const backendOptions = Array.isArray(item.options)
     ? (item.options as Array<Record<string, unknown>>)
@@ -169,10 +205,7 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
         ? String(option.validity_type)
         : undefined,
       start_times: slots.map((slot) =>
-        new Date(String(slot.starts_at)).toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
+        formatTime(resolvedLocale, String(slot.starts_at)),
       ),
       slots: slots.map((slot) => ({
         id: String(slot.id),
@@ -213,6 +246,8 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
     tags: Array.isArray(item.tags) ? item.tags.map(String) : [],
     badges,
     reason: item.reason ? String(item.reason) : undefined,
+    content_meta: normalizeContentMeta(item.content_meta),
+    locale: item.locale ? String(item.locale) : undefined,
     available:
       item.availability === 'AVAILABLE' ||
       badges.some((badge) => badge.toLowerCase() === 'available'),
@@ -279,10 +314,19 @@ const normalizeCart = async (
   )
 
   return backendItems.map((item) => {
-    const product = productsById.get(String(item.experience_id))
-    if (!product) {
+    const known = productsById.get(String(item.experience_id))
+    if (!known) {
       throw new Error(`Cart experience ${String(item.experience_id)} is unavailable.`)
     }
+    // The backend resolved this title in the requested locale; the cached
+    // product was resolved in whatever locale was current when it was fetched.
+    // Preferring the cache meant a Vietnamese cart listing English titles -
+    // and only for the products the shopper happened to have already seen,
+    // which is the hardest kind of bug to notice.
+    const title = item.experience_title
+      ? String(item.experience_title)
+      : known.title
+    const product = title === known.title ? known : { ...known, title }
     const startsAt = item.starts_at ? new Date(String(item.starts_at)) : null
     const participants = Array.isArray(item.participants)
       ? (item.participants as Array<Record<string, unknown>>)
@@ -299,10 +343,7 @@ const normalizeCart = async (
       slot_id: item.slot_id ? String(item.slot_id) : undefined,
       starts_at: startsAt?.toISOString(),
       date: startsAt?.toISOString().slice(0, 10) ?? '',
-      time: startsAt?.toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-      }),
+      time: startsAt ? formatTime(resolvedLocale, startsAt) : undefined,
       adults: countFor('adult', 'senior', 'student'),
       children: countFor('child', 'infant'),
       total: Number(item.quoted_total ?? 0),
@@ -406,7 +447,7 @@ export const api = {
         // for: a language that is enabled in the browser but not yet in the
         // catalogue resolves to English, and a switcher showing the request
         // rather than the result would claim a translation nobody has.
-        locale: String(payload.locale ?? 'en'),
+        locale: (resolvedLocale = String(payload.locale ?? 'en')),
         enabledLocales: Array.isArray(payload.enabled_locales)
           ? payload.enabled_locales.map(String)
           : ['en'],
@@ -428,7 +469,7 @@ export const api = {
         headers: jsonHeaders(),
         body: JSON.stringify({ locale }),
       })
-      return String(payload.locale ?? locale)
+      return (resolvedLocale = String(payload.locale ?? locale))
     } catch {
       return locale
     }

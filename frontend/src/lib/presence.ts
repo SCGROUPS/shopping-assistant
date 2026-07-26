@@ -1,4 +1,6 @@
 import type { CartItem } from '../types'
+import { getResolvedLocale } from './api'
+import { formatDate } from './format'
 
 /**
  * Assistant presence rules — see docs/SYSTEM_DESIGN.md §8.
@@ -85,7 +87,7 @@ export function findScheduleClash(
 
 const clockTime = (item: CartItem) =>
   item.starts_at
-    ? new Date(item.starts_at).toLocaleTimeString([], {
+    ? formatDate(getResolvedLocale(), item.starts_at, {
         hour: 'numeric',
         minute: '2-digit',
       })

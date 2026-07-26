@@ -20,7 +20,7 @@ import type {
 } from '../types'
 import { hasReviews } from '../lib/rating'
 import { VoiceInputButton } from './VoiceInputButton'
-import { useLocale } from '../lib/useLocale'
+import { useLocale, useT } from '../lib/useLocale'
 import { formatMoney } from '../lib/format'
 
 type AssistantPanelProps = {
@@ -54,6 +54,7 @@ export function AssistantPanel({
   // Formatting locale comes from the provider, not a module constant, so
   // prices re-render when the shopper switches language.
   const { locale } = useLocale()
+  const t = useT()
   const money = (currency: string, amount: number) =>
     formatMoney(locale, currency, amount)
   const [value, setValue] = useState('')
@@ -116,7 +117,7 @@ export function AssistantPanel({
       className={`assistant-panel ${open ? 'open' : ''}`}
       inert={!open}
       role="dialog"
-      aria-label="Mai shopping assistant"
+      aria-label={t('assistant.a11y.panel')}
     >
       <header className="assistant-header">
         <div className="assistant-identity">
@@ -124,14 +125,14 @@ export function AssistantPanel({
             <Sparkles size={18} />
           </span>
           <div>
-            <strong>Mai, your local trip curator</strong>
+            <strong>{t('assistant.title')}</strong>
             <span>
               <i />
-              Ready to help
+              {t('assistant.ready')}
             </span>
           </div>
         </div>
-        <button className="plain-icon" onClick={onClose} aria-label="Close assistant">
+        <button className="plain-icon" onClick={onClose} aria-label={t('assistant.a11y.close')}>
           <X size={20} />
         </button>
       </header>
@@ -228,7 +229,7 @@ export function AssistantPanel({
                         <div className="assistant-product-footer">
                           <span>
                             <i />
-                            Available on your date
+                            {t('assistant.availableOnDate')}
                           </span>
                           <div className="assistant-product-actions">
                             {productActions.slice(0, 3).map((action, index) => (
@@ -330,7 +331,7 @@ export function AssistantPanel({
               submit()
             }
           }}
-          placeholder="Ask about timing, access, prices, or build a plan…"
+          placeholder={t('assistant.placeholder')}
           rows={2}
         />
         <VoiceInputButton
@@ -348,7 +349,7 @@ export function AssistantPanel({
           className="assistant-send"
           onClick={submit}
           disabled={!value.trim() || busy}
-          aria-label="Send"
+          aria-label={t('assistant.a11y.send')}
         >
           <Send size={18} />
         </button>

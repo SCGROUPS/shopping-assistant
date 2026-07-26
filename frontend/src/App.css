@@ -3370,3 +3370,16 @@
   justify-content: center;
   width: 30px;
 }
+
+/* Content provenance notice — shown only when the text on screen is not in
+   the language the shopper asked for, or is a translation of a source that has
+   since changed. Deliberately quiet: it is an honest footnote, not a warning. */
+.content-provenance {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted, #6b7280);
+  font-style: italic;
+}

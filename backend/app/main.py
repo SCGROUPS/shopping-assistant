@@ -72,6 +72,25 @@ async def correlation_id(request: Request, call_next):
     response.headers["X-Correlation-ID"] = correlation
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
+    # Bodies differ by language and by session, and both arrive in headers
+    # rather than in the URL, so nothing downstream can tell two such responses
+    # apart without being told. This is not a precaution against a CDN we do
+    # not have yet: the browser's own cache is enough to hand a shopper who
+    # just switched to Vietnamese the English response it already had.
+    #
+    # Merged, not assigned. CORSMiddleware sets `Vary: Origin` on credentialed
+    # responses, and overwriting it makes one origin's preflight answer
+    # cacheable for another - trading a caching bug for a security one.
+    varies = [
+        part.strip()
+        for part in response.headers.get("Vary", "").split(",")
+        if part.strip()
+    ]
+    seen = {part.lower() for part in varies}
+    for header in ("Accept-Language", "X-Session-ID"):
+        if header.lower() not in seen:
+            varies.append(header)
+    response.headers["Vary"] = ", ".join(varies)
     return response
 
 

@@ -42,8 +42,10 @@ import {
   setDisplayCurrency,
   setPreferredLocale,
 } from './lib/api'
-import { formatDate as intlDate, formatMoney } from './lib/format'
+import { formatCount, formatDate as intlDate, formatMoney } from './lib/format'
 import { LocaleProvider } from './lib/LocaleContext'
+import { chromeReady, isFallback, translate } from './lib/i18n'
+import type { MessageKey } from './lib/i18n'
 import {
   detectFriction,
   findScheduleClash,
@@ -191,10 +193,15 @@ function App() {
   const [currency, setCurrency] = useState(getDisplayCurrency())
   const money = (code: string, amount: number) =>
     formatMoney(locale, code, amount)
+  // App renders the provider, so it sits above the context and cannot consume
+  // it. Same dictionary, same locale, just reached directly.
+  const t = (key: MessageKey) => translate(locale, key)
   // Seeded from the server's bootstrap, not from localStorage: a stored
   // preference for a language that has since been disabled would otherwise
   // show as selected while every string on the page arrived in English.
   const [locale, setLocale] = useState('en')
+  const [switchingLocale, setSwitchingLocale] = useState(false)
+  const localeGeneration = useRef(0)
   const [enabledLocales, setEnabledLocales] = useState<string[]>(['en'])
   const [crossSell, setCrossSell] = useState<Experience[]>([])
 
@@ -217,22 +224,49 @@ function App() {
   }, [cartOpen, cartItems, travellers])
 
   const changeLocale = (next: string) => {
+    if (next === locale || switchingLocale) return
+    // Every card, description and cart line is resolved server-side, so
+    // nothing on screen changes language until it is refetched. The chrome is
+    // deliberately *not* switched first: doing so produced a page with
+    // Vietnamese buttons around English descriptions for as long as the
+    // network took, which reads as a broken page rather than a loading one.
+    setSwitchingLocale(true)
     setPreferredLocale(next)
-    setLocale(next)
     api.track('filter_applied', { requested_locale: next })
-    // Every card, description and cart line is resolved server-side, so the
-    // text on screen is in the previous language until the current view is
-    // refetched. Nothing here translates in the browser.
+
+    // Two quick selections can complete out of order, and the loser would
+    // overwrite the winner - leaving the app displaying a language the
+    // shopper had already moved on from. Only the newest switch may commit.
+    const generation = ++localeGeneration.current
+
     void (async () => {
-      const confirmed = await api.setLocale(next)
-      setLocale(confirmed)
-      if (hasSearched) {
-        await runSearch(query, {}, false)
-      } else {
-        const experiences = await api.listExperiences()
-        if (experiences.length) setProducts(experiences)
+      try {
+        const confirmed = await api.setLocale(next)
+        const [experiences, recommended, detail] = await Promise.all([
+          hasSearched ? Promise.resolve(null) : api.listExperiences(),
+          api.recommendations(),
+          selectedProduct
+            ? api.experience(selectedProduct.id)
+            : Promise.resolve(undefined),
+        ])
+        if (hasSearched) await runSearch(query, {}, false)
+        if (generation !== localeGeneration.current) return
+
+        const refreshed = experiences?.length ? experiences : products
+        if (experiences?.length) setProducts(experiences)
+        if (recommended.length) setRecommendations(recommended)
+        if (detail) setSelectedProduct(detail)
+        // The refreshed list, not the closed-over stale one: passing
+        // `products` here meant the cart resolved its titles against
+        // pre-switch copies of exactly the products the shopper had seen.
+        setCartItems(await api.getCart([...refreshed, ...recommended]))
+
+        if (generation !== localeGeneration.current) return
+        // Committed last, so chrome and catalogue change in the same paint.
+        setLocale(confirmed)
+      } finally {
+        if (generation === localeGeneration.current) setSwitchingLocale(false)
       }
-      setCartItems(await api.getCart(products))
     })()
   }
 
@@ -297,7 +331,11 @@ function App() {
         ])
         setAssistantEnabled(cohort.assistantEnabled)
         setLocale(cohort.locale)
-        setEnabledLocales(cohort.enabledLocales)
+        // The backend says which locales have content; `chromeReady` says
+        // which have an interface to show it in. Offering one without the
+        // other produces a page that is half translated, and the shopper
+        // cannot tell that from one that is broken.
+        setEnabledLocales(cohort.enabledLocales.filter(chromeReady))
         if (experiences.length) setProducts(experiences)
         if (recommended.length) setRecommendations(recommended)
         setMessages((current) =>
@@ -831,27 +869,27 @@ function App() {
       {appError && (
         <div className="service-error" role="alert">
           {appError}
-          <button onClick={() => setAppError('')} aria-label="Dismiss service error">
+          <button onClick={() => setAppError('')} aria-label={t('app.a11y.dismissError')}>
             <X size={16} />
           </button>
         </div>
       )}
       <header className="site-header">
-        <a className="brand" href="#top" aria-label="Vietra home">
+        <a className="brand" href="#top" aria-label={t('app.a11y.home')}>
           <span className="brand-mark">V</span>
           <span>
             <strong>VIETRA</strong>
-            <small>Vietnam, beautifully planned</small>
+            <small>{t('app.tagline')}</small>
           </span>
         </a>
 
         <nav className={mobileMenuOpen ? 'mobile-open' : ''}>
-          <a href="#discover">Discover</a>
-          <a href="#recommendations">Curated for you</a>
+          <a href="#discover">{t('app.nav.discover')}</a>
+          <a href="#recommendations">{t('app.nav.curated')}</a>
           {assistantEnabled && (
             <button onClick={() => openAssistant()}>
               <Sparkles size={15} />
-              Ask Mai
+              {t('app.cta.askMai')}
             </button>
           )}
         </nav>
@@ -864,11 +902,12 @@ function App() {
             // something every page then fails to deliver.
             <label className="currency-button">
               <Languages size={16} />
-              <span className="sr-only">Language</span>
+              <span className="sr-only">{t('nav.language')}</span>
               <select
                 value={locale}
                 onChange={(event) => changeLocale(event.target.value)}
-                aria-label="Language"
+                aria-label={t('nav.language')}
+                disabled={switchingLocale}
               >
                 {enabledLocales.map((code) => (
                   <option key={code} value={code}>
@@ -881,11 +920,11 @@ function App() {
           )}
           <label className="currency-button">
             <Globe2 size={16} />
-            <span className="sr-only">Display currency</span>
+            <span className="sr-only">{t('nav.currency')}</span>
             <select
               value={currency}
               onChange={(event) => changeCurrency(event.target.value)}
-              aria-label="Display currency"
+              aria-label={t('nav.currency')}
             >
               {SUPPORTED_CURRENCIES.map((code) => (
                 <option key={code} value={code}>
@@ -898,7 +937,7 @@ function App() {
           <button
             className="cart-button"
             onClick={() => setCartOpen(true)}
-            aria-label="Open cart"
+            aria-label={t('nav.cart.open')}
           >
             <ShoppingBag size={19} />
             {cartItems.length > 0 && <span>{cartItems.length}</span>}
@@ -906,7 +945,7 @@ function App() {
           <button
             className="menu-button"
             onClick={() => setMobileMenuOpen((value) => !value)}
-            aria-label="Menu"
+            aria-label={t('app.a11y.menu')}
           >
             <Menu size={21} />
           </button>
@@ -931,10 +970,10 @@ function App() {
           <div className="hero-content">
             <span className="hero-kicker">
               <WandSparkles size={15} />
-              Thoughtful adventures, matched to you
+              {t('app.hero.title')}
             </span>
             <h1>
-              Find your own rhythm
+              {t('app.hero.subtitle')}
               <em> in Vietnam.</em>
             </h1>
             <p>
@@ -947,12 +986,12 @@ function App() {
                 <Search size={21} />
                 <span>
                   <small id="trip-search-label">
-                    What would make this trip memorable?
+                    {t('app.search.label')}
                   </small>
                   <input
                     value={query}
                     onChange={(event) => setQuery(event.target.value)}
-                    placeholder="A relaxed family day with food and culture…"
+                    placeholder={t('app.search.placeholder')}
                     aria-labelledby="trip-search-label"
                   />
                 </span>
@@ -968,12 +1007,12 @@ function App() {
               <label className="search-segment destination-segment">
                 <MapPin size={18} />
                 <span>
-                  <small>Destination</small>
+                  <small>{t('app.search.destination')}</small>
                   <strong>{destination}</strong>
                   <select
                     value={destination}
                     onChange={(event) => setDestination(event.target.value)}
-                    aria-label="Destination"
+                    aria-label={t('app.search.destination')}
                   >
                     {destinationOptions.map((name) => {
                       const count = facets.destination?.[name]
@@ -989,7 +1028,7 @@ function App() {
               <label className="search-segment">
                 <CalendarDays size={18} />
                 <span>
-                  <small>Date</small>
+                  <small>{t('app.search.date')}</small>
                   <strong>{formatDate(locale, date)}</strong>
                   <input
                     type="date"
@@ -997,14 +1036,14 @@ function App() {
                     min={isoDay(1)}
                     max={isoDay(30)}
                     onChange={(event) => setDate(event.target.value)}
-                    aria-label="Visit date"
+                    aria-label={t('app.a11y.visitDate')}
                   />
                 </span>
               </label>
               <div className="search-segment guest-segment">
                 <Users size={18} />
                 <span>
-                  <small>Guests</small>
+                  <small>{t('app.search.guests')}</small>
                   <strong>
                     {travellers} {travellers === 1 ? 'traveller' : 'travellers'}
                   </strong>
@@ -1012,7 +1051,7 @@ function App() {
                 <div className="guest-stepper">
                   <button
                     type="button"
-                    aria-label="Remove a traveller"
+                    aria-label={t('app.a11y.removeTraveller')}
                     disabled={travellers <= 1}
                     onClick={() =>
                       setTravellers((value) => Math.max(1, value - 1))
@@ -1022,7 +1061,7 @@ function App() {
                   </button>
                   <button
                     type="button"
-                    aria-label="Add a traveller"
+                    aria-label={t('app.a11y.addTraveller')}
                     disabled={travellers >= 12}
                     onClick={() =>
                       setTravellers((value) => Math.min(12, value + 1))
@@ -1034,12 +1073,12 @@ function App() {
               </div>
               <button className="search-submit" disabled={searching}>
                 {searching ? <span className="search-loader" /> : <Search size={20} />}
-                <span>Explore</span>
+                <span>{t('app.search.explore')}</span>
               </button>
             </form>
 
             <div className="suggestion-row">
-              <span>Try</span>
+              <span>{t('app.search.try')}</span>
               {suggestionQueries.map((suggestion) => (
                 <button
                   key={suggestion}
@@ -1054,15 +1093,15 @@ function App() {
           <div className="trust-strip">
             <span>
               <TicketCheck size={18} />
-              Instant mobile vouchers
+              {t('app.trust.vouchers')}
             </span>
             <span>
               <ShieldCheck size={18} />
-              Flexible cancellation
+              {t('app.trust.cancellation')}
             </span>
             <span>
               <Sparkles size={18} />
-              Recommendations that explain why
+              {t('app.trust.explain')}
             </span>
           </div>
         </section>
@@ -1097,8 +1136,8 @@ function App() {
                   <Sparkles size={18} />
                 </span>
                 <div>
-                  <small>Not sure where to begin?</small>
-                  <strong>Let Mai curate your day</strong>
+                  <small>{t('app.cta.unsure')}</small>
+                  <strong>{t('app.cta.letMai')}</strong>
                 </div>
                 <ArrowRight size={18} />
               </button>
@@ -1135,7 +1174,7 @@ function App() {
               onClick={() => setFilterPanelOpen((open) => !open)}
             >
               <Filter size={16} />
-              All filters
+              {t('app.filter.all')}
               {activeFilterCount > 0 && <span>{activeFilterCount}</span>}
             </button>
           </div>
@@ -1148,7 +1187,7 @@ function App() {
                   type="number"
                   min={0}
                   step={100000}
-                  placeholder="No limit"
+                  placeholder={t('app.filter.noLimit')}
                   value={advanced.maxTotalPrice ?? ''}
                   onChange={(event) =>
                     setAdvanced((current) => ({
@@ -1158,11 +1197,11 @@ function App() {
                         : undefined,
                     }))
                   }
-                  aria-label="Maximum total price"
+                  aria-label={t('app.a11y.maxPrice')}
                 />
               </div>
               <div className="filter-group">
-                <h4>Minimum rating</h4>
+                <h4>{t('app.filter.minRating')}</h4>
                 <div className="chip-row">
                   {ratingChoices.map((value) => (
                     <button
@@ -1181,7 +1220,7 @@ function App() {
                 </div>
               </div>
               <div className="filter-group">
-                <h4>Duration</h4>
+                <h4>{t('app.filter.duration')}</h4>
                 <div className="chip-row">
                   {durationChoices.map((choice) => (
                     <button
@@ -1207,7 +1246,7 @@ function App() {
                 </div>
               </div>
               <div className="filter-group">
-                <h4>Setting</h4>
+                <h4>{t('app.filter.setting')}</h4>
                 <div className="chip-row">
                   {['indoor', 'outdoor'].map((value) => (
                     <button
@@ -1229,7 +1268,7 @@ function App() {
                 </div>
               </div>
               <div className="filter-group">
-                <h4>Booking terms</h4>
+                <h4>{t('app.filter.terms')}</h4>
                 <div className="chip-row">
                   <button
                     className={advanced.instantConfirmation ? 'active' : ''}
@@ -1240,7 +1279,7 @@ function App() {
                       }))
                     }
                   >
-                    Instant confirmation
+                    {t('app.filter.instant')}
                   </button>
                   <button
                     className={advanced.freeCancellation ? 'active' : ''}
@@ -1251,7 +1290,7 @@ function App() {
                       }))
                     }
                   >
-                    Free cancellation
+                    {t('app.filter.freeCancel')}
                   </button>
                   <button
                     className={advanced.familyFriendly ? 'active' : ''}
@@ -1262,12 +1301,12 @@ function App() {
                       }))
                     }
                   >
-                    Family friendly
+                    {t('app.filter.family')}
                   </button>
                 </div>
               </div>
               <div className="filter-group">
-                <h4>Accessibility</h4>
+                <h4>{t('app.filter.accessibility')}</h4>
                 <div className="chip-row">
                   {accessibilityChoices.map((value) => (
                     <button
@@ -1290,14 +1329,14 @@ function App() {
                     </button>
                   ))}
                 </div>
-                <small>Accessibility needs are never relaxed.</small>
+                <small>{t('app.filter.accessibilityNote')}</small>
               </div>
               <button
                 className="filter-reset"
                 onClick={() => setAdvanced(emptyAdvanced)}
                 disabled={activeFilterCount === 0}
               >
-                Clear filters
+                {t('app.filter.clear')}
               </button>
             </div>
           )}
@@ -1342,13 +1381,13 @@ function App() {
           {visibleProducts.length === 0 && (
             <div className="empty-results">
               <Compass size={30} />
-              <h3>No exact match yet</h3>
+              <h3>{t('app.empty.noMatch')}</h3>
               <p>
                 Mai can relax a preference while keeping your important
                 constraints intact.
               </p>
               <button onClick={() => openAssistant(nudge ?? undefined)}>
-                Ask Mai to help
+                {t('app.cta.askHelp')}
               </button>
             </div>
           )}
@@ -1356,8 +1395,8 @@ function App() {
 
         <section className="recommendation-section" id="recommendations">
           <div className="recommendation-copy">
-            <span className="eyebrow">A day that flows</span>
-            <h2>Curated pairings, not random upsells.</h2>
+            <span className="eyebrow">{t('app.promo.flow')}</span>
+            <h2>{t('app.promo.flowBody')}</h2>
             <p>
               These experiences work together by location, pace, and time of
               day. Add one and Mai will reshape the rest of your plan.
@@ -1365,14 +1404,14 @@ function App() {
             <div className="plan-story">
               <span>
                 <i>08:30</i>
-                <strong>Cook, taste, connect</strong>
+                <strong>{t('app.promo.cook')}</strong>
                 <small>Market-to-table class · Hoi An</small>
               </span>
               <b />
               <span>
                 <i>16:30</i>
-                <strong>Golden-hour old town</strong>
-                <small>Lanterns & riverside flavours</small>
+                <strong>{t('app.promo.oldTown')}</strong>
+                <small>{t('app.promo.lanterns')}</small>
               </span>
             </div>
             <button
@@ -1382,7 +1421,7 @@ function App() {
               }
             >
               <Sparkles size={16} />
-              Ask Mai to complete this day
+              {t('app.cta.completeDay')}
             </button>
           </div>
           <div className="recommendation-cards">
@@ -1433,7 +1472,7 @@ function App() {
                   </span>
                   <div>
                     <strong>Mai</strong>
-                    <small>Your local curator</small>
+                    <small>{t('app.mai.role')}</small>
                   </div>
                 </header>
                 <p>
@@ -1442,15 +1481,15 @@ function App() {
                 </p>
                 <button>
                   <Check size={14} />
-                  Apply this plan
+                  {t('app.cta.applyPlan')}
                 </button>
               </div>
-              <span className="floating-tag tag-one">Under your budget</span>
-              <span className="floating-tag tag-two">No schedule conflicts</span>
+              <span className="floating-tag tag-one">{t('app.mai.budget')}</span>
+              <span className="floating-tag tag-two">{t('app.mai.noClash')}</span>
             </div>
             <div className="assistant-promo-copy">
-              <span className="eyebrow">More than a chatbot</span>
-              <h2>A local-minded assistant that can actually book.</h2>
+              <span className="eyebrow">{t('app.mai.more')}</span>
+              <h2>{t('app.mai.moreBody')}</h2>
               <p>
                 Mai remembers your filters, explains trade-offs, checks the latest
                 option and price, then turns recommendations into actions you can
@@ -1469,7 +1508,7 @@ function App() {
               </ul>
               <button className="primary-button" onClick={() => openAssistant()}>
                 <Bot size={18} />
-                Start planning with Mai
+                {t('app.cta.startPlanning')}
               </button>
             </div>
           </section>
@@ -1481,7 +1520,7 @@ function App() {
           <span className="brand-mark">V</span>
           <span>
             <strong>VIETRA</strong>
-            <small>Vietnam, beautifully planned</small>
+            <small>{t('app.tagline')}</small>
           </span>
         </a>
         <p>
@@ -1498,7 +1537,7 @@ function App() {
               <p>{nudge.label}</p>
               <button
                 className="nudge-dismiss"
-                aria-label="Dismiss suggestion"
+                aria-label={t('app.a11y.dismissSuggestion')}
                 onClick={() => {
                   api.track('assistant_nudge_dismissed', {
                     trigger: nudge.signal,
@@ -1589,7 +1628,7 @@ function App() {
             <button
               className="modal-close"
               onClick={() => setSelectedProduct(null)}
-              aria-label="Close details"
+              aria-label={t('app.a11y.closeDetails')}
             >
               <X size={20} />
             </button>
@@ -1612,7 +1651,7 @@ function App() {
             <div className="product-modal-body">
               <div className="modal-title-row">
                 <div>
-                  <span className="eyebrow">Chosen for your trip</span>
+                  <span className="eyebrow">{t('app.detail.chosen')}</span>
                   <h2>{selectedProduct.title}</h2>
                 </div>
                 <button className="plain-icon">
@@ -1625,7 +1664,7 @@ function App() {
                     <Star size={15} fill="currentColor" />
                     <strong>{selectedProduct.rating.toFixed(1)}</strong>
                     <span>
-                      {selectedProduct.review_count.toLocaleString()} verified guests
+                      {formatCount(locale, selectedProduct.review_count)} verified guests
                     </span>
                   </>
                 ) : (
@@ -1633,27 +1672,45 @@ function App() {
                 )}
               </div>
               <p>{selectedProduct.short_description}</p>
+              {(() => {
+                // Said once for the record as a whole rather than per field: a
+                // detail page that repeated "not translated" beside every
+                // paragraph would be noise, and the shopper's question is
+                // whether this page is in their language, not which of its
+                // eight strings are.
+                const meta = selectedProduct.content_meta ?? {}
+                const fields = Object.values(meta)
+                const fallback = fields.some(isFallback)
+                const stale = fields.some((field) => field.stale)
+                if (!fallback && !stale) return null
+                return (
+                  <p className="content-provenance" role="note">
+                    <Languages size={14} />
+                    {fallback ? t('content.fallback') : t('content.stale')}
+                  </p>
+                )
+              })()}
               <div className="reason-box">
                 <Sparkles size={18} />
                 <span>
-                  <strong>Why Mai recommends this</strong>
+                  <strong>{t('app.detail.why')}</strong>
                   {selectedProduct.reason}
                 </span>
               </div>
               <div className="detail-grid">
                 <span>
                   <Clock3 size={18} />
-                  <small>Duration</small>
+                  <small>{t('app.filter.duration')}</small>
                   <strong>{Math.round(selectedProduct.duration_minutes / 60)} hours</strong>
                 </span>
                 <span>
                   <CalendarDays size={18} />
-                  <small>Selected date</small>
+                  <small>{t('app.detail.selectedDate')}</small>
                   <strong>{formatDate(locale, date)}</strong>
                 </span>
                 <span>
                   <Users size={18} />
-                  <small>Guests</small>
+                  <small>{t('app.search.guests')}</small>
                   <strong>{travellers} travellers</strong>
                 </span>
               </div>
@@ -1675,7 +1732,7 @@ function App() {
               </div>
               <div className="modal-booking-row">
                 <div>
-                  <span>Total from</span>
+                  <span>{t('app.detail.totalFrom')}</span>
                   <strong>
                     {money(
                       selectedProduct.currency,
@@ -1693,14 +1750,14 @@ function App() {
                   }}
                 >
                   <MessageCircle size={18} />
-                  Ask about this
+                  {t('app.cta.askAbout')}
                 </button>
                 <button
                   className="checkout-button"
                   onClick={() => void addToCart(selectedProduct)}
                 >
                   <ShoppingBag size={18} />
-                  Add to trip
+                  {t('app.cta.addToTrip')}
                 </button>
               </div>
             </div>
@@ -1740,7 +1797,7 @@ function App() {
         <button
           className="mobile-menu-dismiss"
           onClick={() => setMobileMenuOpen(false)}
-          aria-label="Close menu"
+          aria-label={t('app.a11y.closeMenu')}
         >
           <Minus />
         </button>
