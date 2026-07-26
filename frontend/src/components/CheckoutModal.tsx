@@ -14,13 +14,8 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import type { CartItem, Voucher } from '../types'
-
-const money = (currency: string, amount: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: currency === 'VND' ? 0 : 2,
-  }).format(amount)
+import { useLocale, useT } from '../lib/useLocale'
+import { formatMoney } from '../lib/format'
 
 type CheckoutModalProps = {
   open: boolean
@@ -37,6 +32,12 @@ export function CheckoutModal({
   onClose,
   onConfirm,
 }: CheckoutModalProps) {
+  // Formatting locale comes from the provider, not a module constant, so
+  // prices re-render when the shopper switches language.
+  const { locale } = useLocale()
+  const t = useT()
+  const money = (currency: string, amount: number) =>
+    formatMoney(locale, currency, amount)
   const [name, setName] = useState('Alex Traveller')
   const [email, setEmail] = useState('alex@example.com')
   const [busy, setBusy] = useState(false)
@@ -69,7 +70,7 @@ export function CheckoutModal({
             <span className="eyebrow">{voucher ? 'Booking confirmed' : 'Secure demo checkout'}</span>
             <h2>{voucher ? 'Your Vietnam moments are booked' : 'One last check'}</h2>
           </div>
-          <button className="plain-icon" onClick={onClose} aria-label="Close checkout">
+          <button className="plain-icon" onClick={onClose} aria-label={t('checkout.close')}>
             <X size={20} />
           </button>
         </header>
@@ -103,7 +104,7 @@ export function CheckoutModal({
                 </div>
               )}
               <div className="voucher-details">
-                <span>Booking reference</span>
+                <span>{t('checkout.reference')}</span>
                 <strong>{voucher.booking_reference}</strong>
                 <small>{voucher.voucher_reference}</small>
               </div>
@@ -125,8 +126,8 @@ export function CheckoutModal({
                 <div className="section-heading">
                   <span>1</span>
                   <div>
-                    <h3>Lead traveller</h3>
-                    <p>Your vouchers will be sent here.</p>
+                    <h3>{t('checkout.leadTraveller')}</h3>
+                    <p>{t('checkout.emailNote')}</p>
                   </div>
                 </div>
                 <label>
@@ -151,14 +152,14 @@ export function CheckoutModal({
                 <div className="section-heading">
                   <span>2</span>
                   <div>
-                    <h3>Demo payment</h3>
-                    <p>No card details or real money are used.</p>
+                    <h3>{t('checkout.demoPayment')}</h3>
+                    <p>{t('checkout.demoNote')}</p>
                   </div>
                 </div>
                 <div className="demo-payment-card">
                   <CreditCard size={24} />
                   <span>
-                    <strong>Vietra test wallet</strong>
+                    <strong>{t('checkout.wallet')}</strong>
                     <small>•••• 4242 · Always approved</small>
                   </span>
                   <Check size={18} />
@@ -172,7 +173,7 @@ export function CheckoutModal({
             </div>
 
             <aside className="order-summary">
-              <h3>Your booking</h3>
+              <h3>{t('checkout.title')}</h3>
               {items.map((item) => (
                 <div className="summary-item" key={item.id}>
                   <img
@@ -201,7 +202,7 @@ export function CheckoutModal({
                 </div>
               ))}
               <div className="summary-total">
-                <span>Total</span>
+                <span>{t('checkout.total')}</span>
                 <strong>
                   {money(currency, total)}
                 </strong>

@@ -14,6 +14,8 @@ import {
 import { useState } from 'react'
 import type { Experience } from '../types'
 import { NEW_LISTING_LABEL, hasReviews } from '../lib/rating'
+import { useLocale } from '../lib/useLocale'
+import { formatMoney } from '../lib/format'
 
 type ProductCardProps = {
   product: Experience
@@ -30,13 +32,6 @@ const durationLabel = (minutes: number) => {
   return remainder ? `${hours}h ${remainder}m` : `${hours} hours`
 }
 
-const money = (currency: string, amount: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: currency === 'VND' ? 0 : 2,
-  }).format(amount)
-
 export function ProductCard({
   product,
   compact = false,
@@ -44,6 +39,11 @@ export function ProductCard({
   onAdd,
   onAsk,
 }: ProductCardProps) {
+  // Formatting locale comes from the provider, not a module constant, so
+  // prices re-render when the shopper switches language.
+  const { locale } = useLocale()
+  const money = (currency: string, amount: number) =>
+    formatMoney(locale, currency, amount)
   const [saved, setSaved] = useState(false)
 
   return (

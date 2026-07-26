@@ -17,9 +17,28 @@ const SESSION_ID =
   localStorage.getItem('vietra-session-id') ?? crypto.randomUUID()
 localStorage.setItem('vietra-session-id', SESSION_ID)
 
-const jsonHeaders = {
+// A function, not a constant. As an object literal evaluated once at module
+// load it captured whatever the locale was at start-up, so switching language
+// would have changed the header on requests that happened to build their own
+// and left it stale on the ten that spread this. Making it a call means the
+// compiler finds every one of those sites instead of leaving one behind.
+const jsonHeaders = () => ({
   'Content-Type': 'application/json',
   'X-Session-ID': SESSION_ID,
+  'Accept-Language': preferredLocale,
+})
+
+// Endonyms: a language menu is read by someone who cannot yet read the page,
+// so "Tieng Viet" is findable where "Vietnamese" is not.
+export const LOCALE_NAMES: Record<string, string> = {
+  en: 'English',
+  vi: 'Tiếng Việt',
+  zh: '中文',
+  ja: '日本語',
+  ko: '한국어',
+  fr: 'Français',
+  de: 'Deutsch',
+  es: 'Español',
 }
 
 export const SUPPORTED_CURRENCIES = [
@@ -32,6 +51,19 @@ export const SUPPORTED_CURRENCIES = [
   'KRW',
   'JPY',
 ] as const
+
+// The shopper's language, sent on every request as `Accept-Language`. The
+// server negotiates and decides - the header is a preference, not an
+// instruction - and every response says which locale it actually resolved,
+// which is what the UI reads rather than assuming it got what it asked for.
+let preferredLocale = localStorage.getItem('vietra-locale') ?? ''
+
+export const setPreferredLocale = (locale: string) => {
+  preferredLocale = locale
+  localStorage.setItem('vietra-locale', locale)
+}
+
+export const getPreferredLocale = () => preferredLocale
 
 // Display currency is presentation state, so it lives here rather than being
 // threaded through every call signature. The authoritative VND price always
@@ -67,6 +99,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       'X-Session-ID': SESSION_ID,
+      // Before the spread, so an explicit per-call header still wins, and
+      // omitted entirely when the shopper has expressed no preference - an
+      // empty `Accept-Language` is a claim about language, and the browser's
+      // own header is a better guess than ours.
+      ...(preferredLocale ? { 'Accept-Language': preferredLocale } : {}),
       ...init?.headers,
     },
   })
@@ -345,7 +382,7 @@ export const api = {
   ): void {
     void request('/events', {
       method: 'POST',
-      headers: jsonHeaders,
+      headers: jsonHeaders(),
       body: JSON.stringify({
         event_type: eventType,
         experience_id: options.experienceId ?? null,
@@ -356,13 +393,44 @@ export const api = {
   },
 
   /** Cohort assignment, resolved before first paint. */
-  async sessionContext(): Promise<{ assistantEnabled: boolean }> {
+  async sessionContext(): Promise<{
+    assistantEnabled: boolean
+    locale: string
+    enabledLocales: string[]
+  }> {
     try {
       const payload = await request<Record<string, unknown>>('/session/context')
-      return { assistantEnabled: payload.assistant_enabled !== false }
+      return {
+        assistantEnabled: payload.assistant_enabled !== false,
+        // The locale the server *resolved*, which is not always the one asked
+        // for: a language that is enabled in the browser but not yet in the
+        // catalogue resolves to English, and a switcher showing the request
+        // rather than the result would claim a translation nobody has.
+        locale: String(payload.locale ?? 'en'),
+        enabledLocales: Array.isArray(payload.enabled_locales)
+          ? payload.enabled_locales.map(String)
+          : ['en'],
+      }
     } catch {
-      // A telemetry outage must not remove the assistant.
-      return { assistantEnabled: true }
+      // A telemetry outage must not remove the assistant, and must not offer a
+      // language list the server never confirmed.
+      return { assistantEnabled: true, locale: 'en', enabledLocales: ['en'] }
+    }
+  },
+
+  async setLocale(locale: string): Promise<string> {
+    // Persisted server-side as well as locally, because the session preference
+    // is what the assistant and any later device read - localStorage is this
+    // browser's opinion, and the conversation outlives the tab.
+    try {
+      const payload = await request<Record<string, unknown>>('/session/locale', {
+        method: 'PUT',
+        headers: jsonHeaders(),
+        body: JSON.stringify({ locale }),
+      })
+      return String(payload.locale ?? locale)
+    } catch {
+      return locale
     }
   },
 
@@ -391,7 +459,7 @@ export const api = {
     try {
       const payload = await request<Record<string, unknown>>('/search', {
         method: 'POST',
-        headers: jsonHeaders,
+        headers: jsonHeaders(),
         body: JSON.stringify({
           query,
           filters,
@@ -463,7 +531,7 @@ export const api = {
     try {
       const conversation = await request<{ id: string }>('/conversations', {
         method: 'POST',
-        headers: jsonHeaders,
+        headers: jsonHeaders(),
         body: JSON.stringify({
           query: context.query,
           filters: context.filters ?? {},
@@ -491,7 +559,7 @@ export const api = {
         `${API_BASE}/conversations/${conversationId}/messages?stream=true`,
         {
           method: 'POST',
-          headers: { ...jsonHeaders, Accept: 'text/event-stream' },
+          headers: { ...jsonHeaders(), Accept: 'text/event-stream' },
           body: JSON.stringify({ message: text, context }),
         },
       )
@@ -654,7 +722,7 @@ export const api = {
 
       const response = await request<Record<string, unknown>>('/cart/items', {
         method: 'POST',
-        headers: { ...jsonHeaders, 'Idempotency-Key': crypto.randomUUID() },
+        headers: { ...jsonHeaders(), 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({
           experience_id: product.id,
           option_id: optionId,
@@ -695,7 +763,7 @@ export const api = {
       `/cart/items/${itemId}`,
       {
         method: 'DELETE',
-        headers: { ...jsonHeaders, 'Idempotency-Key': crypto.randomUUID() },
+        headers: { ...jsonHeaders(), 'Idempotency-Key': crypto.randomUUID() },
       },
     )
     return normalizeCart(response, knownProducts)
@@ -722,13 +790,13 @@ export const api = {
         '/checkout/prepare',
         {
           method: 'POST',
-          headers: { ...jsonHeaders, 'Idempotency-Key': crypto.randomUUID() },
+          headers: { ...jsonHeaders(), 'Idempotency-Key': crypto.randomUUID() },
           body: JSON.stringify({}),
         },
       )
       const booking = await request<Record<string, unknown>>('/checkout/confirm', {
         method: 'POST',
-        headers: { ...jsonHeaders, 'Idempotency-Key': crypto.randomUUID() },
+        headers: { ...jsonHeaders(), 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({
           confirmation: 'CONFIRM',
           customer_details: customer,

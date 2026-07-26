@@ -20,6 +20,8 @@ import type {
 } from '../types'
 import { hasReviews } from '../lib/rating'
 import { VoiceInputButton } from './VoiceInputButton'
+import { useLocale } from '../lib/useLocale'
+import { formatMoney } from '../lib/format'
 
 type AssistantPanelProps = {
   open: boolean
@@ -39,13 +41,6 @@ const prompts = [
   'Find accessible options',
 ]
 
-const money = (currency: string, amount: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: currency === 'VND' ? 0 : 2,
-  }).format(amount)
-
 export function AssistantPanel({
   open,
   messages,
@@ -56,6 +51,11 @@ export function AssistantPanel({
   onAction,
   onView,
 }: AssistantPanelProps) {
+  // Formatting locale comes from the provider, not a module constant, so
+  // prices re-render when the shopper switches language.
+  const { locale } = useLocale()
+  const money = (currency: string, amount: number) =>
+    formatMoney(locale, currency, amount)
   const [value, setValue] = useState('')
   const [speakingMessageId, setSpeakingMessageId] = useState<string>()
   const endRef = useRef<HTMLDivElement>(null)

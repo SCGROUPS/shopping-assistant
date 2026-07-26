@@ -8,6 +8,7 @@ import {
   Compass,
   Filter,
   Globe2,
+  Languages,
   Heart,
   MapPin,
   Menu,
@@ -35,10 +36,14 @@ import { VoiceInputButton } from './components/VoiceInputButton'
 import { categories, demoExperiences } from './data/demo'
 import {
   SUPPORTED_CURRENCIES,
+  LOCALE_NAMES,
   api,
   getDisplayCurrency,
   setDisplayCurrency,
+  setPreferredLocale,
 } from './lib/api'
+import { formatDate as intlDate, formatMoney } from './lib/format'
+import { LocaleProvider } from './lib/LocaleContext'
 import {
   detectFriction,
   findScheduleClash,
@@ -79,12 +84,13 @@ const suggestionQueries = [
   'Rainy-day experiences',
 ]
 
-const formatDate = (date: string) => {
+const formatDate = (locale: string, date: string) => {
   if (!date) return 'Choose date'
-  return new Intl.DateTimeFormat('en-US', {
+  // Noon, so a timezone west of UTC cannot render the previous day.
+  return intlDate(locale, `${date}T12:00:00`, {
     month: 'short',
     day: 'numeric',
-  }).format(new Date(`${date}T12:00:00`))
+  })
 }
 
 const ANY_DESTINATION = 'Anywhere in Vietnam'
@@ -129,13 +135,6 @@ const accessibilityChoices = [
   'audio guide',
   'sign language',
 ]
-
-const money = (currency: string, amount: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: currency === 'VND' ? 0 : 2,
-  }).format(amount)
 
 function App() {
   const [products, setProducts] = useState<Experience[]>(
@@ -190,6 +189,13 @@ function App() {
   // otherwise, so a telemetry outage never silently removes the assistant.
   const [assistantEnabled, setAssistantEnabled] = useState(true)
   const [currency, setCurrency] = useState(getDisplayCurrency())
+  const money = (code: string, amount: number) =>
+    formatMoney(locale, code, amount)
+  // Seeded from the server's bootstrap, not from localStorage: a stored
+  // preference for a language that has since been disabled would otherwise
+  // show as selected while every string on the page arrived in English.
+  const [locale, setLocale] = useState('en')
+  const [enabledLocales, setEnabledLocales] = useState<string[]>(['en'])
   const [crossSell, setCrossSell] = useState<Experience[]>([])
 
   useEffect(() => {
@@ -209,6 +215,26 @@ function App() {
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cartOpen, cartItems, travellers])
+
+  const changeLocale = (next: string) => {
+    setPreferredLocale(next)
+    setLocale(next)
+    api.track('filter_applied', { requested_locale: next })
+    // Every card, description and cart line is resolved server-side, so the
+    // text on screen is in the previous language until the current view is
+    // refetched. Nothing here translates in the browser.
+    void (async () => {
+      const confirmed = await api.setLocale(next)
+      setLocale(confirmed)
+      if (hasSearched) {
+        await runSearch(query, {}, false)
+      } else {
+        const experiences = await api.listExperiences()
+        if (experiences.length) setProducts(experiences)
+      }
+      setCartItems(await api.getCart(products))
+    })()
+  }
 
   const changeCurrency = (next: string) => {
     setDisplayCurrency(next)
@@ -270,6 +296,8 @@ function App() {
           api.sessionContext(),
         ])
         setAssistantEnabled(cohort.assistantEnabled)
+        setLocale(cohort.locale)
+        setEnabledLocales(cohort.enabledLocales)
         if (experiences.length) setProducts(experiences)
         if (recommended.length) setRecommendations(recommended)
         setMessages((current) =>
@@ -319,11 +347,11 @@ function App() {
         ? 'No exact match'
         : `${count} ${count === 1 ? 'experience' : 'experiences'}`,
       destination,
-      formatDate(date),
+      formatDate(locale, date),
       `${travellers} ${travellers === 1 ? 'traveller' : 'travellers'}`,
     ]
     return parts.join(' · ')
-  }, [visibleProducts.length, destination, date, travellers])
+  }, [visibleProducts.length, destination, date, travellers, locale])
 
   const resultsRef = useRef<HTMLElement>(null)
   const pendingScroll = useRef(false)
@@ -798,6 +826,7 @@ function App() {
   }
 
   return (
+    <LocaleProvider locale={locale}>
     <div className={`app-shell ${assistantOpen ? 'assistant-docked' : ''}`}>
       {appError && (
         <div className="service-error" role="alert">
@@ -828,6 +857,28 @@ function App() {
         </nav>
 
         <div className="header-actions">
+          {enabledLocales.length > 1 && (
+            // Hidden entirely while only one language is enabled. A switcher
+            // offering a single choice is not a control, and one offering
+            // languages the catalogue has not been translated into promises
+            // something every page then fails to deliver.
+            <label className="currency-button">
+              <Languages size={16} />
+              <span className="sr-only">Language</span>
+              <select
+                value={locale}
+                onChange={(event) => changeLocale(event.target.value)}
+                aria-label="Language"
+              >
+                {enabledLocales.map((code) => (
+                  <option key={code} value={code}>
+                    {LOCALE_NAMES[code] ?? code}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown size={14} />
+            </label>
+          )}
           <label className="currency-button">
             <Globe2 size={16} />
             <span className="sr-only">Display currency</span>
@@ -939,7 +990,7 @@ function App() {
                 <CalendarDays size={18} />
                 <span>
                   <small>Date</small>
-                  <strong>{formatDate(date)}</strong>
+                  <strong>{formatDate(locale, date)}</strong>
                   <input
                     type="date"
                     value={date}
@@ -1598,7 +1649,7 @@ function App() {
                 <span>
                   <CalendarDays size={18} />
                   <small>Selected date</small>
-                  <strong>{formatDate(date)}</strong>
+                  <strong>{formatDate(locale, date)}</strong>
                 </span>
                 <span>
                   <Users size={18} />
@@ -1695,6 +1746,7 @@ function App() {
         </button>
       )}
     </div>
+    </LocaleProvider>
   )
 }
 
