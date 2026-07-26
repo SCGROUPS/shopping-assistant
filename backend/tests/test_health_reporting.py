@@ -13,7 +13,7 @@ import pytest
 from httpx import AsyncClient
 
 from app.api.schemas import SearchRequest
-from app.assistant.provider import DemoAIProvider
+from app.assistant.provider import AzureOpenAIProvider, DemoAIProvider
 from app.common.degradation import intent_health
 from app.search.service import SearchService
 
@@ -119,4 +119,45 @@ async def test_a_service_with_no_model_reports_itself_degraded():
         "a service that cannot interpret anything served a page that claimed "
         "it had understood the query"
     )
+    intent_health.reset()
+
+
+def test_the_real_provider_declares_that_it_interprets_language():
+    """The inverse of the test above, which nothing else covers.
+
+    `interprets_language` now drives a shopper-visible notice and the deployment
+    smoke gate, so it is wrong in both directions. Flipping the Azure provider's
+    flag to False failed no test at all: every production page would carry
+    "we couldn't understand you" and every deploy would go red, with nothing in
+    the suite objecting. Asserted on the class, not an instance, because
+    constructing one needs live credentials.
+    """
+    assert AzureOpenAIProvider.interprets_language is True, (
+        "the provider that actually calls the model is declaring that it only "
+        "matches keywords; every page it serves will be marked degraded"
+    )
+    assert DemoAIProvider.interprets_language is False, (
+        "the provider that only matches keywords is claiming to interpret "
+        "language; the silent outage becomes invisible again"
+    )
+
+
+async def test_the_probe_verdict_is_reported_under_the_names_an_alert_reads(
+    client: AsyncClient,
+):
+    """The newest keys were the only ones in this block not pinned by name.
+
+    Renaming "ok" to "healthy" and "detail" to "why" failed nothing, which is
+    the same gap this file's own docstring was written about - a rename is a
+    silent change to whatever is parsing the endpoint.
+    """
+    intent_health.reset()
+    intent_health.record_probe(ok=False, detail="the deployment rejected our request")
+
+    body = (await client.get("/api/v1/health")).json()
+
+    assert body["intent_extraction"]["probe"] == {
+        "ok": False,
+        "detail": "the deployment rejected our request",
+    }
     intent_health.reset()

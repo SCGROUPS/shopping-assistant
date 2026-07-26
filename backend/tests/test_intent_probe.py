@@ -6,9 +6,11 @@ call at startup turns that into a failed deployment.
 """
 
 import asyncio
+import logging
 
 import pytest
 
+from app import main
 from app.common.degradation import intent_health
 from app.common.intent_probe import ProbeOutcome, probe_intent
 
@@ -503,3 +505,35 @@ async def test_a_supervised_run_starts_from_a_clean_slate(monkeypatch):
         "down by a rejection that belonged to an earlier run"
     )
     intent_health.reset()
+
+
+@pytest.mark.asyncio
+async def test_the_skip_log_carries_the_word_the_sev_0_alert_matches(monkeypatch, caplog):
+    """The whole detection surface for the quietest outage is one log line.
+
+    When no endpoint is configured the probe records ok=True - correctly, it
+    cannot judge a model it never called - so readiness passes and the failure
+    counters stay at zero. Nothing else in the process says anything. The sev-0
+    rule in infra/bicep/resources.bicep fires on `has 'skipped'`, which makes
+    that single word the difference between a paged outage and a silent one.
+
+    Demoting this line to info, or rewording it to drop "skipped", previously
+    failed no test in the suite.
+    """
+    settings = main.get_settings()
+    monkeypatch.setattr(settings, "azure_openai_endpoint", "", raising=False)
+    monkeypatch.setattr(settings, "demo_mode", True, raising=False)
+    intent_health.reset()
+
+    with caplog.at_level(logging.ERROR, logger=main.logger.name):
+        await main._run_intent_probe()
+
+    skipped = [r for r in caplog.records if "Intent probe" in r.getMessage()]
+    assert skipped, "the probe skipped the model and said nothing at all"
+    assert any(r.levelno >= logging.ERROR for r in skipped), (
+        "logged below ERROR; the alert rule reads error output"
+    )
+    assert any("skipped" in r.getMessage() for r in skipped), (
+        "the sev-0 rule matches on the word 'skipped' and it is no longer in "
+        "the message; the alert would never fire"
+    )

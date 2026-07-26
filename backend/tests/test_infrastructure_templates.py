@@ -40,8 +40,13 @@ def _without_comments(source: str) -> str:
 
     The lookbehind keeps `https://...` intact, which is otherwise the obvious
     way to break this file while fixing it.
+
+    Block comments are stripped first. Nothing in the templates uses them today,
+    so the scan currently happens to fail closed on a stray delimiter inside
+    one - but that is luck, not design, and it is the same fail-open shape as
+    the `//` case that already got through review once.
     """
-    return re.sub(r"(?<!:)//[^\n]*", "", source)
+    return re.sub(r"(?<!:)//[^\n]*", "", re.sub(r"/\*.*?\*/", "", source, flags=re.S))
 
 
 def _blocks(source: str) -> list[str]:
@@ -125,3 +130,23 @@ def test_every_placeholder_in_a_query_is_actually_substituted():
             "replace(<var>, '__APP__', appName); passing the variable itself ships the "
             "placeholder, and the rule then looks for a container app named '__APP__'."
         )
+
+
+def test_a_stray_delimiter_inside_a_comment_cannot_disarm_the_scan():
+    """Both comment styles, because this file failed open once already.
+
+    A `'''` inside a comment desynchronises the block pairing, and the failure
+    is not a false alarm - it silently stops the scan from checking anything
+    while the real bug sits in the file. The `//` case reached production. The
+    block-comment case merely happens to fail closed today, which is luck.
+    """
+    for comment in ("// a stray ''' here", "/* a stray ''' here */"):
+        source = f"{comment}\nvar a = '''\n[real block]\n'''\n"
+        blocks = _blocks(source)
+        assert blocks == ["\n[real block]\n"], (
+            f"{comment!r} desynchronised the block scan; it returned {blocks!r}"
+        )
+
+    # The counterpart: stripping must not eat a URL, which is the obvious way
+    # to break this while fixing it.
+    assert "https://example.invalid/x" in _without_comments("var u = 'https://example.invalid/x'")
