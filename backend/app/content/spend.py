@@ -34,6 +34,11 @@ async def reserve(session: AsyncSession, budget: float, amount: Decimal = ESTIMA
     """
     if budget <= 0:
         return True
+    if Decimal(str(budget)) < amount:
+        # The INSERT branch has no existing row to compare against, so a budget
+        # smaller than a single reservation would let the first call of the day
+        # through and only start refusing afterwards. Refuse it here instead.
+        return False
 
     claimed = await session.execute(
         text(

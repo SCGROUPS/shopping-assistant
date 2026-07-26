@@ -85,19 +85,46 @@ class GlossaryViolation(RuntimeError):
     """
 
 
-# Failures that recur no matter how often they are retried. Reviving these every
-# two hours spends money to be wrong on a schedule, so they stay terminal until
-# the source, the recipe or an operator changes - each of which produces a new
-# fingerprint and therefore a new job.
+# Only these are revived. An allowlist, not a denylist, because the denylist got
+# the default wrong in the safe-looking direction: everything unrecognised was
+# transient, so a bad deployment name, an expired credential, a permissions
+# error or a plain AttributeError in our own code would be retried every two
+# hours forever, paying each time and never surfacing that a human is needed.
 #
-# A glossary violation is deterministic: the same source under the same recipe
-# will go on omitting the same term. `asyncio.TimeoutError` deliberately is not
-# here - a slow provider is the textbook transient failure.
-PERMANENT_FAILURES: tuple[type[Exception], ...] = (GlossaryViolation, ValueError)
+# The question a transient classification answers is "would doing exactly this
+# again, unchanged, plausibly work?" For a timeout or a 503, yes. For anything
+# we do not recognise, we cannot know, and the honest answer to "I do not know"
+# is to stop and be visible in the failed queue rather than to spend money on a
+# guess in a loop.
+TRANSIENT_FAILURES: tuple[type[Exception], ...] = (
+    TimeoutError,
+    ConnectionError,
+    OSError,  # covers the socket-level errors the SDK re-raises
+)
+
+# Retryable by status rather than by type: the SDK raises one class for most
+# HTTP failures, so the code is what separates "come back later" from "this
+# request is wrong and will stay wrong".
+TRANSIENT_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
 
 
 def classify(exc: Exception) -> str:
-    return "permanent" if isinstance(exc, PERMANENT_FAILURES) else "transient"
+    """Decide whether retrying this exception unchanged could ever work.
+
+    `GlossaryViolation` is checked first and explicitly: five attempts have
+    already failed the same way, and the sixth is the same source under the same
+    recipe, so it will omit the same term. Same for malformed structured output
+    - once is flakiness, five times is a prompt or a schema that needs changing,
+    and neither changes on its own.
+    """
+    if isinstance(exc, GlossaryViolation | ValueError):
+        return "permanent"
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if isinstance(status, int):
+        return "transient" if status in TRANSIENT_STATUS else "permanent"
+    if isinstance(exc, TRANSIENT_FAILURES):
+        return "transient"
+    return "permanent"
 
 
 async def lease_jobs(session: AsyncSession, *, limit: int) -> list[Leased]:
@@ -389,10 +416,43 @@ async def sweep_stalled_leases(session: AsyncSession) -> int:
             lease_token=None,
             leased_until=None,
             error_detail="lease expired on the final attempt",
+            # Whatever the last attempt concluded is preserved: a job that had
+            # already been classified transient stays revivable, and one that
+            # never got far enough to be classified stays NULL, which means
+            # unknown and is not revived.
+            failure_kind=TranslationJob.failure_kind,
         )
-        .returning(TranslationJob.id)
+        .returning(
+            TranslationJob.entity_id,
+            TranslationJob.field,
+            TranslationJob.locale,
+            TranslationJob.fingerprint,
+            TranslationJob.generation,
+        )
     )
-    return len(stalled.all())
+    targets = stalled.all()
+    if not targets:
+        return 0
+
+    # `fail_job` marks the field too, and sweeping has to as well. Leaving the
+    # field `pending` behind a `failed` job produces a state nothing can serve
+    # and nothing can fix: no job is claimable, and re-enqueueing is a no-op
+    # because the desired fingerprint has not moved.
+    await session.execute(
+        update(TranslationField)
+        .where(
+            TranslationField.entity_type == ENTITY_EXPERIENCE,
+            tuple_(
+                TranslationField.entity_id,
+                TranslationField.field,
+                TranslationField.locale,
+                TranslationField.desired_fingerprint,
+                TranslationField.generation,
+            ).in_([tuple(row) for row in targets]),
+        )
+        .values(status="failed")
+    )
+    return len(targets)
 
 
 async def revive_failed_jobs(session: AsyncSession) -> int:

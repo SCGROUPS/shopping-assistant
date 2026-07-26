@@ -643,7 +643,7 @@ async def test_a_provider_outage_does_not_park_translations_forever(factory):
     await _enqueue(factory, locales=["vi"])
 
     async def always_down(*, job, glossary):
-        raise RuntimeError("provider unavailable")
+        raise ConnectionError("provider unavailable")
 
     for _ in range(MAX_ATTEMPTS):
         await drain(factory, always_down, limit=10)
@@ -751,7 +751,7 @@ async def test_reviving_does_not_wake_fields_whose_work_is_dead(factory):
     await _enqueue(factory, locales=["vi"])
 
     async def always_down(*, job, glossary):
-        raise RuntimeError("provider unavailable")
+        raise ConnectionError("provider unavailable")
 
     for _ in range(MAX_ATTEMPTS):
         await drain(factory, always_down, limit=10)
@@ -973,3 +973,82 @@ async def test_an_overrun_is_recorded_rather_than_hidden(factory):
     async with factory() as session:
         assert await spend.spent_today(session) == Decimal("2.5000")
         assert await spend.reserve(session, limit) is False
+
+
+async def test_a_swept_job_does_not_strand_its_field(factory):
+    """Sweeping has to leave the field where `fail_job` would leave it.
+
+    A job parked as `failed` above a field still marked `pending` is a state
+    nothing can move: no job is claimable, and re-enqueueing is a no-op because
+    the desired fingerprint has not changed. The field would sit there waiting
+    for work that no longer exists, and no queue would show it.
+    """
+    await _enqueue(factory, locales=["vi"])
+    job = await _lease_one(factory, field="title", locale="vi")
+
+    async with factory() as session:
+        await session.execute(
+            update(TranslationJob)
+            .where(TranslationJob.id == job.job_id)
+            .values(
+                attempts=MAX_ATTEMPTS,
+                leased_until=datetime.now(UTC) - timedelta(seconds=1),
+                failure_kind="transient",
+            )
+        )
+        await session.commit()
+
+    async with factory() as session:
+        assert await sweep_stalled_leases(session) == 1
+        await session.commit()
+
+    assert (await _jobs(factory, field="title", locale="vi"))[0].status == "failed"
+    assert [f.status for f in await _fields(factory, field="title", locale="vi")] == ["failed"]
+
+    # And because the sweep preserved the classification, the field is reachable
+    # again once the outage that killed the worker is over.
+    async with factory() as session:
+        assert await revive_failed_jobs(session) == 1
+        await session.commit()
+    assert (await _jobs(factory, field="title", locale="vi"))[0].status == "queued"
+
+
+async def test_an_unrecognised_failure_is_not_retried_on_a_schedule(factory):
+    """"I do not know what this is" must not mean "try it again in two hours".
+
+    A wrong deployment name, an expired credential or an AttributeError in our
+    own code all fail identically every time. Under a permanent-denylist they
+    counted as transient and were revived forever; the allowlist makes the
+    default stop-and-be-visible instead.
+    """
+    assert classify(TimeoutError()) == "transient"
+    assert classify(ConnectionError()) == "transient"
+    assert classify(AttributeError("'NoneType' object has no attribute 'client'")) == "permanent"
+    assert classify(PermissionError()) == "transient", "an OSError subclass is a socket error"
+    assert classify(GlossaryViolation("missing term")) == "permanent"
+    assert classify(RuntimeError("translator returned nothing")) == "permanent"
+
+    class ApiError(Exception):
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+    assert classify(ApiError(429)) == "transient", "rate limited means come back later"
+    assert classify(ApiError(503)) == "transient"
+    assert classify(ApiError(401)) == "permanent", "a bad credential will not fix itself"
+    assert classify(ApiError(404)) == "permanent", "a missing deployment is a config error"
+
+
+async def test_a_budget_smaller_than_one_call_buys_nothing(factory):
+    """The INSERT branch has no row to compare against.
+
+    With the ceiling checked only in the ON CONFLICT branch, the first call of
+    each day is free regardless of the configured budget - so `budget = 0.001`
+    still spends. Setting a budget to something tiny is how an operator says
+    stop, and it has to work on the first call, not the second.
+    """
+    async with factory() as session:
+        assert await spend.reserve(session, 0.001) is False
+        await session.commit()
+
+    async with factory() as session:
+        assert await spend.spent_today(session) == Decimal("0")
