@@ -41,6 +41,13 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    # Every job here inherited the 6-hour default, so anything that hung -
+    # a wedged deploy gate, a browser waiting on a selector that never
+    # appears, a database service that never accepts connections - held a
+    # runner and the concurrency group for the rest of the working day
+    # before anyone was told. These bounds are roughly triple the observed
+    # runtimes, so they only fire on something genuinely stuck.
+    timeout-minutes: 20
 
     # The database code paths have a separate implementation from demo mode and
     # were previously never executed by CI, so SQL-only defects could only be
@@ -93,6 +100,7 @@ jobs:
   # a test suite it does not depend on.
   validate-frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -120,6 +128,10 @@ jobs:
     if: github.event_name == 'push'
     needs: [validate, validate-frontend]
     runs-on: ubuntu-latest
+    # Observed 25 minutes end to end, of which the readiness gate is now
+    # capped at ten by its own wall clock. This is the backstop for the parts
+    # that have no cap of their own, mainly the Azure deployment itself.
+    timeout-minutes: 45
     environment: production
     permissions:
       contents: read
