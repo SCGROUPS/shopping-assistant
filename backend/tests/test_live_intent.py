@@ -28,11 +28,12 @@ from __future__ import annotations
 import os
 
 import pytest
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.assistant.provider import HARD_CONSTRAINT_FIELDS, AzureOpenAIProvider
 from app.common.config import get_settings
+from app.common.locales import DEFAULT_LOCALE
+from app.common.persistence import load_products
 from app.common.ranking import strip_accents
 from app.search.service import CONSTRAINT_FIELDS
 
@@ -64,24 +65,34 @@ def _live_database_url() -> str:
     return url
 
 
-async def _catalogue_vocabulary() -> tuple[set[str], set[str]]:
+async def _catalogue_vocabulary() -> tuple[list[str], list[str]]:
+    """Exactly the vocabulary production builds, by calling what production calls.
+
+    This used to run its own two SELECTs, and they disagreed with production in
+    three ways that all made the test easier to pass than the real thing: it
+    casefolded both lists, so a model answering in the wrong case looked
+    correct; it read every row of `experiences` rather than published inventory;
+    and it took destinations from the `destinations` table, which includes
+    cities holding nothing anyone can book. A test whose fixture is more
+    forgiving than production cannot tell you production works, so it now
+    derives the lists the way `SearchService.search` does - from
+    `catalog_products` - and any future change there is inherited rather than
+    re-implemented.
+    """
     engine = create_async_engine(_live_database_url())
+    factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        async with engine.connect() as connection:
-            categories = (
-                await connection.execute(
-                    text("SELECT DISTINCT category FROM experiences WHERE category IS NOT NULL")
-                )
-            ).scalars()
-            destinations = (
-                await connection.execute(text("SELECT DISTINCT name FROM destinations"))
-            ).scalars()
-            return (
-                {value.casefold() for value in categories},
-                {value.casefold() for value in destinations},
-            )
+        async with factory() as db:
+            products = await load_products(db, locale=DEFAULT_LOCALE)
     finally:
         await engine.dispose()
+
+    if not products:
+        pytest.skip("the live catalogue returned no published products")
+    return (
+        sorted({product["category"] for product in products}),
+        sorted({product["destination"] for product in products}),
+    )
 
 
 def _provider() -> AzureOpenAIProvider:
@@ -120,25 +131,39 @@ async def test_the_model_only_names_categories_the_catalogue_stocks(query: str):
     categories is one whose every answer silently discards a constraint, and
     nothing else in the suite would ever say so.
     """
-    categories, _ = await _catalogue_vocabulary()
+    categories, destinations = await _catalogue_vocabulary()
     provider = _provider()
 
     # The real vocabulary has to be handed over, exactly as the search service
     # hands it over. Calling this without it leaves the schema enum as [null],
     # which makes a category impossible rather than correct - the assertion
     # would pass while testing nothing.
-    offered = sorted({value for value in categories})
-    assert offered, "the catalogue must have categories for this to mean anything"
+    assert categories, "the catalogue must have categories for this to mean anything"
+    # Compared case-insensitively because the eligibility gate is
+    # case-insensitive, but *offered* in the catalogue's own case - the model is
+    # asked the same question production asks it.
+    known = {value.casefold() for value in categories}
 
     invented: list[str] = []
     for _ in range(RUNS):
-        intent = await provider.extract_intent(query, categories=offered)
-        for constraint in intent.hard_constraints:
-            if str(constraint.get("field", "")).casefold() != "category":
-                continue
-            value = str(constraint.get("value", "")).casefold()
-            if value and value not in categories:
-                invented.append(value)
+        intent = await provider.extract_intent(
+            query, categories=categories, destinations=destinations
+        )
+        # Both branches, because a category is now a hard constraint only when
+        # the shopper insisted and a soft preference otherwise. Scanning
+        # `hard_constraints` alone used to be the whole story; after the
+        # soft/hard split it silently checks almost nothing, since most phrasings
+        # take the soft path.
+        stated = [
+            str(c.get("value", ""))
+            for c in intent.hard_constraints
+            if str(c.get("field", "")).casefold() == "category"
+        ] + [
+            str(p.get("value", ""))
+            for p in intent.soft_preferences
+            if str(p.get("field", "")).casefold() == "category"
+        ]
+        invented += [value for value in stated if value and value.casefold() not in known]
 
     assert invented == [], (
         f"{query!r} produced categories this catalogue does not stock: {sorted(set(invented))}. "
@@ -153,14 +178,14 @@ async def test_a_named_city_is_read_as_a_destination_we_sell():
     constraint - the city has to come back as one the catalogue sells, or the
     shopper who named it correctly gets nothing.
     """
-    _CATEGORIES, destinations = await _catalogue_vocabulary()
+    categories, destinations = await _catalogue_vocabulary()
     provider = _provider()
 
     for _ in range(RUNS):
         intent = await provider.extract_intent(
             "hoi an lantern",
-            categories=sorted(_CATEGORIES),
-            destinations=sorted(destinations),
+            categories=categories,
+            destinations=destinations,
         )
         named = [intent.destination.name] if intent.destination.name else []
         named += [
@@ -170,10 +195,10 @@ async def test_a_named_city_is_read_as_a_destination_we_sell():
         ]
         assert named, "the model named no destination at all for an explicitly located query"
         for value in named:
-            folded = value.casefold()
-            assert any(folded in known or known in folded for known in destinations), (
-                f"{value!r} is not a destination this catalogue sells"
-            )
+            folded = strip_accents(value).casefold()
+            assert any(
+                folded == strip_accents(known).casefold() for known in destinations
+            ), f"{value!r} is not a destination this catalogue sells"
 
 
 @pytest.mark.parametrize(
@@ -196,12 +221,12 @@ async def test_a_city_named_in_the_shoppers_language_still_resolves(query: str, 
     not match it, and the destination was silently discarded: the shopper who
     was most precise got the least useful page.
     """
-    _CATEGORIES, destinations = await _catalogue_vocabulary()
+    categories, destinations = await _catalogue_vocabulary()
     provider = _provider()
 
     for _ in range(RUNS):
         intent = await provider.extract_intent(
-            query, categories=sorted(_CATEGORIES), destinations=sorted(destinations)
+            query, categories=categories, destinations=destinations
         )
         resolved = intent.destination.name or ""
         # Compared the way the service compares. The enum constrains meaning,

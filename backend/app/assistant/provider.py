@@ -262,8 +262,8 @@ class AIProvider(Protocol):
         self,
         text: str,
         *,
-        categories: Sequence[str] | None = None,
-        destinations: Sequence[str] | None = None,
+        categories: Sequence[str],
+        destinations: Sequence[str],
     ) -> SearchIntent: ...
 
     async def plan_action(self, text: str, state: dict[str, Any]) -> ToolPlan | None: ...
@@ -540,8 +540,8 @@ class DemoAIProvider:
         self,
         text: str,
         *,
-        categories: Sequence[str] | None = None,
-        destinations: Sequence[str] | None = None,
+        categories: Sequence[str],
+        destinations: Sequence[str],
     ) -> SearchIntent:
         return deterministic_intent(text)
 
@@ -646,10 +646,23 @@ class AzureOpenAIProvider:
         self,
         text: str,
         *,
-        categories: Sequence[str] | None = None,
-        destinations: Sequence[str] | None = None,
+        categories: Sequence[str],
+        destinations: Sequence[str],
     ) -> SearchIntent:
         self._guard("intent extraction")
+        # An empty vocabulary is worse than a missing one. Both enums below are
+        # built as `[*values, None]`, so an empty list does not widen the
+        # choice - it collapses it to `[None]`, making "no category" and "no
+        # destination" the only answers the schema permits. Under `strict` the
+        # model complies, and every shopper silently searches the whole country
+        # for anything. Required arguments stop the call site forgetting; this
+        # stops it passing an empty catalogue read.
+        if not categories or not destinations:
+            raise ValueError(
+                "extract_intent needs the catalogue's own categories and destinations; "
+                f"got {len(categories)} categories and {len(destinations)} destinations. "
+                "An empty list silently restricts the model to answering 'none'."
+            )
         constraint_value = {
             "anyOf": [
                 {"type": "string"},
@@ -674,7 +687,7 @@ class AzureOpenAIProvider:
                         # their own language searched the whole country. An
                         # enum makes the model do the resolving, which is the
                         # one part of this it is actually good at.
-                        "name": {"type": ["string", "null"], "enum": [*(destinations or []), None]},
+                        "name": {"type": ["string", "null"], "enum": [*destinations, None]},
                         "confidence": {"type": "number"},
                     },
                     "required": ["name", "confidence"],
@@ -724,7 +737,25 @@ class AzureOpenAIProvider:
                 # emptied the grid. Prose telling the model not to invent did
                 # not work on nano or mini; a `strict` enum removes the
                 # possibility rather than discouraging it.
-                "category": {"type": ["string", "null"], "enum": [*(categories or []), None]},
+                #
+                # `required` is the model's call, not ours. The prompt has
+                # always said categories are soft "unless the user says must,
+                # only, or required" - and the code then turned every non-null
+                # category into a hard equality filter regardless, so the
+                # service overrode the instruction it had just given. Someone
+                # who merely mentioned street food got only street food, and
+                # the narrow and empty result pages traced back here. The
+                # model reads the sentence; it is the only thing that can tell
+                # "I want a cooking class" from "cooking classes only".
+                "category": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": ["string", "null"], "enum": [*categories, None]},
+                        "required": {"type": "boolean"},
+                    },
+                    "required": ["name", "required"],
+                    "additionalProperties": False,
+                },
                 "exclusions": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -773,7 +804,12 @@ class AzureOpenAIProvider:
                         "Treat explicit indoor/outdoor, accessibility, date, budget, language, "
                         "and exclusion statements as hard constraints. Categories, interests, "
                         "and general family suitability are soft preferences unless the user says "
-                        "must, only, or required. Do not request clarification merely because an "
+                        "must, only, or required. Set category.required true only when the user "
+                        "rules out everything else - 'cooking classes only', 'must be a food "
+                        "tour' - and false when they merely say what they are in the mood for. "
+                        "When it is false the category ranks matching experiences higher and "
+                        "hides nothing, so prefer false when the wording is at all open. "
+                        "Do not request clarification merely because an "
                         "optional destination, date, budget, language, or accessibility filter was "
                         "omitted. Preserve destination names. Use ISO 8601 for "
                         "visit_start and visit_end. The hard-constraint field names are fixed "
@@ -805,18 +841,30 @@ class AzureOpenAIProvider:
         # Folded back into the constraint list the service already understands,
         # so the enum changes what the model may say without changing what
         # anything downstream has to read.
-        category = payload.pop("category", None)
+        category = payload.pop("category", None) or {}
+        name = category.get("name")
         intent = SearchIntent.model_validate(payload)
-        if category:
+        if not name:
+            return intent
+        # Both branches are folded into lists the service already reads, so the
+        # schema change stays inside this method.
+        if category.get("required"):
             return intent.model_copy(
                 update={
                     "hard_constraints": [
                         *intent.hard_constraints,
-                        {"field": "category", "operator": "eq", "value": category},
+                        {"field": "category", "operator": "eq", "value": name},
                     ]
                 }
             )
-        return intent
+        return intent.model_copy(
+            update={
+                "soft_preferences": [
+                    *intent.soft_preferences,
+                    {"field": "category", "value": name, "weight": 0.5},
+                ]
+            }
+        )
 
     async def plan_action(self, text: str, state: dict[str, Any]) -> ToolPlan | None:
         """Let the agent choose a tool and fill its parameters itself.

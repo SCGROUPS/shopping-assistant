@@ -645,3 +645,27 @@ async def test_a_failed_rebuild_is_not_a_promise_to_rebuild(factory):
         )
 
     assert "stale-index" in await _codes(factory, experience.id)
+
+
+async def test_a_listing_filed_under_an_unknown_category_is_not_published(factory):
+    """The gate asked only whether a category had been typed, never which one.
+
+    A category outside the catalogue's vocabulary is not a cosmetic problem: it
+    is offered to the intent model as an enum built from live inventory and
+    matched by exact equality, so a listing filed under an invented name cannot
+    be reached by anyone who filters. It looks published and is unfindable.
+    """
+    await _seed()
+    experience = await _only(factory)
+    assert await _codes(factory, experience.id) == set()
+
+    async with factory() as db:
+        stale = await db.get(Experience, experience.id)
+        assert stale is not None
+        # Written directly, because the admin path now refuses this - which is
+        # the point: the gate is the second line, for rows that arrived by
+        # import, migration or hand-written SQL.
+        stale.category = "Food experience"
+        await db.commit()
+
+    assert "unknown-category" in await _codes(factory, experience.id)

@@ -122,6 +122,16 @@ def preference_fit(
     if wants_family:
         signals.append(1.0 if product["family_friendly"] else 0.0)
 
+    # A category the shopper preferred but did not require. Without this the
+    # soft branch had nowhere to go: `category` was the only category field
+    # anything read, and it is a filter, so every stated interest was either
+    # mandatory or discarded. Here it is what a preference should be - items in
+    # the category rank above items outside it, and nothing is removed.
+    if filters.preferred_category:
+        signals.append(
+            1.0 if product["category"].casefold() == filters.preferred_category.casefold() else 0.0
+        )
+
     if filters.indoor_outdoor:
         allowed = {filters.indoor_outdoor.casefold(), "mixed"}
         signals.append(1.0 if product["indoor_outdoor"].casefold() in allowed else 0.0)

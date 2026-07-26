@@ -347,3 +347,62 @@ async def test_upgrading_a_released_database_lands_where_a_fresh_install_does(
     assert [_canonical(item) for item in upgraded["constraints"]] == [
         _canonical(item) for item in fresh["constraints"]
     ], "constraints differ between an upgraded database and a new one"
+
+
+async def test_the_taxonomy_repair_actually_rewrites_a_retired_category():
+    """That the migration chain applies says nothing about what 0007 does to data.
+
+    The rest of this file compares schema shape, which a data-only migration
+    cannot change - so 0007 would pass every existing check while doing
+    nothing at all. The repair is the entire point of it: a row left under
+    "Food experience" is offered to the intent model as a category of its own,
+    splitting the vocabulary that made `food tour in ho chi minh city` return
+    an empty page.
+    """
+    url = DATABASE_URL
+    assert url
+
+    _alembic("upgrade", "head", url=url)
+    engine = create_async_engine(url)
+    try:
+        async with engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    text("SELECT id, content_version FROM experiences LIMIT 1")
+                )
+            ).first()
+            if row is None:
+                pytest.skip("no experiences in the test database to recategorise")
+            experience_id, version_before = row
+            # Put the database back into the state production was in.
+            await connection.execute(
+                text("UPDATE experiences SET category = 'Food experience' WHERE id = :id"),
+                {"id": experience_id},
+            )
+            await connection.execute(
+                text("DELETE FROM alembic_version WHERE version_num = '0007_canonical_categories'")
+            )
+            await connection.execute(
+                text("UPDATE alembic_version SET version_num = '0006_index_recipe'")
+            )
+
+        _alembic("upgrade", "head", url=url)
+
+        async with engine.connect() as connection:
+            category, version_after = (
+                await connection.execute(
+                    text("SELECT category, content_version FROM experiences WHERE id = :id"),
+                    {"id": experience_id},
+                )
+            ).one()
+
+        assert category == "Food", (
+            f"the retired spelling survived the migration: {category!r}. The split "
+            "vocabulary is still in the database and still reaches the intent model."
+        )
+        assert version_after > version_before, (
+            f"content_version did not move ({version_before} -> {version_after}), so a "
+            "partner diffing its inventory cannot see that its listing was recategorised"
+        )
+    finally:
+        await engine.dispose()

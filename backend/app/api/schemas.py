@@ -21,6 +21,12 @@ class SearchFilters(BaseModel):
     currency: str | None = None
     max_total_price: float | None = Field(default=None, ge=0)
     category: str | None = None
+    # A category the shopper leaned towards without insisting on. Kept apart
+    # from `category` because the two mean opposite things to the eligibility
+    # gate: that one removes everything else, this one only ranks matches
+    # higher. Collapsing them is what made "we have street food in Hoi An"
+    # return nothing but street food and hide the cooking classes next door.
+    preferred_category: str | None = None
     rating: float | None = Field(default=None, ge=0, le=5)
     max_duration_minutes: int | None = Field(default=None, ge=1)
     accessibility: list[str] = Field(default_factory=list)

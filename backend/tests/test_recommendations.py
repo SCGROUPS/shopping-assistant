@@ -123,3 +123,25 @@ async def test_cold_start_redistributes_the_session_weight():
     assert cold["session"] == 0.0
     assert cold["context_fit"] > warm["context_fit"]
     assert sum(cold.values()) == pytest.approx(sum(warm.values()))
+
+
+def test_every_complement_names_a_category_the_catalogue_stocks():
+    """The bonus is awarded by equality, so a stale name is a silent no-op.
+
+    Three of these were wrong for months: "Food experience" and "Transport
+    ticket" were spellings the catalogue retired, and "Museum or cultural venue"
+    was never one of its categories at all. Nothing failed - the complement
+    bonus simply could never be awarded, so cruises stopped suggesting food and
+    transport suggested nothing. A recommendation that quietly does not happen
+    looks exactly like one the ranking chose not to make.
+    """
+    from app.catalog.vocabulary import CATEGORIES
+    from app.recommendations.service import COMPLEMENTS
+
+    known = set(CATEGORIES)
+    referenced = set(COMPLEMENTS) | {value for values in COMPLEMENTS.values() for value in values}
+    unknown = referenced - known
+    assert not unknown, (
+        f"COMPLEMENTS refers to categories the catalogue does not stock: {sorted(unknown)}. "
+        f"These can never match a product, so the bonus is silently dead. Known: {sorted(known)}"
+    )

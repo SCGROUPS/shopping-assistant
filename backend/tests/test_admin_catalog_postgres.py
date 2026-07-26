@@ -1889,3 +1889,29 @@ async def test_a_real_edit_still_re_embeds(factory):
             ).scalars()
         )
     assert texts and all("Basket Boat" in text for text in texts)
+
+
+async def test_a_category_outside_the_vocabulary_is_refused(factory):
+    """The divergence that reached production has to be impossible to re-enter.
+
+    Two taxonomies coexisted for months - "Food" and "Food experience",
+    "Transport" and "Transport ticket" - because nothing checked what an
+    operator typed. The cost landed on shoppers: category is offered to the
+    intent model as an enum of whatever the catalogue holds, so the model
+    reasonably chose the descriptive spelling, which had one listing in the
+    country while seventy sat under the other name.
+    """
+    from app.common.errors import ApiError
+
+    await _import()
+    experience = await _only(factory)
+
+    with pytest.raises(ApiError) as error:
+        await catalog_ops.update_experience(
+            experience.id, {"category": "Food experience"}, OPERATOR
+        )
+    assert error.value.status == 422
+    assert "category" in str(error.value.detail).casefold()
+
+    updated = await catalog_ops.update_experience(experience.id, {"category": "Food"}, OPERATOR)
+    assert updated["category"] == "Food"

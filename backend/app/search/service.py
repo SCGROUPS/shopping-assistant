@@ -258,6 +258,18 @@ def merge_filters(explicit: SearchFilters, intent: SearchIntent) -> tuple[Search
     for preference in intent.soft_preferences:
         if preference.get("field") == "family_friendly" and values["family_friendly"] is None:
             values["family_friendly"] = bool(preference.get("value"))
+        # Routed to `preferred_category`, never to `category`: the shopper said
+        # they would like this kind of thing, not that they would refuse the
+        # rest. It reaches the ranker as a preference and the eligibility gate
+        # never sees it.
+        if (
+            preference.get("field") == "category"
+            and not values.get("category")
+            and not values.get("preferred_category")
+        ):
+            value = preference.get("value")
+            if isinstance(value, str) and value:
+                values["preferred_category"] = value
     values["exclusions"] = list(dict.fromkeys([*values["exclusions"], *intent.exclusions]))
     if values["visit_start"] and not values["visit_end"]:
         values["visit_end"] = values["visit_start"]

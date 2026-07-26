@@ -34,6 +34,7 @@ from app.catalog.indexing import (
     document_text_for,
     index_fingerprint,
 )
+from app.catalog.vocabulary import CATEGORIES
 from app.common.models import (
     Destination,
     Experience,
@@ -113,6 +114,22 @@ async def publish_blockers(
                     f"set the {field.replace('_', ' ')}",
                 )
             )
+
+    # Present is not the same as usable. The gate checked only that a category
+    # had been typed, so any spelling passed - which is how two competing
+    # taxonomies reached production and stayed there. A category outside the
+    # vocabulary is invisible to search: it is offered to the intent model as an
+    # enum built from the catalogue, and matched by exact equality, so a listing
+    # filed under an invented name is bookable by nobody who filters.
+    category = getattr(experience, "category", None)
+    if category and category not in CATEGORIES:
+        blockers.append(
+            Blocker(
+                "unknown-category",
+                f"use one of the catalogue's categories, not {category!r}: "
+                + ", ".join(CATEGORIES),
+            )
+        )
 
     if experience.destination_id is None:
         blockers.append(Blocker("missing-destination", "set the destination"))

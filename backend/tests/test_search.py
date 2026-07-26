@@ -858,3 +858,151 @@ class TestRelaxationIsAuthorisedNotAssumed:
         from app.search.service import relaxation_candidates
 
         assert set(relaxation_candidates(self._filters())) == {"language", "budget"}
+
+
+class SoftCategoryProvider:
+    """The shopper mentioned a kind of thing; they did not rule out the rest.
+
+    "I'd like to do a cooking class in Hoi An" names a preference. The prompt
+    has always classed categories as soft "unless the user says must, only, or
+    required", and the model is what reads that distinction out of the
+    sentence, so it reports the category with `required` false.
+    """
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
+        return SearchIntent(
+            search_text=text,
+            destination=IntentValue(name="Hoi An", confidence=0.9),
+            soft_preferences=[{"field": "category", "value": "Food", "weight": 0.5}],
+        )
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None
+
+
+async def test_a_preferred_category_ranks_matches_up_without_hiding_the_rest():
+    """The directive: the model decides what is mandatory, not the service.
+
+    Every non-null category used to be converted into a hard equality filter,
+    whatever the model said about it, so a passing mention of food removed
+    every non-food experience in the city. The shopper who would happily have
+    seen a lantern workshop was shown a shorter page and told nothing.
+    """
+    response = await SearchService(ai_provider=SoftCategoryProvider()).search(
+        SearchRequest(query="i'd like to eat well in hoi an")
+    )
+
+    categories = {item.category for item in response.items}
+    assert len(categories) > 1, (
+        f"a soft category preference removed everything else: only {categories} came back. "
+        "This is the hard-filter path; a preference must not empty the page of alternatives."
+    )
+    assert "Food" in categories, "the preferred category is missing entirely"
+
+    # Compared against the same query with no preference expressed, because
+    # "Food appears high up" can be true by accident - it was: the first
+    # version of this assertion passed with the ranking signal deleted.
+    baseline = await SearchService(ai_provider=NoPreferenceProvider()).search(
+        SearchRequest(query="i'd like to eat well in hoi an")
+    )
+
+    def food_ranks(items) -> dict:
+        return {item.id: index for index, item in enumerate(items) if item.category == "Food"}
+
+    preferred_ranks = food_ranks(response.items)
+    baseline_ranks = food_ranks(baseline.items)
+    assert preferred_ranks and baseline_ranks, "no food came back; the fixture cannot show a change"
+
+    # Paired by product, not averaged over the page. A mean rank compares two
+    # different sets of items: expressing the preference also pulls further
+    # food onto the page, and a newcomer landing last raises the mean even
+    # though every item that was already there moved up. That is the
+    # preference working, so a mean would have reported a regression.
+    common = preferred_ranks.keys() & baseline_ranks.keys()
+    assert common, "no food experience appears in both pages to compare"
+    moved = {
+        item_id: (baseline_ranks[item_id], preferred_ranks[item_id])
+        for item_id in common
+    }
+    assert all(after <= before for before, after in moved.values()), (
+        f"a preferred-category item ranked lower once the preference was expressed: {moved}"
+    )
+    assert any(after < before for before, after in moved.values()), (
+        f"expressing a preference for Food changed nothing: {moved}. The preference is "
+        "carried through the intent but never reaches the ranker, so 'soft' means 'ignored'."
+    )
+    assert len(preferred_ranks) >= len(baseline_ranks), (
+        "preferring a category put less of it on the page than not mentioning it at all"
+    )
+
+
+async def test_a_required_category_still_removes_everything_else():
+    """The other half: when the shopper does insist, the filter must still bite."""
+    response = await SearchService(ai_provider=RequiredCategoryProvider()).search(
+        SearchRequest(query="cooking classes only, in hoi an")
+    )
+
+    categories = {item.category for item in response.items}
+    assert categories <= {"Food"}, (
+        f"a required category let {categories - {'Food'}} through; the eligibility gate "
+        "is no longer honouring hard category constraints"
+    )
+
+
+class RequiredCategoryProvider:
+    """The shopper insisted, so the model reports the category as required.
+
+    "Cooking classes only" is the sentence the prompt's "must, only, or
+    required" carve-out is about. This is the path that must still remove
+    everything else - the soft/hard split is only correct if both halves work.
+    """
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
+        return SearchIntent(
+            search_text=text,
+            destination=IntentValue(name="Hoi An", confidence=0.9),
+            hard_constraints=[{"field": "category", "operator": "eq", "value": "Food"}],
+        )
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None
+
+
+class NoPreferenceProvider:
+    """The same query, with no category preference expressed - the baseline."""
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
+        return SearchIntent(
+            search_text=text,
+            destination=IntentValue(name="Hoi An", confidence=0.9),
+        )
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None

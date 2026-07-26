@@ -38,12 +38,19 @@ EVENT_WEIGHTS = {
 DEMAND_WEIGHTS = {"views": 1.0, "cart_adds": 3.0, "bookings": 6.0}
 POPULARITY_SATURATION = 40.0
 
+# Every name here has to be one the catalogue actually stocks, because these are
+# matched by equality against a product's category. Three of them were not:
+# "Food experience" and "Transport ticket" were the retired spellings, and
+# "Museum or cultural venue" was never a category at all. The effect was silent
+# - no error, just a complement bonus that could never be awarded, so food could
+# not be recommended alongside a cruise and transport recommended nothing. Pinned
+# against `CATEGORIES` by `test_recommendations.py` so it cannot drift again.
 COMPLEMENTS = {
-    "Museum or cultural venue": {"Food experience", "Cruise", "Guided tour"},
-    "Day trip": {"Entertainment experience", "Food experience", "Open-dated voucher"},
-    "Transport ticket": {"Day trip", "Guided tour", "Activity or class"},
-    "Cruise": {"Food experience", "Guided tour", "Open-dated voucher"},
-    "Activity or class": {"Food experience", "Cruise", "Guided tour"},
+    "Culture": {"Food", "Cruise", "Guided tour"},
+    "Day trip": {"Entertainment experience", "Food", "Open-dated voucher"},
+    "Transport": {"Day trip", "Guided tour", "Activity or class"},
+    "Cruise": {"Food", "Guided tour", "Open-dated voucher"},
+    "Activity or class": {"Food", "Cruise", "Guided tour"},
 }
 
 PREFERENCE_FIELDS = (

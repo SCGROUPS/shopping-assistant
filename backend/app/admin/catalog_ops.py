@@ -31,6 +31,7 @@ from app.admin import audit
 from app.admin.auth import Principal
 from app.catalog.indexing import enqueue_experience_reindex
 from app.catalog.publish_gate import publish_blockers, unpublishable_now
+from app.catalog.vocabulary import CATEGORIES
 from app.common.database import session_factory
 from app.common.errors import ApiError
 from app.common.models import (
@@ -363,6 +364,17 @@ def _validate(changes: dict[str, Any], allowed: dict[str, Any]) -> dict[str, Any
             422,
             "Invalid edit",
             f"indoor_outdoor must be one of {', '.join(sorted(INDOOR_OUTDOOR))}",
+            "invalid-edit",
+        )
+    # Checked here as well as at the publish gate, because this is where the
+    # value is chosen and so the only place an operator finds out in time to
+    # pick a different one. `indoor_outdoor` has always been closed this way;
+    # category was left open, and two taxonomies grew.
+    if "category" in cleaned and cleaned["category"] not in CATEGORIES:
+        raise ApiError(
+            422,
+            "Invalid edit",
+            f"category must be one of {', '.join(CATEGORIES)}",
             "invalid-edit",
         )
     if "duration_minutes" in cleaned and not 1 <= cleaned["duration_minutes"] <= 20_160:
