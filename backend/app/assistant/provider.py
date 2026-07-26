@@ -847,14 +847,28 @@ class AzureOpenAIProvider:
         # Folded back into the constraint list the service already understands,
         # so the enum changes what the model may say without changing what
         # anything downstream has to read.
-        category = payload.pop("category", None) or {}
-        name = category.get("name")
+        category = payload.pop("category", None)
+        # The schema asks for an object, but a model that answers with the bare
+        # string "Food" is not wrong about the shopper - and `.get` on a string
+        # raises AttributeError, which the caller catches by falling back to
+        # deterministic parsing. That discards a perfectly good reading of the
+        # query over a wrapper, so take the string as the name.
+        if isinstance(category, str):
+            name = category.strip() or None
+        elif isinstance(category, dict):
+            name = category.get("name")
+        else:
+            name = None
         intent = SearchIntent.model_validate(payload)
         if not name:
             return intent
         # Both branches are folded into lists the service already reads, so the
-        # schema change stays inside this method.
-        if category.get("required"):
+        # schema change stays inside this method. A bare string carries no way
+        # to say "required", and the prompt's standing rule is that a category
+        # is soft unless the shopper insisted - so it lands as a preference,
+        # which narrows nothing away.
+        required = isinstance(category, dict) and bool(category.get("required"))
+        if required:
             return intent.model_copy(
                 update={
                     "hard_constraints": [

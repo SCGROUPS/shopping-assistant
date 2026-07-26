@@ -142,19 +142,47 @@ EFFORTS_BY_MODEL = {
 BICEP = Path(__file__).resolve().parents[2] / "infra" / "bicep" / "main.bicep"
 
 
-def _declared_intent_deployment() -> str:
-    """The deployment production will actually run, read from the template.
+def _bicep_param(name: str) -> str:
+    """A string parameter's default, read from the template production deploys.
 
     Not from Settings: the container's environment is written by Bicep, so the
     default in `config.py` is what a developer gets locally and has no bearing
-    on what production sends. Reading the wrong one of those two is how this
-    was missed the first time.
+    on what production sends. Reading the wrong one of those two is how this was
+    missed the first time. scripts/deploy.sh passes no model parameters, so
+    these defaults are what production runs.
     """
+    pattern = re.compile(rf"^param\s+{re.escape(name)}\s+string\s*=\s*'([^']+)'")
     for line in BICEP.read_text().splitlines():
-        match = re.match(r"param intentDeployment string = '([^']+)'", line.strip())
+        match = pattern.match(line.strip())
         if match:
             return match.group(1)
-    raise AssertionError(f"no intentDeployment parameter found in {BICEP}")
+    raise AssertionError(
+        f"no string parameter {name!r} with a literal default found in {BICEP}. "
+        "If it moved to a parameters file or is now passed by deploy.sh, this test is "
+        "reading the wrong source and must be updated - it fails rather than guessing."
+    )
+
+
+def _declared_intent_deployment() -> str:
+    return _bicep_param("intentDeployment")
+
+
+def test_the_intent_deployment_is_one_the_template_actually_creates():
+    """`intentDeployment` is a free parameter; nothing tied it to a real model.
+
+    infra/bicep/ai-integration.bicep creates exactly two chat deployments,
+    chatDeployment and nanoDeployment. intentDeployment merely happened to equal
+    the first. Point it at a name that is not deployed and every intent call
+    404s - and the fallback answers HTTP 200 with a full page, so it looks
+    exactly like the two outages this file already exists for.
+    """
+    intent = _declared_intent_deployment()
+    available = {_bicep_param("chatDeployment"), _bicep_param("nanoDeployment")}
+    assert intent in available, (
+        f"infra/bicep/main.bicep sets intentDeployment to {intent!r}, which is not one of "
+        f"the deployments ai-integration.bicep creates ({sorted(available)}). Every intent "
+        f"call would 404 and silently fall back to deterministic parsing."
+    )
 
 
 def test_the_effort_we_send_is_accepted_by_the_deployment_we_declare():

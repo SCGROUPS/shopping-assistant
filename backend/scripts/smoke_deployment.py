@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import sys
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -35,6 +36,16 @@ CASES = [
 ]
 
 TIMEOUT_SECONDS = 60
+
+
+def _fold(value: str) -> str:
+    """Compare cities without letting accents or case decide the outcome.
+
+    The catalogue stores unaccented names, but a model asked in Vietnamese may
+    answer "Hội An", which is the same city and must not fail the gate.
+    """
+    stripped = unicodedata.normalize("NFD", value)
+    return "".join(c for c in stripped if not unicodedata.combining(c)).casefold().strip()
 
 
 def _search(base: str, query: str) -> dict:
@@ -56,7 +67,7 @@ def main() -> int:
     base = sys.argv[1]
 
     failures: list[str] = []
-    for query, _expected in CASES:
+    for query, expected in CASES:
         try:
             payload = _search(base, query)
         except (urllib.error.URLError, TimeoutError) as error:
@@ -73,6 +84,16 @@ def main() -> int:
                 "not running - the service is falling back to deterministic parsing, "
                 "which cannot filter. Check the container logs for 'Intent extraction "
                 "failed' and confirm the intent deployment accepts our request."
+            )
+        elif _fold(resolved) != _fold(expected):
+            # Checking only that *a* city came back would accept "đi thuyền ở
+            # hội an" resolving to Hanoi. This is the one gate standing between
+            # a broken deployment and shoppers, so it asserts the answer, not
+            # the shape of the answer.
+            failures.append(
+                f"{query!r}: resolved the wrong city ({status}, expected {expected!r}). "
+                "Extraction ran but understood the place incorrectly, so the page is "
+                "filtered to somewhere the shopper did not ask for."
             )
         else:
             print(f"ok   {query!r} -> {status}")

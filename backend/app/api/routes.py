@@ -42,6 +42,7 @@ from app.catalog.service import get_product_async, product_card, product_detail
 from app.common.analytics import assistant_holdout, funnel_report
 from app.common.config import get_settings
 from app.common.database import database_ready
+from app.common.degradation import intent_health
 from app.common.errors import ApiError
 from app.common.llm_cost import ledger
 from app.common.locales import canonical_locale, negotiate_locale
@@ -484,11 +485,21 @@ async def analytics_funnel(principal: ReadAccess) -> dict[str, Any]:
 @router.get("/health")
 async def api_health() -> dict[str, Any]:
     products = await catalog_products()
+    intent = intent_health.snapshot()
     return {
         "status": "ok",
         "mode": "postgresql" if database_mode() else "demo-memory",
         "catalog_size": len(products),
         "database_ready": await database_ready(),
+        # Reported next to "status": "ok" on purpose. This endpoint stayed ok
+        # through two outages in which the service understood nothing anyone
+        # typed, because the failure is caught and answered with a full page.
+        # Alert on failure_ratio, not on status.
+        "intent_extraction": {
+            "calls": intent.calls,
+            "failures": intent.failures,
+            "failure_ratio": round(intent.failure_ratio, 4),
+        },
     }
 
 

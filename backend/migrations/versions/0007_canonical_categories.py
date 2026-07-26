@@ -27,6 +27,7 @@ and enqueues every locale. Doing it there rather than here also means the work
 is leased, retried and reported instead of happening inside a schema migration.
 """
 
+import sqlalchemy as sa
 from alembic import op
 
 revision = "0007_canonical_categories"
@@ -50,16 +51,24 @@ REPAIRED_BY_HAND = (
 
 
 def upgrade() -> None:
+    # Bound parameters throughout. Both sources here are module constants, so
+    # interpolation would be safe today, but a migration is exactly the kind of
+    # file where "just add the new name to the tuple" happens later and the
+    # habit is what protects it.
+    connection = op.get_bind()
     for retired, canonical in RETIRED.items():
         # Bumped in the same statement as the rename, so a row cannot be
         # recategorised without the version that advertises it having moved.
-        op.execute(
-            f"""
-            UPDATE experiences
-               SET category = '{canonical}',
-                   content_version = content_version + 1
-             WHERE category = '{retired}'
-            """
+        connection.execute(
+            sa.text(
+                """
+                UPDATE experiences
+                   SET category = :canonical,
+                       content_version = content_version + 1
+                 WHERE category = :retired
+                """
+            ),
+            {"canonical": canonical, "retired": retired},
         )
 
     # Production's three rows were renamed outside a migration and so never got
@@ -67,13 +76,15 @@ def upgrade() -> None:
     # already canonical and this is a bump with nothing behind it - harmless,
     # since a version only ever means "something a partner can see changed", and
     # no approval predates a fresh build.
-    slugs = ", ".join(f"'{slug}'" for slug in REPAIRED_BY_HAND)
-    op.execute(
-        f"""
-        UPDATE experiences
-           SET content_version = content_version + 1
-         WHERE slug IN ({slugs})
-        """
+    connection.execute(
+        sa.text(
+            """
+            UPDATE experiences
+               SET content_version = content_version + 1
+             WHERE slug = ANY(:slugs)
+            """
+        ),
+        {"slugs": list(REPAIRED_BY_HAND)},
     )
 
 

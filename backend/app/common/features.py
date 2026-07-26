@@ -18,14 +18,16 @@ from app.common.ranking import bayesian_rating
 
 # Commercial value per booking. Real margin data does not exist in the POC
 # catalogue (docs/SYSTEM_DESIGN.md §16), so category take rate is the proxy.
+# Keys are exactly app.catalog.vocabulary.CATEGORIES, pinned by a test. This
+# table outlived two vocabulary changes carrying spellings the catalogue had
+# stopped using ("Food experience", "Transport ticket"), which silently earned
+# every renamed item the default rate instead of its own.
 CATEGORY_TAKE_RATE: dict[str, float] = {
     "Day trip": 0.18,
     "Cruise": 0.18,
     "Guided tour": 0.16,
     "Activity or class": 0.15,
-    "Food experience": 0.14,
     "Entertainment experience": 0.13,
-    "Museum or cultural venue": 0.12,
     "Open-dated voucher": 0.12,
     "Culture": 0.12,
     "Wellness": 0.15,
@@ -34,7 +36,6 @@ CATEGORY_TAKE_RATE: dict[str, float] = {
     "Family": 0.14,
     "Food": 0.14,
     "Transport": 0.08,
-    "Transport ticket": 0.08,
 }
 DEFAULT_TAKE_RATE = 0.12
 MAX_TAKE_RATE = max([*CATEGORY_TAKE_RATE.values(), DEFAULT_TAKE_RATE])
@@ -113,14 +114,31 @@ def preference_fit(
     are the ones that are allowed to be traded off. When the shopper has
     expressed nothing, intrinsic party-fit signals keep the term discriminating
     instead of collapsing to a constant.
+
+    Weighted, not a flat average. Every signal used to count the same, so a
+    thing the shopper actually asked for was worth exactly as much as whether
+    the item happens to offer four languages - and the more intrinsic signals
+    were added, the less any stated preference moved the page. Something the
+    shopper said outranks something we noticed on their behalf, and how much
+    they wanted it is the model's reading of their words, not a constant here.
+
+    With nothing expressed, every remaining signal is intrinsic and shares one
+    weight, so the score is identical to the plain mean it replaces.
     """
-    signals: list[float] = []
+    # Weighted mean of (value, weight) pairs.
+    signals: list[tuple[float, float]] = []
+    stated = 1.0
+    # Noticed on the shopper's behalf: enough to break ties between items that
+    # match what was asked for equally well, not enough to overturn it.
+    noticed = 0.25
 
     wants_family = filters.family_friendly or any(
         person.type in {"child", "infant"} for person in party
     )
     if wants_family:
-        signals.append(1.0 if product["family_friendly"] else 0.0)
+        # Stated if they asked; noticed if we inferred it from the party.
+        weight = stated if filters.family_friendly else noticed
+        signals.append((1.0 if product["family_friendly"] else 0.0, weight))
 
     # A category the shopper preferred but did not require. Without this the
     # soft branch had nowhere to go: `category` was the only category field
@@ -128,29 +146,42 @@ def preference_fit(
     # mandatory or discarded. Here it is what a preference should be - items in
     # the category rank above items outside it, and nothing is removed.
     if filters.preferred_category:
-        signals.append(
-            1.0 if product["category"].casefold() == filters.preferred_category.casefold() else 0.0
-        )
+        matched = product["category"].casefold() == filters.preferred_category.casefold()
+        # `or stated`: a model that omits the weight is not saying "barely
+        # wants it", it is saying nothing, and the preference stands at full
+        # strength. Zero means the model judged it not worth acting on.
+        strength = filters.preferred_category_weight
+        signals.append((1.0 if matched else 0.0, stated if strength is None else strength))
 
     if filters.indoor_outdoor:
         allowed = {filters.indoor_outdoor.casefold(), "mixed"}
-        signals.append(1.0 if product["indoor_outdoor"].casefold() in allowed else 0.0)
+        signals.append((1.0 if product["indoor_outdoor"].casefold() in allowed else 0.0, stated))
 
     if filters.max_duration_minutes:
         ratio = product["duration_minutes"] / filters.max_duration_minutes
-        signals.append(max(0.0, min(1.0, 1.2 - ratio)))
+        signals.append((max(0.0, min(1.0, 1.2 - ratio)), stated))
 
     if filters.rating is not None:
-        signals.append(min(1.0, max(0.0, (product["rating"] - filters.rating) / 0.5)))
+        signals.append((min(1.0, max(0.0, (product["rating"] - filters.rating) / 0.5)), stated))
 
     # Intrinsic signals: these matter to every tourist, whether or not they
     # thought to ask for them.
-    signals.append(1.0 if product["instant_confirmation"] else 0.0)
+    signals.append((1.0 if product["instant_confirmation"] else 0.0, noticed))
     signals.append(
-        1.0 if any(option["free_cancellation_hours"] > 0 for option in product["options"]) else 0.0
+        (
+            1.0
+            if any(option["free_cancellation_hours"] > 0 for option in product["options"])
+            else 0.0,
+            noticed,
+        )
     )
-    signals.append(min(1.0, len(product["languages"]) / 4))
-    return sum(signals) / len(signals)
+    signals.append((min(1.0, len(product["languages"]) / 4), noticed))
+    total = sum(weight for _, weight in signals)
+    if not total:
+        # Every signal was weighted zero, which is the model saying none of this
+        # should sway the order. Neutral, so relevance decides alone.
+        return 0.0
+    return sum(value * weight for value, weight in signals) / total
 
 
 def price_fit(

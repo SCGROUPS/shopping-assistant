@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
@@ -353,39 +354,73 @@ async def test_the_taxonomy_repair_actually_rewrites_a_retired_category():
     """That the migration chain applies says nothing about what 0007 does to data.
 
     The rest of this file compares schema shape, which a data-only migration
-    cannot change - so 0007 would pass every existing check while doing
-    nothing at all. The repair is the entire point of it: a row left under
-    "Food experience" is offered to the intent model as a category of its own,
-    splitting the vocabulary that made `food tour in ho chi minh city` return
-    an empty page.
+    cannot change - so 0007 would pass every existing check while doing nothing
+    at all. The repair is the entire point of it: a row left under "Food
+    experience" is offered to the intent model as a category of its own,
+    splitting the vocabulary that made `food tour in ho chi minh city` return an
+    empty page.
+
+    The row is inserted here rather than borrowed from whatever the preceding
+    tests left behind. The first version of this test read `LIMIT 1` and skipped
+    when it found nothing, and since the tests above finish by rebuilding the
+    schema with no rows in it, it skipped - reporting success for a repair it
+    had never once executed.
     """
     url = DATABASE_URL
     assert url
 
     _alembic("upgrade", "head", url=url)
     engine = create_async_engine(url)
+    slug = f"taxonomy-repair-{uuid4().hex[:12]}"
     try:
         async with engine.begin() as connection:
-            row = (
-                await connection.execute(
-                    text("SELECT id, content_version FROM experiences LIMIT 1")
-                )
-            ).first()
-            if row is None:
-                pytest.skip("no experiences in the test database to recategorise")
-            experience_id, version_before = row
-            # Put the database back into the state production was in.
+            supplier_id, destination_id, experience_id = uuid4(), uuid4(), uuid4()
             await connection.execute(
-                text("UPDATE experiences SET category = 'Food experience' WHERE id = :id"),
-                {"id": experience_id},
+                text(
+                    "INSERT INTO suppliers (id, external_id, name, status) "
+                    "VALUES (:id, :ext, 'Taxonomy Fixture', 'ACTIVE')"
+                ),
+                {"id": supplier_id, "ext": f"TAXONOMY-{slug}"},
             )
             await connection.execute(
-                text("DELETE FROM alembic_version WHERE version_num = '0007_canonical_categories'")
+                text(
+                    "INSERT INTO destinations "
+                    "(id, slug, name, country_code, latitude, longitude, timezone) VALUES "
+                    "(:id, :slug, 'Taxonomy City', 'VN', 16.0, 108.2, 'Asia/Ho_Chi_Minh')"
+                ),
+                {"id": destination_id, "slug": slug},
             )
             await connection.execute(
-                text("UPDATE alembic_version SET version_num = '0006_index_recipe'")
+                text(
+                    "INSERT INTO experiences ("
+                    "  id, supplier_id, destination_id, slug, title, short_description,"
+                    "  description, category, subcategories, interest_tags, indoor_outdoor,"
+                    "  duration_minutes, latitude, longitude, meeting_point, languages,"
+                    "  accessibility_features, family_friendly, instant_confirmation,"
+                    "  mobile_voucher, rating, popularity_score, status, needs_review,"
+                    "  boost, pinned, suppressed, promotion_label, content_version, source_type"
+                    ") VALUES ("
+                    "  :id, :supplier_id, :destination_id, :slug, 'Taxonomy Fixture',"
+                    "  'short', 'long', 'Food experience', '{}', '{}', 'outdoor',"
+                    "  90, 16.0, 108.2, 'meet here', '{en}', '{}', true, true,"
+                    "  true, 4.5, 0.5, 'PUBLISHED', false, 0, false, false, '', 1, 'manual'"
+                    ")"
+                ),
+                {
+                    "id": experience_id,
+                    "supplier_id": supplier_id,
+                    "destination_id": destination_id,
+                    "slug": slug,
+                },
             )
 
+        # `stamp`, not a hand-written UPDATE of alembic_version. The first
+        # version deleted the head row and then updated a table it had just
+        # emptied, which reported "UPDATE 0" and left the database stamped
+        # `base` - so the re-run replayed every migration from 0001 instead of
+        # applying 0007 to an existing 0006 database, which is the only
+        # situation this test exists to cover.
+        _alembic("stamp", "0006_index_recipe", url=url)
         _alembic("upgrade", "head", url=url)
 
         async with engine.connect() as connection:
@@ -400,9 +435,20 @@ async def test_the_taxonomy_repair_actually_rewrites_a_retired_category():
             f"the retired spelling survived the migration: {category!r}. The split "
             "vocabulary is still in the database and still reaches the intent model."
         )
-        assert version_after > version_before, (
-            f"content_version did not move ({version_before} -> {version_after}), so a "
-            "partner diffing its inventory cannot see that its listing was recategorised"
+        assert version_after > 1, (
+            f"content_version did not move (1 -> {version_after}), so a partner "
+            "diffing its inventory cannot see that its listing was recategorised"
         )
     finally:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM experiences WHERE slug = :slug"), {"slug": slug}
+            )
+            await connection.execute(
+                text("DELETE FROM destinations WHERE slug = :slug"), {"slug": slug}
+            )
+            await connection.execute(
+                text("DELETE FROM suppliers WHERE external_id = :ext"),
+                {"ext": f"TAXONOMY-{slug}"},
+            )
         await engine.dispose()

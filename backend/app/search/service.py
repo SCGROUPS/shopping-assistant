@@ -18,6 +18,7 @@ from app.assistant.provider import AIProvider, build_ai_provider, deterministic_
 from app.catalog.service import product_card, starting_price
 from app.common.config import get_settings
 from app.common.database import session_factory
+from app.common.degradation import intent_health
 from app.common.embedding_cache import embedding_cache
 from app.common.features import (
     availability_fit,
@@ -270,6 +271,9 @@ def merge_filters(explicit: SearchFilters, intent: SearchIntent) -> tuple[Search
             value = preference.get("value")
             if isinstance(value, str) and value:
                 values["preferred_category"] = value
+                weight = preference.get("weight")
+                if isinstance(weight, int | float) and not isinstance(weight, bool):
+                    values["preferred_category_weight"] = max(0.0, min(1.0, float(weight)))
     values["exclusions"] = list(dict.fromkeys([*values["exclusions"], *intent.exclusions]))
     if values["visit_start"] and not values["visit_end"]:
         values["visit_end"] = values["visit_start"]
@@ -603,13 +607,20 @@ class SearchService:
         # between calls that see the same catalogue.
         categories = sorted({product["category"] for product in available_products})
         destinations = sorted({product["destination"] for product in available_products})
+        intent_degraded = False
         if should_extract_intent(request):
+            intent_health.record_call()
             try:
                 intent = await self.ai.extract_intent(
                     request.query, categories=categories, destinations=destinations
                 )
             except Exception:
                 logger.exception("Intent extraction failed; using deterministic parsing")
+                # Counted as well as logged. Two outages survived days of
+                # logging because nobody reads a log that nothing points at;
+                # this number is on the health surface, where it can be alerted.
+                intent_health.record_failure()
+                intent_degraded = True
                 intent = deterministic_intent(request.query)
         else:
             # No model ran, so nothing judged this query. A terminal question
@@ -657,10 +668,27 @@ class SearchService:
                 unmatched.append("destination_unmatched")
                 continue
             kept.append(constraint)
+        # Soft preferences need the identical check. Only hard constraints were
+        # screened, so an invented category that arrived as a *preference*
+        # sailed through to `preferred_category`, matched nothing, and scored
+        # 0.0 on every product - and because preference fit is averaged, that
+        # zero dragged the whole page's score down without ever appearing as a
+        # dropped constraint. A vocabulary the catalogue does not stock is
+        # equally meaningless whether the model called it required or nice to
+        # have.
+        kept_preferences: list[dict[str, Any]] = []
+        for preference in intent.soft_preferences:
+            field = str(preference.get("field", "")).casefold()
+            value = str(preference.get("value", "")).casefold()
+            if field == "category" and value and value not in known_categories:
+                unmatched.append("category_unmatched")
+                continue
+            kept_preferences.append(preference)
         if unmatched:
             intent = intent.model_copy(
                 update={
                     "hard_constraints": kept,
+                    "soft_preferences": kept_preferences,
                     "dropped_constraints": list(
                         dict.fromkeys([*intent.dropped_constraints, *unmatched])
                     ),
@@ -672,7 +700,17 @@ class SearchService:
         # max_total_price." - which was neither the shopper's language nor
         # anything they had written. The client owns the wording.
         unresolved_codes = list(
-            dict.fromkeys([*intent.dropped_constraints, *(f"field.{f}" for f in unresolved)])
+            dict.fromkeys(
+                [
+                    *intent.dropped_constraints,
+                    *(f"field.{f}" for f in unresolved),
+                    # A page assembled without the model understanding the query
+                    # says so, in the same channel the client already reads for
+                    # everything else it could not honour. Silence here is what
+                    # made a broken service indistinguishable from a working one.
+                    *(("intent_unavailable",) if intent_degraded else ()),
+                ]
+            )
         )
         if unresolved or intent.needs_clarification:
             intent = intent.model_copy(update={"needs_clarification": True})

@@ -27,6 +27,12 @@ class SearchFilters(BaseModel):
     # higher. Collapsing them is what made "we have street food in Hoi An"
     # return nothing but street food and hide the cooking classes next door.
     preferred_category: str | None = None
+    # How strongly the shopper wants it, as the model judged it. The model
+    # already emits this and it was being dropped on the floor, which turned
+    # "I'd quite like a food tour" and "food, if it's going" into the same
+    # request. Strength of preference is a reading of the shopper's language,
+    # so it belongs to the model, not to a constant in the ranker.
+    preferred_category_weight: float | None = Field(default=None, ge=0.0, le=1.0)
     rating: float | None = Field(default=None, ge=0, le=5)
     max_duration_minutes: int | None = Field(default=None, ge=1)
     accessibility: list[str] = Field(default_factory=list)

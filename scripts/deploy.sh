@@ -82,6 +82,14 @@ deploy_stack() {
   local log
 
   log="$(mktemp)"
+  # No model deployment names are passed here, deliberately. The defaults in
+  # infra/bicep/main.bicep are therefore what production runs, and that file is
+  # the single place they are decided. Passing one from here would mean the name
+  # in the template no longer describes the running service - which is how a
+  # hand-set AZURE_OPENAI_INTENT_DEPLOYMENT once survived until the next deploy
+  # silently reverted it and reopened an outage that looked fixed.
+  # backend/tests/test_intent_request_shape.py reads those defaults directly and
+  # will not see anything added here.
   while true; do
     if az deployment sub create \
       --name "$deployment" \

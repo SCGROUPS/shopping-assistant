@@ -11,11 +11,15 @@ from app.api.schemas import (
     SearchIntent,
     SearchRequest,
 )
+from app.catalog.vocabulary import CATEGORIES
 from app.common.config import get_settings
+from app.common.degradation import intent_health
 from app.common.features import (
+    CATEGORY_TAKE_RATE,
     availability_fit,
     margin_fit,
     merchandising_multiplier,
+    preference_fit,
     promotion_active,
 )
 from app.common.persistence import catalog_products
@@ -940,6 +944,18 @@ async def test_a_preferred_category_ranks_matches_up_without_hiding_the_rest():
         f"expressing a preference for Food changed nothing: {moved}. The preference is "
         "carried through the intent but never reaches the ranker, so 'soft' means 'ignored'."
     )
+    # A floor, not just a direction. "Something moved up" passed while the
+    # average item gained a single position - technically honoured, invisible
+    # to a shopper who asked for food and got the same page with one swap in
+    # it. Every paired item clears two places here; the floor is set at two so
+    # that diluting the preference term (another intrinsic signal, a flat mean
+    # again) fails instead of quietly degrading to a token gesture.
+    gains = [before - after for before, after in moved.values()]
+    assert min(gains) >= 2, (
+        f"preferring Food moved its items by {gains} places. The preference is reaching "
+        "the ranker but is too weak to reorder the page, which reads to a shopper as "
+        "having been ignored."
+    )
     assert len(preferred_ranks) >= len(baseline_ranks), (
         "preferring a category put less of it on the page than not mentioning it at all"
     )
@@ -1006,3 +1022,192 @@ class NoPreferenceProvider:
 
     async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
         return None
+
+
+class InventedSoftCategoryProvider:
+    """A preference for something the catalogue does not stock.
+
+    Real values from production logs: "attractions", "tourist attraction",
+    "sightseeing or lantern festival". The hard path has been screened for this
+    since the empty-grid fix; the soft path was not, because a preference cannot
+    empty a grid and so looked harmless.
+    """
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
+        return SearchIntent(
+            search_text=text,
+            destination=IntentValue(name="Hoi An", confidence=0.9),
+            soft_preferences=[
+                {"field": "category", "value": "sightseeing or lantern festival", "weight": 0.5}
+            ],
+        )
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None
+
+
+async def test_a_preferred_category_we_do_not_stock_is_dropped_and_declared():
+    """An unsatisfiable preference must not silently reorder the page.
+
+    It matches no product, so `preference_fit` scores every product 0.0 on that
+    signal; because the score is an unweighted mean, carrying it deflates the
+    preference score of the whole page by one signal's worth. The ranking then
+    reflects a preference nothing could ever satisfy, and the shopper is never
+    told their words were discarded - which is the thing they would need to know
+    to phrase it differently.
+    """
+    response = await SearchService(ai_provider=InventedSoftCategoryProvider()).search(
+        SearchRequest(query="sightseeing in hoi an")
+    )
+
+    assert response.effective_filters.preferred_category is None, (
+        "a category the catalogue does not stock reached the ranker as a preference: "
+        f"{response.effective_filters.preferred_category!r}"
+    )
+    assert "category_unmatched" in response.unresolved_constraints, (
+        "the preference was discarded without telling the shopper; "
+        f"unresolved_constraints={response.unresolved_constraints}"
+    )
+    assert response.items, "dropping an unsatisfiable preference must not empty the grid"
+
+
+class BrokenIntentProvider:
+    """The failure mode both production outages actually took.
+
+    Not a contrived exception: a wrong `reasoning.effort` for the deployed model
+    makes Azure OpenAI return 400 on every single call, which arrives here as an
+    exception out of `extract_intent`.
+    """
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
+        raise RuntimeError(
+            "400 Unsupported value: 'minimal' is not supported with this model"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_page_built_without_the_model_says_so_and_is_counted():
+    """The outage that hid behind HTTP 200 now leaves two marks.
+
+    The shopper still gets a page - that part is deliberate and unchanged. But
+    the response now names the degradation, and the health surface carries a
+    non-zero failure ratio, so it can be alerted on. Without both, a service
+    that has stopped understanding every query it receives is indistinguishable
+    from a healthy one, which is exactly how two outages ran for days.
+    """
+    intent_health.reset()
+    service = SearchService(ai_provider=BrokenIntentProvider())
+
+    response = await service.search(SearchRequest(query="lantern workshop in hoi an"))
+
+    assert "intent_unavailable" in response.unresolved_constraints, (
+        "the page was assembled by deterministic parsing, with no model having read the "
+        "query, and said nothing about it - the client cannot tell this page apart from "
+        "one the model actually understood"
+    )
+    assert response.items, "degrading must still answer; a page beats an error page"
+
+    health = intent_health.snapshot()
+    assert health.calls == 1
+    assert health.failures == 1
+    assert health.failure_ratio == 1.0, (
+        "every intent call failed and the health surface reported it as fine"
+    )
+    intent_health.reset()
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_page_is_not_marked_as_degraded():
+    """The counterpart: the marker must mean something when it is absent."""
+    intent_health.reset()
+    service = SearchService(ai_provider=NoPreferenceProvider())
+
+    response = await service.search(SearchRequest(query="lantern workshop in hoi an"))
+
+    assert "intent_unavailable" not in response.unresolved_constraints
+    assert intent_health.snapshot().failures == 0
+    intent_health.reset()
+
+
+def test_the_models_strength_of_preference_reaches_the_ranker():
+    """A mild preference and an emphatic one must not score identically.
+
+    The model already judges how much the shopper wants something and emits a
+    weight for it; that number used to be dropped in `merge_filters`, so "a
+    food tour would be nice" and "I really want a food tour" produced the same
+    ranking. Reading strength out of a sentence is a language judgement, which
+    belongs to the model - the ranker's job is to honour it, not to substitute
+    a constant of its own.
+    """
+    faint = SearchIntent(
+        search_text="maybe some food",
+        soft_preferences=[{"field": "category", "value": "Food", "weight": 0.1}],
+    )
+    emphatic = SearchIntent(
+        search_text="really want food",
+        soft_preferences=[{"field": "category", "value": "Food", "weight": 1.0}],
+    )
+    faint_filters, _ = merge_filters(SearchFilters(), faint)
+    emphatic_filters, _ = merge_filters(SearchFilters(), emphatic)
+
+    assert faint_filters.preferred_category_weight == 0.1
+    assert emphatic_filters.preferred_category_weight == 1.0
+
+    food = {
+        "category": "Food",
+        "family_friendly": True,
+        "indoor_outdoor": "indoor",
+        "duration_minutes": 120,
+        "rating": 4.5,
+        "instant_confirmation": True,
+        "options": [{"free_cancellation_hours": 24}],
+        "languages": ["en", "vi"],
+    }
+    other = {**food, "category": "Tour"}
+
+    faint_gap = preference_fit(food, faint_filters) - preference_fit(other, faint_filters)
+    emphatic_gap = preference_fit(food, emphatic_filters) - preference_fit(
+        other, emphatic_filters
+    )
+
+    assert faint_gap > 0, "even a faint preference should favour the category"
+    assert emphatic_gap > faint_gap * 2, (
+        f"a preference the model rated 1.0 separated the categories by {emphatic_gap:.4f}, "
+        f"barely more than one it rated 0.1 ({faint_gap:.4f}). The model's reading of how "
+        "much the shopper wants this is being flattened to a constant."
+    )
+
+
+def test_every_category_we_stock_has_its_own_take_rate():
+    """The commercial table and the catalogue vocabulary are one list, not two.
+
+    CATEGORY_TAKE_RATE drifted through two renames still holding "Food
+    experience" and "Transport ticket". Nothing failed: an unknown category
+    silently takes DEFAULT_TAKE_RATE, so renaming a category quietly repriced
+    every item in it and left a dead key behind to make it look intentional.
+    """
+    rated = set(CATEGORY_TAKE_RATE)
+    stocked = set(CATEGORIES)
+    assert not stocked - rated, (
+        f"categories the catalogue stocks with no take rate, silently priced at the "
+        f"default: {sorted(stocked - rated)}"
+    )
+    assert not rated - stocked, (
+        f"take rates for categories the catalogue does not stock: {sorted(rated - stocked)}. "
+        "A key here that no product can have is a rename that was never finished."
+    )

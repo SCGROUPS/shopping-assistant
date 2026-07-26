@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from uuid import uuid4
@@ -13,11 +14,39 @@ from app.admin.routes import router as admin_router
 from app.api.routes import router
 from app.common.config import get_settings
 from app.common.database import database_ready
+from app.common.degradation import intent_health
 from app.common.errors import install_error_handlers
+from app.common.intent_probe import probe_intent
 from app.common.logging_setup import configure_logging
 from app.common.store import store
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+async def _run_intent_probe() -> None:
+    """Record whether the intent deployment accepts the request we send it."""
+    from app.assistant.provider import build_ai_provider
+    from app.common.persistence import catalog_products
+
+    try:
+        products = await catalog_products()
+        result = await probe_intent(
+            build_ai_provider(),
+            categories=sorted({product["category"] for product in products}),
+            destinations=sorted({product["destination"] for product in products}),
+        )
+    except Exception as error:  # noqa: BLE001
+        # The probe failing to run is not the deployment rejecting us, and must
+        # not be reported as though it were.
+        logger.warning("Intent probe did not run: %s", error)
+        intent_health.record_probe(ok=True, detail=f"probe did not run: {error}")
+        return
+    if result.ok:
+        logger.info("Intent probe: %s", result.detail)
+    else:
+        logger.error("Intent probe FAILED: %s", result.detail)
+    intent_health.record_probe(ok=result.ok, detail=result.detail)
 
 
 @asynccontextmanager
@@ -36,9 +65,15 @@ async def lifespan(app: FastAPI):
     from app.catalog.indexing import index_worker_loop
 
     worker = asyncio.create_task(index_worker_loop())
+    # Run alongside startup rather than blocking it: a slow model must not stop
+    # the service coming up, and readiness stays false until the answer is in.
+    probe = asyncio.create_task(_run_intent_probe())
     try:
         yield
     finally:
+        probe.cancel()
+        with suppress(asyncio.CancelledError):
+            await probe
         worker.cancel()
         with suppress(asyncio.CancelledError):
             await worker
@@ -98,11 +133,22 @@ async def live() -> JSONResponse:
 @app.get("/health/ready")
 async def ready() -> JSONResponse:
     database = await database_ready()
-    healthy = settings.demo_mode or database
-    return JSONResponse(
-        {"status": "ready" if healthy else "degraded", "database": database},
-        status_code=200 if healthy else 503,
-    )
+    probe = intent_health.probe()
+    # A revision whose every intent call is rejected must not take traffic. It
+    # would serve HTTP 200 and a full page for each search while understanding
+    # none of them, which is indistinguishable from working and is precisely how
+    # two outages survived their own deployments. Failing readiness here leaves
+    # the previous revision serving, which does understand its shoppers.
+    intent_ok = probe is None or probe.ok
+    healthy = (settings.demo_mode or database) and intent_ok
+    body = {
+        "status": "ready" if healthy else "degraded",
+        "database": database,
+        # None until the probe has answered: unknown is not the same as good,
+        # and saying so keeps a slow start from reading as a failed one.
+        "intent": None if probe is None else {"ok": probe.ok, "detail": probe.detail},
+    }
+    return JSONResponse(body, status_code=200 if healthy else 503)
 
 
 static_directory = Path(__file__).parent / "static"
