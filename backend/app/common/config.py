@@ -46,8 +46,10 @@ class Settings(BaseSettings):
     # finishes overnight. Bounded because the provider rate limits, and each
     # lane holds a database session for the length of a model call.
     # Sized against the deployment's tokens-per-minute quota, not against
-    # what the event loop could manage. Eight lanes against a 10K TPM
-    # deployment spend most of their time collecting 429s.
+    # what the event loop could manage: eight lanes against a 10K TPM
+    # deployment spend most of their time collecting 429s. The translate job
+    # overrides this to match its own quota; this default is the safe one for
+    # anything that has not been told what it is talking to.
     translation_concurrency: int = 3
     # Translation runs in its own container, so this ceiling is its own and
     # cannot starve the storefront. Hitting it defers work to the next run

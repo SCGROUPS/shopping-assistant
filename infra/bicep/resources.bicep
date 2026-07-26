@@ -487,6 +487,14 @@ resource translateJob 'Microsoft.App/jobs@2024-03-01' = {
               name: 'AZURE_OPENAI_API_VERSION'
               value: '2025-04-01-preview'
             }
+            {
+              // Set here rather than in the application default, because it is
+              // a fact about this job against this deployment's quota and not
+              // about the software. The storefront shares the code and has no
+              // reason to inherit a backfill's concurrency.
+              name: 'TRANSLATION_CONCURRENCY'
+              value: '12'
+            }
           ]
           resources: {
             cpu: json('0.5')
