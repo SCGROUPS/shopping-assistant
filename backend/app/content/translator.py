@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -582,8 +583,11 @@ async def _run_one(session_factory, translator, job: Leased, *, hold_all: bool) 
         # a rate-limited batch stops asking instead of spinning through its
         # remaining jobs at full speed to collect the same 429.
         await asyncio.sleep(_retry_after(exc))
-        await _defer(session_factory, job, f"rate limited: {exc}")
-        return "throttled"
+        outcome = await _defer(session_factory, job, f"rate limited: {exc}")
+        # If the fence missed, this worker no longer owns the job and nothing
+        # was handed back - reporting `throttled` would keep the drain looping
+        # over work somebody else has.
+        return "throttled" if outcome == "deferred" else outcome
     except BudgetExceeded as exc:
         # Not a failure of this job: the work is fine, we simply declined to pay
         # for it right now. Consuming an attempt would mean a spending ceiling
@@ -629,9 +633,12 @@ def _retry_after(exc: Exception) -> float:
     headers = getattr(getattr(exc, "response", None), "headers", None)
     raw = headers.get("retry-after") if headers else None
     try:
-        return min(max(float(raw), 1.0), MAX_RETRY_AFTER)  # pyright: ignore[reportArgumentType]
+        wait = min(max(float(raw), 1.0), MAX_RETRY_AFTER)  # pyright: ignore[reportArgumentType]
     except (TypeError, ValueError):
-        return DEFAULT_RETRY_AFTER
+        wait = DEFAULT_RETRY_AFTER
+    # Jittered, or every lane wakes at the same instant and reproduces the burst
+    # that earned the 429 in the first place.
+    return wait * (1.0 + random.random() * 0.25)
 
 
 async def _defer(session_factory, job: Leased, detail: str) -> str:
@@ -688,6 +695,7 @@ async def drain(
     limit: int | None = None,
     hold_all: bool = False,
     concurrency: int | None = None,
+    deadline: float | None = None,
 ) -> dict[str, int]:
     """Work the queue once. Each job commits in its own transaction.
 
@@ -729,6 +737,13 @@ async def drain(
 
     async def guarded(job: Leased) -> str:
         async with gate:
+            # Checked after acquiring, not before. Under throttling a job can
+            # sit on this semaphore for minutes while the deadline passes, and
+            # starting it then means the replica timeout kills it mid-flight -
+            # still leased, with its attempt already spent. Handing it back is
+            # the difference between a run that ends and a run that is killed.
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                return await _defer(session_factory, job, "run deadline reached")
             return await _run_one(session_factory, translator, job, hold_all=hold_all)
 
     for outcome in await asyncio.gather(*(guarded(job) for job in jobs)):

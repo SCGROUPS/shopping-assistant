@@ -1225,10 +1225,70 @@ def test_a_retry_after_header_is_believed_but_not_blindly(factory):
             body=None,
         )
 
-    assert _retry_after(limited({"retry-after": "7"})) == 7.0
+    def within_jitter(actual: float, base: float) -> bool:
+        # Jittered upwards by up to 25%, so three lanes do not wake together and
+        # reproduce the burst that earned the 429.
+        return base <= actual <= base * 1.25
+
+    assert within_jitter(_retry_after(limited({"retry-after": "7"})), 7.0)
     # No header at all: guessing short is how a retry storm starts.
-    assert _retry_after(limited({})) == translator_module.DEFAULT_RETRY_AFTER
-    assert _retry_after(limited({"retry-after": "banana"})) == translator_module.DEFAULT_RETRY_AFTER
+    assert within_jitter(_retry_after(limited({})), translator_module.DEFAULT_RETRY_AFTER)
+    assert within_jitter(
+        _retry_after(limited({"retry-after": "banana"})), translator_module.DEFAULT_RETRY_AFTER
+    )
     # A provider returning something absurd must not idle the worker until its
     # replica timeout kills it.
-    assert _retry_after(limited({"retry-after": "99999"})) == translator_module.MAX_RETRY_AFTER
+    assert within_jitter(
+        _retry_after(limited({"retry-after": "99999"})), translator_module.MAX_RETRY_AFTER
+    )
+    # The jitter is real, not a constant multiplier.
+    assert len({_retry_after(limited({"retry-after": "10"})) for _ in range(20)}) > 1
+
+
+async def test_a_permanently_throttled_run_ends_itself_without_spending_attempts(factory):
+    """The replica timeout is not a safe way to end a run.
+
+    Container Apps kills the process at 3000s, and it kills it mid-batch: jobs
+    are still leased with their attempts already spent, and nothing gets the
+    chance to hand them back. Five throttled executions would park the queue
+    exactly as five genuine failures do - which is the bug this whole change
+    exists to fix, reappearing one level up.
+
+    So the run carries its own deadline and stops on its own terms.
+    """
+    await _enqueue(factory, locales=["vi", "ja"])
+    before = {(job.field, job.locale): job.attempts for job in await _jobs(factory)}
+
+    request = httpx.Request("POST", "https://example.invalid/openai")
+
+    async def always_limited(*, job, glossary):
+        raise RateLimitError(
+            "slow down",
+            response=httpx.Response(429, request=request, headers={"retry-after": "1"}),
+            body=None,
+        )
+
+    # A deadline already in the past: every job is handed back at the semaphore
+    # without ever reaching the provider.
+    counts = await drain(
+        factory,
+        always_limited,
+        limit=8,
+        deadline=asyncio.get_running_loop().time() - 1,
+    )
+    assert counts["leased"] == 8
+    assert counts["deferred"] == 8
+    assert counts["failed"] == 0
+
+    after = {(job.field, job.locale): job.attempts for job in await _jobs(factory)}
+    assert after == before, "a run that ran out of time must cost nothing"
+    assert {job.status for job in await _jobs(factory)} == {"queued"}
+
+
+async def test_a_deadline_that_has_not_passed_does_not_interfere(factory):
+    """The deadline must only fire when it has actually been reached."""
+    await _enqueue(factory, locales=["vi"])
+    counts = await drain(
+        factory, _echo, limit=4, deadline=asyncio.get_running_loop().time() + 300
+    )
+    assert counts["published"] == 4 and counts["deferred"] == 0

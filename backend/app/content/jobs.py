@@ -9,10 +9,12 @@ catalogue noticing that content changed.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from sqlalchemy import func, select
 
+from app.common.config import get_settings
 from app.common.database import session_factory
 from app.common.models import Experience, TranslationJob
 from app.content.enqueue import enqueue_experience_translations
@@ -86,8 +88,12 @@ async def drain_translations(
             totals["revived"] = await revive_failed_jobs(session)
             await session.commit()
 
+    deadline = asyncio.get_running_loop().time() + get_settings().translation_run_seconds
+
     while True:
-        counts = await drain(session_factory, translator, limit=limit, hold_all=hold_all)
+        counts = await drain(
+            session_factory, translator, limit=limit, hold_all=hold_all, deadline=deadline
+        )
         for key, value in counts.items():
             totals[key] += value
         if counts["leased"] == 0:
@@ -100,6 +106,12 @@ async def drain_translations(
             # rather than failing: the next run picks up exactly where this one
             # left off, with every attempt still available.
             logger.warning("translation.budget_reached", extra={"counts": counts})
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            # Ending on our own terms, with every leased job deferred and every
+            # attempt intact, rather than being killed by the replica timeout
+            # mid-batch. What is left is exactly what the next run picks up.
+            logger.warning("translation.deadline_reached", extra={"counts": counts})
             break
         if counts["throttled"]:
             # Throttling is not "no progress", it is the provider pacing us, and

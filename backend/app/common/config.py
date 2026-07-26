@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     # rather than failing it: a backfill that stops early is resumable, and a
     # backfill that burns its attempts against a spending limit is not.
     translation_daily_budget: float = 25.0
+    # Comfortably inside the container job's 3000s replica timeout. The timeout
+    # is not a safe way to end a run: it kills the process while jobs are still
+    # leased with their attempts already spent, so five throttled executions
+    # would park the queue exactly as five real failures do. This deadline is
+    # what lets the run hand its work back instead.
+    translation_run_seconds: float = 2400.0
 
     assistant_max_tool_rounds: int = 3
     assistant_max_session_turns: int = 12
