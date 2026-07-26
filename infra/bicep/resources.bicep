@@ -22,6 +22,9 @@ param imageDeployment string
 @secure()
 param adminBootstrapKey string = ''
 
+@description('Where intent-extraction alerts are sent. Empty means the alerts still fire and are visible in Azure Monitor, but nobody is told.')
+param alertEmail string = ''
+
 var normalizedPrefix = toLower(replace(prefix, '-', ''))
 var postgresAdmin = 'vietraadmin'
 var databaseName = 'vietra'
@@ -581,6 +584,116 @@ resource migrateJob 'Microsoft.App/jobs@2024-03-01' = {
       ]
     }
     workloadProfileName: 'Consumption'
+  }
+}
+
+// Both outages were invisible for days: search catches every extraction
+// failure and answers HTTP 200 with a full page, so no request failed, no
+// availability metric moved, and the health endpoint kept saying "ok". The
+// counters added on that surface are only worth having if something reads
+// them, and until these rules existed nothing did.
+resource alertRecipients 'Microsoft.Insights/actionGroups@2023-01-01' = if (!empty(alertEmail)) {
+  name: 'ag-${prefix}-intent'
+  location: 'global'
+  properties: {
+    groupShortName: 'vietraIntent'
+    enabled: true
+    emailReceivers: [
+      {
+        name: 'operator'
+        emailAddress: alertEmail
+        useCommonAlertSchema: true
+      }
+    ]
+  }
+}
+
+// Compiles to resourceId(), which is a pure string function, so it stays
+// valid when no email was given and the action group was never deployed.
+var alertActions = empty(alertEmail) ? [] : [alertRecipients.id]
+
+resource intentFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-${prefix}-intent-extraction-failing'
+  location: location
+  properties: {
+    displayName: 'Vietra: search is not understanding shoppers'
+    description: 'The intent extractor threw and the search fell back to deterministic parsing. The shopper still received HTTP 200 and a full page of products, which is why this cannot be detected from request metrics.'
+    severity: 1
+    enabled: true
+    scopes: [
+      logs.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          // Threshold is zero-tolerance rather than a ratio on purpose. At this
+          // traffic level a ratio has a denominator of one or two searches, so
+          // it swings between 0 and 1 on no real signal - and the provider has
+          // already retried twice before this line is ever written, so a single
+          // occurrence is a shopper who got an unfiltered page, not a blip.
+          query: '''
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == '${appName}'
+| where Log_s has 'Intent extraction failed'
+| summarize FailedSearches = count()
+'''
+          timeAggregation: 'Total'
+          metricMeasureColumn: 'FailedSearches'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: alertActions
+    }
+  }
+}
+
+resource intentProbeAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-${prefix}-intent-probe-rejected'
+  location: location
+  properties: {
+    displayName: 'Vietra: a revision refused to serve'
+    description: 'The startup probe found the intent deployment rejecting our requests, so the revision failed its readiness check and took no traffic. With one replica and no automatic rollback this means the storefront is down, which is the deliberate trade - but it is not a state to discover from a customer.'
+    severity: 0
+    enabled: true
+    scopes: [
+      logs.id
+    ]
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT5M'
+    criteria: {
+      allOf: [
+        {
+          query: '''
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == '${appName}'
+| where Log_s has 'Intent probe' and Log_s has_any ('rejected', 'gave up')
+| summarize RejectedProbes = count()
+'''
+          timeAggregation: 'Total'
+          metricMeasureColumn: 'RejectedProbes'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: alertActions
+    }
   }
 }
 

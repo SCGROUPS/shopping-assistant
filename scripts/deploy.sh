@@ -66,6 +66,14 @@ else
   # gives no hint why.
   echo "ADMIN_BOOTSTRAP_KEY is not set: the operator console will be unreachable." >&2
 fi
+if [[ -n "${ALERT_EMAIL:-}" ]]; then
+  deployment_parameters+=(alertEmail="$ALERT_EMAIL")
+else
+  # The alert rules deploy either way and are visible in Azure Monitor. Without
+  # a recipient nobody is *told*, which is how both intent outages ran for days
+  # while every dashboard read healthy.
+  echo "ALERT_EMAIL is not set: intent alerts will fire but notify nobody." >&2
+fi
 
 # This script runs the same ARM deployment twice — once to bootstrap the
 # registry, once with the real image. Azure Database for PostgreSQL rejects a

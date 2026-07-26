@@ -30,6 +30,7 @@ param postgresAdminPassword string
 @secure()
 @description('First operator credential for the console. Empty leaves the console unreachable, which is the safe default for an unattended deploy.')
 param adminBootstrapKey string = ''
+param alertEmail string = ''
 
 param chatDeployment string = 'gpt-5.4-mini'
 // Intent extraction shares the chat model. Nano's output wandered between
@@ -82,6 +83,7 @@ module resources 'resources.bicep' = {
     aiEndpoint: aiAccount.outputs.endpoint
     aiApiKey: aiAccount.outputs.apiKey
     adminBootstrapKey: adminBootstrapKey
+    alertEmail: alertEmail
   }
 }
 

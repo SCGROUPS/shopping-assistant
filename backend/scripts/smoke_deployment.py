@@ -76,14 +76,29 @@ def main() -> int:
 
         resolved = (payload.get("intent") or {}).get("destination", {}).get("name")
         items = payload.get("items") or []
+        unresolved = payload.get("unresolved_constraints") or []
         status = f"items={len(items):<3} destination={resolved!r}"
 
-        if not resolved:
+        if "intent_unavailable" in unresolved:
+            # The outage signature, stated by the service rather than guessed at
+            # from a missing field. Both previous outages produced exactly this
+            # marker on every search, and inferring it from a null destination
+            # would also fire when the model simply read the sentence badly -
+            # which is a different problem with a different fix.
             failures.append(
-                f"{query!r}: no destination resolved ({status}). Intent extraction is "
-                "not running - the service is falling back to deterministic parsing, "
-                "which cannot filter. Check the container logs for 'Intent extraction "
-                "failed' and confirm the intent deployment accepts our request."
+                f"{query!r}: the service reported intent_unavailable ({status}). Intent "
+                "extraction threw and search fell back to deterministic parsing, so "
+                "every shopper is getting an unfiltered page behind an HTTP 200. Check "
+                "the container logs for 'Intent extraction failed' and confirm the "
+                "intent deployment accepts our request shape - a reasoning effort the "
+                "deployment does not support is what caused this twice."
+            )
+        elif not resolved:
+            failures.append(
+                f"{query!r}: no destination resolved ({status}), but extraction itself "
+                "ran - unresolved_constraints did not report intent_unavailable. The "
+                "model answered and did not find the city in the sentence, so this is "
+                "the model or the prompt, not the deployment."
             )
         elif _fold(resolved) != _fold(expected):
             # Checking only that *a* city came back would accept "đi thuyền ở
