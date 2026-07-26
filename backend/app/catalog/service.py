@@ -4,6 +4,7 @@ from typing import Any
 from uuid import UUID
 
 from app.api.schemas import (
+    ContentFieldMeta,
     ExperienceCard,
     ExperienceDetail,
     OptionView,
@@ -15,6 +16,7 @@ from app.api.schemas import (
 from app.common import currency as fx
 from app.common import urgency
 from app.common.errors import ApiError
+from app.common.locales import DEFAULT_LOCALE
 from app.common.persistence import catalog_product
 from app.common.store import DemoStore, store
 
@@ -107,6 +109,11 @@ def product_card(
         reason=" ".join(explanations or []) or None,
         reason_code=reason_code,
         options=options,
+        locale=product.get("locale", DEFAULT_LOCALE),
+        content_meta={
+            field: ContentFieldMeta(**meta)
+            for field, meta in (product.get("content_meta") or {}).items()
+        },
     )
 
 
@@ -118,9 +125,9 @@ def get_product(product_id: UUID, data: DemoStore = store) -> dict[str, Any]:
 
 
 async def get_product_async(
-    product_id: UUID, data: DemoStore = store
+    product_id: UUID, data: DemoStore = store, locale: str = DEFAULT_LOCALE
 ) -> dict[str, Any]:
-    product = await catalog_product(product_id, data)
+    product = await catalog_product(product_id, data, locale=locale)
     if not product or product["status"] != "PUBLISHED":
         raise ApiError(
             404,

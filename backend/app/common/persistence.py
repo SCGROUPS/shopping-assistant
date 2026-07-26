@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.common.config import get_settings
 from app.common.database import session_factory
+from app.common.locales import DEFAULT_LOCALE
 from app.common.models import (
     BehaviorEvent,
     Destination,
@@ -21,6 +22,7 @@ from app.common.models import (
     ShoppingSession,
 )
 from app.common.ranking import deterministic_embedding
+from app.common.resolution import ResolvedField, content_meta, resolve_experience_text
 from app.common.store import DemoStore, store
 
 
@@ -73,27 +75,32 @@ async def lock_idempotency(
     )
 
 
-async def catalog_products(data: DemoStore = store) -> list[dict[str, Any]]:
+async def catalog_products(
+    data: DemoStore = store, locale: str = DEFAULT_LOCALE
+) -> list[dict[str, Any]]:
     if not database_mode():
         return list(data.products.values())
     factory = require_session_factory()
     async with factory() as db:
-        return await load_products(db)
+        return await load_products(db, locale=locale)
 
 
 async def catalog_product(
-    product_id: UUID, data: DemoStore = store
+    product_id: UUID, data: DemoStore = store, locale: str = DEFAULT_LOCALE
 ) -> dict[str, Any] | None:
     if not database_mode():
         return data.products.get(product_id)
     factory = require_session_factory()
     async with factory() as db:
-        products = await load_products(db, [product_id])
+        products = await load_products(db, [product_id], locale=locale)
         return products[0] if products else None
 
 
 async def load_products(
-    db: AsyncSession, product_ids: list[UUID] | None = None
+    db: AsyncSession,
+    product_ids: list[UUID] | None = None,
+    *,
+    locale: str = DEFAULT_LOCALE,
 ) -> list[dict[str, Any]]:
     statement = (
         select(Experience)
@@ -130,20 +137,26 @@ async def load_products(
             # (experience_id, locale), so without this filter a record with
             # several locales would contribute several rows and whichever the
             # database returned last would win - silently, and differently on
-            # different runs. Locale-aware resolution replaces the constant;
-            # until then the constant is the honest description of what we serve.
-            ExperienceSearchDocument.locale == "en",
+            # different runs. The document carries the embedding that drives
+            # recommendations and MMR, so picking an arbitrary one is not a
+            # display bug - it ranks a Vietnamese shopper's results by a
+            # Japanese vector.
+            ExperienceSearchDocument.locale == locale,
         )
     )
     documents = {
         item.experience_id: item for item in document_rows.scalars().all()
     }
 
+    resolved = await resolve_experience_text(db, experiences, locale)
+
     products = [
         _product_dict(
             experience,
             destinations[experience.destination_id],
             documents.get(experience.id),
+            resolved[experience.id],
+            locale,
         )
         for experience in experiences
     ]
@@ -157,17 +170,19 @@ def _product_dict(
     experience: Experience,
     destination: str,
     document: ExperienceSearchDocument | None,
+    fields: dict[str, ResolvedField],
+    locale: str,
 ) -> dict[str, Any]:
     media = sorted(experience.media, key=lambda item: item.sort_order)
     document_text = document.document_text if document else " ".join(
         [
-            experience.title,
+            fields["title"].value,
             destination,
             experience.category,
             *experience.subcategories,
             *experience.interest_tags,
-            experience.short_description,
-            experience.description,
+            fields["short_description"].value,
+            fields["description"].value,
         ]
     )
     embedding = (
@@ -180,9 +195,9 @@ def _product_dict(
         "external_id": experience.external_id,
         "destination_id": experience.destination_id,
         "slug": experience.slug,
-        "title": experience.title,
-        "short_description": experience.short_description,
-        "description": experience.description,
+        "title": fields["title"].value,
+        "short_description": fields["short_description"].value,
+        "description": fields["description"].value,
         "destination": destination,
         "category": experience.category,
         "subcategories": list(experience.subcategories),
@@ -191,7 +206,7 @@ def _product_dict(
         "duration_minutes": experience.duration_minutes,
         "latitude": float(experience.latitude),
         "longitude": float(experience.longitude),
-        "meeting_point": experience.meeting_point,
+        "meeting_point": fields["meeting_point"].value,
         "languages": list(experience.languages),
         "accessibility_features": list(experience.accessibility_features),
         "minimum_age": experience.minimum_age,
@@ -210,6 +225,8 @@ def _product_dict(
         "promotion_ends_at": experience.promotion_ends_at,
         "needs_review": experience.needs_review,
         "image_url": media[0].url if media else "",
+        "locale": locale,
+        "content_meta": content_meta(fields),
         "search_document": document_text,
         "embedding": embedding,
         "options": [

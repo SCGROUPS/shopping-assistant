@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     # what lets the run hand its work back instead.
     translation_run_seconds: float = 2400.0
 
+    # Which locales the storefront will actually serve. The gate, not a list of
+    # what exists: `SUPPORTED_LOCALES` says what the system understands, this
+    # says what has content good enough to show a paying customer. A locale is
+    # added here once its coverage and eval gates pass (spec 7, "locale
+    # readiness"), which is why it ships as `['en']` and moves under its own
+    # release rather than arriving with the machinery.
+    enabled_locales: list[str] = Field(default_factory=lambda: ["en"])
+
     assistant_max_tool_rounds: int = 3
     assistant_max_session_turns: int = 12
     # Control group for the core thesis that guided selling beats manual search.

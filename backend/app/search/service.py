@@ -461,7 +461,13 @@ class SearchService:
         return vector
 
     async def search(self, request: SearchRequest) -> SearchResponse:
-        available_products = await catalog_products(self.data)
+        # One locale for both halves of this request. Retrieval filters the
+        # index by locale and the cards are rendered from the catalogue, so
+        # loading the catalogue in a different locale returns English cards
+        # for Vietnamese matches - a page whose results do not contain the
+        # words that found them.
+        locale = normalize_locale(request.locale)
+        available_products = await catalog_products(self.data, locale=locale)
         if should_extract_intent(request):
             try:
                 intent = await self.ai.extract_intent(request.query)
@@ -575,7 +581,7 @@ class SearchService:
                         semantic_limit=self.settings.search_semantic_candidates,
                         rrf_k=self.settings.search_rrf_k,
                         page_size=max(request.page_size * 3, 50),
-                        locale=normalize_locale(request.locale),
+                        locale=locale,
                     )
             except Exception:
                 logger.exception("PostgreSQL hybrid retrieval failed")

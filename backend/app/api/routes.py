@@ -15,6 +15,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.admin.auth import CatalogWrite, ReadAccess
+from app.api.locale import LOCALE_PREFERENCE_KEY, RequestLocale
 from app.api.schemas import (
     BookingView,
     CartItemRequest,
@@ -25,6 +26,7 @@ from app.api.schemas import (
     EventRequest,
     ExperienceDetail,
     ExperienceListResponse,
+    LocalePreferenceRequest,
     MessageRequest,
     Participant,
     RecommendationResponse,
@@ -42,6 +44,7 @@ from app.common.config import get_settings
 from app.common.database import database_ready
 from app.common.errors import ApiError
 from app.common.llm_cost import ledger
+from app.common.locales import negotiate_locale, normalize_locale
 from app.common.models import BehaviorEvent
 from app.common.persistence import (
     catalog_products,
@@ -66,9 +69,21 @@ IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=8,
 
 @router.post("/search", response_model=SearchResponse)
 async def search(
-    request: SearchRequest, session_id: SessionHeader = "demo-session"
+    request: SearchRequest,
+    locale: RequestLocale,
+    session_id: SessionHeader = "demo-session",
 ) -> SearchResponse:
-    result = await search_service.search(request)
+    # The body field is an input to negotiation, not a second source of truth.
+    # Un-negotiated it would let a client search a locale the storefront has
+    # not enabled and receive an empty corpus that reads as a catalogue
+    # problem; ignored entirely it would break the documented precedence, in
+    # which an explicit request outranks a session preference.
+    chosen = locale
+    if request.locale:
+        asked = negotiate_locale(explicit=request.locale, enabled=get_settings().enabled_locales)
+        if asked == normalize_locale(request.locale):
+            chosen = asked
+    result = await search_service.search(request.model_copy(update={"locale": chosen}))
     await _capture(
         session_id,
         EventRequest(event_type="search_submitted", query_id=result.query_id),
@@ -78,6 +93,7 @@ async def search(
 
 @router.get("/experiences", response_model=ExperienceListResponse)
 async def list_experiences(
+    locale: RequestLocale,
     destination: str | None = None,
     category: str | None = None,
     limit: int = Query(default=20, ge=1, le=50),
@@ -86,7 +102,7 @@ async def list_experiences(
 ) -> ExperienceListResponse:
     products = [
         product
-        for product in await catalog_products()
+        for product in await catalog_products(locale=locale)
         if product["status"] == "PUBLISHED"
         and (not destination or product["destination"].casefold() == destination.casefold())
         and (not category or product["category"].casefold() == category.casefold())
@@ -103,9 +119,11 @@ async def list_experiences(
 
 @router.get("/experiences/{experience_id}", response_model=ExperienceDetail)
 async def experience_detail(
-    experience_id: UUID, session_id: SessionHeader = "demo-session"
+    experience_id: UUID,
+    locale: RequestLocale,
+    session_id: SessionHeader = "demo-session",
 ) -> ExperienceDetail:
-    product = await get_product_async(experience_id)
+    product = await get_product_async(experience_id, locale=locale)
     await _capture(
         session_id,
         EventRequest(event_type="experience_viewed", experience_id=experience_id),
@@ -133,6 +151,7 @@ async def availability(
 
 @router.get("/recommendations", response_model=RecommendationResponse)
 async def recommendations(
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
     placement: str = Query(default="for_you"),
     experience_id: UUID | None = None,
@@ -161,6 +180,7 @@ async def recommendations(
         filters=filters,
         party=party,
         display_currency=display_currency,
+        locale=locale,
     )
 
 
@@ -374,7 +394,9 @@ async def import_catalog(
 
 
 @router.get("/session/context")
-async def session_context(session_id: SessionHeader = "demo-session") -> dict[str, Any]:
+async def session_context(
+    locale: RequestLocale, session_id: SessionHeader = "demo-session"
+) -> dict[str, Any]:
     """Bootstrap the storefront: which cohort is this shopper in?
 
     The frontend must know before first paint whether to render the assistant
@@ -385,7 +407,39 @@ async def session_context(session_id: SessionHeader = "demo-session") -> dict[st
         "session_id": session_id,
         "assistant_enabled": not assistant_holdout(session_id),
         "assistant_holdout": assistant_holdout(session_id),
+        "locale": locale,
+        "enabled_locales": list(get_settings().enabled_locales),
     }
+
+
+@router.put("/session/locale")
+async def set_session_locale(
+    body: LocalePreferenceRequest, session_id: SessionHeader = "demo-session"
+) -> dict[str, Any]:
+    """Persist the switcher's choice for this session.
+
+    Negotiated rather than stored verbatim, so a locale that is not enabled
+    cannot be parked in a session and quietly applied to every later request
+    once someone notices the storefront looks wrong.
+    """
+    settings = get_settings()
+    chosen = negotiate_locale(explicit=body.locale, enabled=settings.enabled_locales)
+    if not database_mode():
+        session = store.session(session_id)
+        session["preference_state"] = {
+            **(session.get("preference_state") or {}),
+            LOCALE_PREFERENCE_KEY: chosen,
+        }
+    else:
+        factory = require_session_factory()
+        async with factory() as db:
+            record = await ensure_session(db, session_id)
+            record.preference_state = {
+                **(record.preference_state or {}),
+                LOCALE_PREFERENCE_KEY: chosen,
+            }
+            await db.commit()
+    return {"locale": chosen, "requested": body.locale, "enabled_locales": list(settings.enabled_locales)}
 
 
 @router.get("/analytics/funnel")

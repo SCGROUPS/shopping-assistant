@@ -47,7 +47,12 @@ class SearchRequest(BaseModel):
     # because it selects the corpus, not the formatting: a Vietnamese query has
     # to be parsed with the configuration its documents were indexed with, or it
     # stems differently on each side and simply stops matching.
-    locale: str = DEFAULT_LOCALE
+    #
+    # `None` rather than `"en"`, so "the client did not say" is distinguishable
+    # from "the client asked for English". With a default the route could not
+    # tell them apart, and would override a session's chosen Vietnamese with an
+    # English nobody requested.
+    locale: str | None = None
 
 
 class IntentValue(BaseModel):
@@ -63,6 +68,18 @@ class SearchIntent(BaseModel):
     exclusions: list[str] = Field(default_factory=list)
     needs_clarification: bool = False
     clarification_question: str | None = None
+
+
+class LocalePreferenceRequest(BaseModel):
+    locale: str
+
+
+class ContentFieldMeta(BaseModel):
+    """Where one displayed string came from."""
+
+    locale: str
+    # source | manual | machine | imported | stale | fallback
+    provenance: str
 
 
 class PriceView(BaseModel):
@@ -118,6 +135,13 @@ class ExperienceCard(BaseModel):
     reason: str | None = None
     reason_code: str | None = None
     options: list[OptionView] = Field(default_factory=list)
+    # The locale this card was resolved in, and where each translated string
+    # came from. Additive, per spec 4.3: the fields stay plain strings, so a
+    # client that ignores this keeps working, and one that reads it can label
+    # a description that fell back to English or has gone stale. A client that
+    # cannot tell fallback from translation cannot tell us either.
+    locale: str = DEFAULT_LOCALE
+    content_meta: dict[str, ContentFieldMeta] = Field(default_factory=dict)
 
 
 class ExperienceDetail(ExperienceCard):
