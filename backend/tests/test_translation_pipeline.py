@@ -1238,9 +1238,8 @@ def test_a_retry_after_header_is_believed_but_not_blindly(factory):
     )
     # A provider returning something absurd must not idle the worker until its
     # replica timeout kills it.
-    assert within_jitter(
-        _retry_after(limited({"retry-after": "99999"})), translator_module.MAX_RETRY_AFTER
-    )
+    # The cap is applied after the jitter, or it is 25% higher than it says.
+    assert _retry_after(limited({"retry-after": "99999"})) == translator_module.MAX_RETRY_AFTER
     # The jitter is real, not a constant multiplier.
     assert len({_retry_after(limited({"retry-after": "10"})) for _ in range(20)}) > 1
 
@@ -1292,3 +1291,34 @@ async def test_a_deadline_that_has_not_passed_does_not_interfere(factory):
         factory, _echo, limit=4, deadline=asyncio.get_running_loop().time() + 300
     )
     assert counts["published"] == 4 and counts["deferred"] == 0
+
+
+async def test_a_job_queued_behind_a_slow_lane_is_not_started_after_the_deadline(factory):
+    """The deadline check has to sit *after* the semaphore, not before it.
+
+    Checked before, a job that waits minutes for a lane passes a deadline that
+    was still in the future when it queued, then starts work the replica timeout
+    will kill in flight - leased, with its attempt spent. This is the case the
+    placement exists for, and the past-deadline test does not prove it.
+    """
+    await _enqueue(factory, locales=["vi"])
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.3
+    started: list[str] = []
+
+    async def slow_first(*, job, glossary):
+        started.append(job.field)
+        if len(started) == 1:
+            # Holds the only lane until the deadline has passed.
+            await asyncio.sleep(0.6)
+        return f"[vi] {job.source_text}"
+
+    counts = await drain(factory, slow_first, limit=4, concurrency=1, deadline=deadline)
+
+    assert len(started) == 1, f"only the lane holder may reach the provider, got {started}"
+    assert counts["published"] == 1
+    assert counts["deferred"] == 3
+
+    deferred = [job for job in await _jobs(factory) if job.status == "queued"]
+    assert len(deferred) == 3
+    assert {job.attempts for job in deferred} == {0}

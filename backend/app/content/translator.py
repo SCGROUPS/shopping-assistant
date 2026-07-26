@@ -637,8 +637,10 @@ def _retry_after(exc: Exception) -> float:
     except (TypeError, ValueError):
         wait = DEFAULT_RETRY_AFTER
     # Jittered, or every lane wakes at the same instant and reproduces the burst
-    # that earned the 429 in the first place.
-    return wait * (1.0 + random.random() * 0.25)
+    # that earned the 429 in the first place. Capped *after* jitter: a ceiling
+    # that the jitter can exceed by 25% is not the ceiling the deployment budget
+    # was reasoned against.
+    return min(wait * (1.0 + random.random() * 0.25), MAX_RETRY_AFTER)
 
 
 async def _defer(session_factory, job: Leased, detail: str) -> str:
