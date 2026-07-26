@@ -297,12 +297,65 @@ hostname="$(az containerapp show \
   --output tsv)"
 app_url="https://${hostname}"
 
+# The revision that this deployment just created. Health has to be read from
+# it by name: under single-revision mode a revision that never passes
+# readiness leaves the *previous* one serving, so the shared ingress would
+# keep answering 200 from the old code and a dead deploy would look like a
+# good one.
+latest_revision="$(az containerapp revision list \
+  --resource-group "$resource_group" \
+  --name "$app_name" \
+  --query "sort_by([], &properties.createdTime)[-1].name" \
+  --output tsv)"
+echo "  waiting on revision ${latest_revision}"
+
+ready_body=""
+deploy_failure=""
 for _ in {1..60}; do
-  if curl --fail --silent "${app_url}/health/ready" >/dev/null; then
+  revision_state="$(az containerapp revision show \
+    --resource-group "$resource_group" \
+    --name "$app_name" \
+    --revision "$latest_revision" \
+    --query "[properties.provisioningState, properties.trafficWeight]" \
+    --output tsv 2>/dev/null || true)"
+  # A list query with --output tsv returns one value per *line*, not one
+  # tab-separated row, so cut -f2 would hand back both of them.
+  provisioning="$(echo "$revision_state" | sed -n 1p)"
+  traffic="$(echo "$revision_state" | sed -n 2p)"
+
+  # Nothing later in the wait can undo this; ACA has given up starting it.
+  if [[ "$provisioning" == "Failed" ]]; then
+    deploy_failure="revision ${latest_revision} failed to provision"
     break
+  fi
+
+  # Only trust the endpoint once this revision is the one behind it.
+  if [[ "$traffic" == "100" ]]; then
+    ready_body="$(curl --silent --max-time 30 "${app_url}/health/ready" || true)"
+    if echo "$ready_body" | grep -q '"status": *"ready"'; then
+      break
+    fi
+    # A settled "no" from the intent probe. The verdict is recorded once per
+    # process and only a new revision can change it, so spending the
+    # remaining nine minutes re-asking is nine minutes of a known answer.
+    if echo "$ready_body" | grep -q '"ok": *false'; then
+      deploy_failure="the intent probe rejected revision ${latest_revision}"
+      break
+    fi
   fi
   sleep 10
 done
+
+if [[ -n "$deploy_failure" ]]; then
+  echo "" >&2
+  echo "Deployment failed: ${deploy_failure}" >&2
+  [[ -n "$ready_body" ]] && echo "  /health/ready said: ${ready_body}" >&2
+  echo "  The previous revision is still serving traffic." >&2
+  echo "  If the intent probe rejected it, the deployed model does not accept" >&2
+  echo "  the request in app/assistant/provider.py - check reasoning.effort" >&2
+  echo "  against the model named in infra/bicep/main.bicep." >&2
+  exit 1
+fi
 
 curl --fail --silent "${app_url}/health/ready" >/dev/null
 curl --fail --silent "${app_url}/api/v1/experiences?limit=1" >/dev/null
