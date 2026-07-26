@@ -1764,3 +1764,124 @@ async def test_a_refused_batch_is_not_retried_one_document_at_a_time(factory):
     assert rows
     assert all(row.status == "queued" for row in rows)
     assert all(row.attempts == 0 for row in rows)
+
+
+async def test_re_enqueueing_unchanged_content_creates_no_work_at_all(factory):
+    """Why a redeploy does not pay to rebuild a catalogue nobody edited.
+
+    Seeding and importing touch every row on every deploy, so something has to
+    stop an untouched product from being re-embedded eight times for nothing.
+    That guard lives in the *enqueue* path, not in the worker: a locale whose
+    stored document already carries the desired fingerprint is never queued, so
+    the worker is never asked.
+
+    Pinned here because the saving is invisible - it shows up as work that does
+    not happen - and because a plausible-looking change to `enqueue_reindex`
+    could remove it without breaking a single other test. A production deploy
+    spends roughly one and a half seconds per document; the difference between
+    this working and not is minutes.
+    """
+    from app.catalog.indexing import (
+        enqueue_reindex,
+        index_fingerprint,
+        process_index_work,
+        resolved_document_text,
+    )
+    from app.common.models import Destination, Experience, IndexWorkItem
+
+    await _import()
+    experience = await _only(factory)
+
+    class _CountingProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def embed(self, text: str) -> list[float]:
+            self.calls += 1
+            return [0.02] * 512
+
+    provider = _CountingProvider()
+    await process_index_work(factory, provider, limit=50)
+    assert provider.calls > 0, "the first build must actually embed something"
+
+    # Exactly what a redeploy does: ask again for the documents that already
+    # exist, with the fingerprints they already carry.
+    async with factory() as db:
+        row = (
+            await db.execute(
+                select(Experience, Destination.name)
+                .join(Destination, Destination.id == Experience.destination_id)
+                .where(Experience.id == experience.id)
+            )
+        ).first()
+        assert row is not None
+        for locale in SUPPORTED_LOCALES:
+            text = await resolved_document_text(db, row[0], row[1], locale)
+            await enqueue_reindex(
+                db, experience.id, locale, index_fingerprint(text, locale)
+            )
+        await db.commit()
+
+    async with factory() as db:
+        pending = list(
+            (
+                await db.execute(
+                    select(IndexWorkItem.status).where(
+                        IndexWorkItem.experience_id == experience.id,
+                        IndexWorkItem.status != "done",
+                    )
+                )
+            ).scalars()
+        )
+    assert pending == [], f"unchanged content queued {len(pending)} items"
+
+    provider.calls = 0
+    await process_index_work(factory, provider, limit=50)
+    assert provider.calls == 0, (
+        f"re-indexing unchanged text cost {provider.calls} embedding calls"
+    )
+
+
+async def test_a_real_edit_still_re_embeds(factory):
+    """The guard against the guard.
+
+    Whatever stops unchanged content from being rebuilt must not also stop
+    changed content. Skipping too eagerly would leave search describing text
+    nobody can see any more, with an empty queue and no error - invisible from
+    every angle except a shopper's search results.
+    """
+    from app.catalog.indexing import process_index_work
+    from app.common.models import ExperienceSearchDocument
+
+    await _import()
+    experience = await _only(factory)
+
+    class _CountingProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def embed(self, text: str) -> list[float]:
+            self.calls += 1
+            return [0.03] * 512
+
+    provider = _CountingProvider()
+    await process_index_work(factory, provider, limit=50)
+
+    await catalog_ops.update_experience(
+        experience.id, {"title": "Hoi An Basket Boat Ride"}, OPERATOR
+    )
+    provider.calls = 0
+    await process_index_work(factory, provider, limit=50)
+    assert provider.calls > 0, "an edited title must be re-embedded"
+
+    async with factory() as db:
+        texts = list(
+            (
+                await db.execute(
+                    select(ExperienceSearchDocument.document_text).where(
+                        ExperienceSearchDocument.experience_id == experience.id
+                    )
+                )
+            ).scalars()
+        )
+    assert texts and all("Basket Boat" in text for text in texts)
