@@ -1254,3 +1254,53 @@ def test_a_stated_preference_outweighs_everything_noticed_for_the_shopper():
         "the stated share has drifted from the declared budget, which means the trade "
         "between what a shopper says and what we notice is no longer the one written down"
     )
+
+
+def test_the_models_strength_of_family_preference_reaches_the_ranker():
+    """The same wish, expressed twice, must not count twice differently.
+
+    `family_friendly_weight` arrives by the same soft-preference path as the
+    preferred category and is read at the same point in the blend, but review
+    deleted the whole plumbing - the schema field, the write in
+    `merge_filters`, the read in `features.py` - and no test failed. An
+    untested weight is a weight that can quietly become a constant again, which
+    is precisely the regression the change was made to fix.
+    """
+    faint = SearchIntent(
+        search_text="somewhere the kids could come along",
+        soft_preferences=[{"field": "family_friendly", "value": True, "weight": 0.1}],
+    )
+    emphatic = SearchIntent(
+        search_text="it absolutely has to work for the kids",
+        soft_preferences=[{"field": "family_friendly", "value": True, "weight": 1.0}],
+    )
+    faint_filters, _ = merge_filters(SearchFilters(), faint)
+    emphatic_filters, _ = merge_filters(SearchFilters(), emphatic)
+
+    assert faint_filters.family_friendly is True
+    assert faint_filters.family_friendly_weight == 0.1
+    assert emphatic_filters.family_friendly_weight == 1.0
+
+    suitable = {
+        "category": "Food",
+        "family_friendly": True,
+        "indoor_outdoor": "indoor",
+        "duration_minutes": 120,
+        "rating": 4.5,
+        "instant_confirmation": True,
+        "options": [{"free_cancellation_hours": 24}],
+        "languages": ["en", "vi"],
+    }
+    unsuitable = {**suitable, "family_friendly": False}
+
+    faint_gap = preference_fit(suitable, faint_filters) - preference_fit(unsuitable, faint_filters)
+    emphatic_gap = preference_fit(suitable, emphatic_filters) - preference_fit(
+        unsuitable, emphatic_filters
+    )
+
+    assert faint_gap > 0, "even a faint wish should favour the places that suit children"
+    assert emphatic_gap > faint_gap * 2, (
+        f"a wish the model rated 1.0 separated suitable from unsuitable by "
+        f"{emphatic_gap:.4f}, barely more than one it rated 0.1 ({faint_gap:.4f}). How much "
+        "the shopper meant it is being flattened to a constant."
+    )
