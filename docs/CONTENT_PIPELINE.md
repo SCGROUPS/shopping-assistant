@@ -1846,6 +1846,8 @@ Each numbered step below is a deployable release:
 5. **Backfill** translations and search documents for existing inventory
 6. **Switcher, UI strings, locale formatting**; enable locales as gates pass
 7. **Authoring API + publish gate** (§5), **media** (§14), **booking lines**
+   — the publish gate is *done*: enforced on both the operator endpoint and the
+   importer, with `unpublishable_now` surfacing the listings that predate it
 8. **Partner authentication, staging, approval API and review UI** — together,
    because a submission queue no operator can see is a queue that fills up
 9. **Authoring console** with per-locale tabs and provenance
@@ -1958,6 +1960,9 @@ first, then revision 2's.
 | **A host guard only has to know about `.` as a separator** | UTS-46 folds `\u3002`, `\uff0e` and `\uff61` to `.` before resolution, so `pay\u3002example\u3002com` is the same host, not a lookalike. The pattern required a literal `.`, so no candidate was ever matched and the careful suffix check underneath was never reached (§6.8) |
 | **The concurrency contract belongs on approve and reject** | It belongs on every write. `edit` published as `manual` - which then protects the text from machine correction - with no generation check at all, and the console offers Edit precisely on the stale candidates where the source has moved (§6.8) |
 | **A rejected translation can be recovered by editing it** | Not if rejection removes it from the only screen that lists it. Rejection deliberately does not re-enqueue, so a `needs_review`-only console strands every rejection on English permanently - the same defect as the write-only queue, one layer up (§6.8) |
+| **A publish gate belongs on the publish endpoint** | `upsert_catalog` assigns `status` straight onto the row and never calls `set_status`, so the importer - the path that actually put three description-less listings into production - walks around a gate that guards only the console (§5.3) |
+| **Publication requires a current search document** | Editing a title makes the document stale by definition, so the strict reading refuses every fix-the-copy-then-publish. `IndexWorkItem` is an outbox whose stated guarantee is that a committed change *will* be rebuilt, so a scheduled item satisfies findability and only `failed` or nothing at all does not (§5.3) |
+| **A published listing that fails the gate will be noticed** | The gate guards a transition, so everything already live keeps its status and nothing re-examines it. The three were found by a script that fetched all 379 records one at a time; the same rules have to exist as a filter, not only as a check (§5.3) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,
 migration entirely, the `language`/`locale` collision, audit attribution for

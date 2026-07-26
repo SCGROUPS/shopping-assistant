@@ -27,6 +27,7 @@ from app.catalog.indexing import (
     mark_locale_indexed,
     upsert_search_document,
 )
+from app.catalog.publish_gate import publish_blockers
 from app.catalog.seed import stable_id
 from app.catalog.trippass import (
     TRIPPASS_SUPPLIER_EXTERNAL_ID,
@@ -298,7 +299,7 @@ async def upsert_catalog(
     if session_factory is None:
         raise RuntimeError("DATABASE_URL is required to import a supplier catalogue.")
     if not catalog:
-        return {"created": 0, "updated": 0, "needs_review": 0}
+        return {"created": 0, "updated": 0, "needs_review": 0, "held": 0}
 
     # A fixed order, because two imports running at once take the same row
     # locks. Visiting products in different orders is the textbook deadlock:
@@ -325,7 +326,7 @@ async def upsert_catalog(
             embeddings.extend(deterministic_embedding(document) for document in batch)
             fallbacks.extend(True for _ in batch)
 
-    created = updated = 0
+    created = updated = held = 0
     async with session_factory() as session:
         # Ordering alone does not make two concurrent imports safe. Suppliers,
         # destinations and experiences are all created select-then-insert, so
@@ -376,6 +377,31 @@ async def upsert_catalog(
                 experience.id,
                 {option_data["external_id"] for option_data in product["options"]},
             )
+
+            # Checked here rather than in `_apply` because `_apply` runs before
+            # the media and options exist, so a new listing would fail every
+            # commerce rule on the way in.
+            #
+            # This is the path that actually put three description-less
+            # listings into production. The gate on `set_status` guards an
+            # operator publishing by hand; the importer never calls it and
+            # assigns `status` straight onto the row, so a gate that lived only
+            # there would have looked complete and caught nothing.
+            #
+            # A refused product is held rather than dropped. `PENDING_REVIEW`
+            # is the existing "not confident enough to sell" state, the
+            # eligibility gate already filters on it, and the reason is written
+            # where the operator will read it.
+            if "status" not in protected and experience.status == "PUBLISHED":
+                await session.flush()
+                blockers = await publish_blockers(session, experience, require_index=False)
+                if blockers:
+                    experience.status = "PENDING_REVIEW"
+                    experience.needs_review = True
+                    experience.review_note = "Cannot publish: " + "; ".join(
+                        item.message for item in blockers
+                    )
+                    held += 1
 
             # Enqueued *before* the document is written, and that order is the
             # whole point. A worker holding an older version of this listing has
@@ -464,6 +490,10 @@ async def upsert_catalog(
         "created": created,
         "updated": updated,
         "needs_review": sum(1 for product in catalog if product.get("needs_review")),
+        # Products the feed wanted published and the gate would not sell.
+        # Reported separately from `needs_review` because they are a different
+        # problem: the classifier was confident, the record was incomplete.
+        "held": held,
     }
 
 

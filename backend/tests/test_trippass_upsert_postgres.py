@@ -119,7 +119,7 @@ async def test_reimport_refreshes_supply_without_dropping_a_live_cart(factory):
     froze them on stale prices with an availability window that quietly
     expired. Upserting has to keep the ids and still move the price.
     """
-    assert await _import() == {"created": 1, "updated": 0, "needs_review": 0}
+    assert await _import() == {"created": 1, "updated": 0, "needs_review": 0, "held": 0}
     experience_id, option_id, slot_id = await _add_to_cart(factory)
 
     # The supplier raises the adult price and publishes a third variant.
@@ -130,7 +130,7 @@ async def test_reimport_refreshes_supply_without_dropping_a_live_cart(factory):
             {"name": "Senior", "description": "Aged 65+", "price": 700000},
         ]
     )
-    assert result == {"created": 0, "updated": 1, "needs_review": 0}
+    assert result == {"created": 0, "updated": 1, "needs_review": 0, "held": 0}
 
     async with factory() as db:
         item = await db.scalar(select(CartItem))
@@ -157,7 +157,7 @@ async def test_reimport_is_idempotent(factory):
             await db.scalar(select(func.count()).select_from(model))
             for model in (Experience, ExperienceOption, OptionPrice, AvailabilitySlot)
         ]
-    assert await _import() == {"created": 0, "updated": 1, "needs_review": 0}
+    assert await _import() == {"created": 0, "updated": 1, "needs_review": 0, "held": 0}
     async with factory() as db:
         after = [
             await db.scalar(select(func.count()).select_from(model))

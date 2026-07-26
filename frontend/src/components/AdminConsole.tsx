@@ -44,6 +44,7 @@ import type {
   TranslationReviewQueue,
   LocaleCoverage,
   ReviewState,
+  PublishBlocker,
 } from '../lib/adminApi'
 
 type Tab = 'review' | 'catalog' | 'translations' | 'settings' | 'audit' | 'insight'
@@ -238,6 +239,10 @@ function Editor({
 
   const dirty = Object.keys(draft).length > 0
 
+  // Recomputed server-side on every read, because deactivating an option or a
+  // reindex falling behind can break a listing without anybody editing it.
+  const blockers = (detail?.publish_blockers as PublishBlocker[] | undefined) ?? []
+
   return (
     <aside className="ops-editor">
       <header>
@@ -339,13 +344,35 @@ function Editor({
               key={status}
               type="button"
               className={row.status === status ? 'is-current' : ''}
-              disabled={busy || row.status === status || !can('catalog:publish')}
+              disabled={
+                busy ||
+                row.status === status ||
+                !can('catalog:publish') ||
+                (status === 'PUBLISHED' && blockers.length > 0)
+              }
               onClick={() => void run(() => changeStatus(row.id, status, note))}
             >
               {status.replace('_', ' ').toLowerCase()}
             </button>
           ))}
         </div>
+        {blockers.length > 0 ? (
+          // Shown before the operator clicks, not after the server refuses.
+          // A disabled button with no explanation is indistinguishable from a
+          // broken one.
+          <div className="ops-blockers">
+            <p className="ops-sub">
+              {row.status === 'PUBLISHED'
+                ? 'This is live and would not be allowed to publish today:'
+                : 'Before this can be published:'}
+            </p>
+            <ul>
+              {blockers.map((blocker) => (
+                <li key={blocker.code}>{blocker.message}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
       </section>
 
       <section>
@@ -920,6 +947,7 @@ export default function AdminConsole() {
   const [selected, setSelected] = useState<CatalogRow | null>(null)
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
+  const [incompleteOnly, setIncompleteOnly] = useState(false)
   const [pageNumber, setPageNumber] = useState(1)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [ceiling, setCeiling] = useState(1.5)
@@ -943,10 +971,11 @@ export default function AdminConsole() {
       q: query || undefined,
       status: statusFilter || undefined,
       needsReview: tab === 'review' ? true : undefined,
+      incomplete: tab === 'catalog' && incompleteOnly ? true : undefined,
       page: pageNumber,
       pageSize: 25,
     }),
-    [query, statusFilter, tab, pageNumber],
+    [query, statusFilter, tab, pageNumber, incompleteOnly],
   )
 
   const load = useCallback(async () => {
@@ -1090,6 +1119,21 @@ export default function AdminConsole() {
                       </option>
                     ))}
                   </select>
+                  {/* The gate guards the transition, so anything that went
+                      live before it existed is still live and still broken.
+                      Production's three description-less listings were found
+                      by a script that read all 379 records one at a time. */}
+                  <label className="ops-check">
+                    <input
+                      type="checkbox"
+                      checked={incompleteOnly}
+                      onChange={(event) => {
+                        setIncompleteOnly(event.target.checked)
+                        setPageNumber(1)
+                      }}
+                    />
+                    <span>Would not publish today</span>
+                  </label>
                 </div>
               )}
 

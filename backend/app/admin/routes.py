@@ -74,6 +74,7 @@ async def list_experiences(
     supplier: str | None = None,
     destination: str | None = None,
     promoted: bool | None = None,
+    incomplete: bool | None = None,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> dict[str, Any]:
@@ -85,6 +86,7 @@ async def list_experiences(
             supplier=supplier,
             destination=destination,
             promoted=promoted,
+            incomplete=incomplete,
             page=page,
             page_size=page_size,
         )

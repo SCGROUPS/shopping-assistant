@@ -30,6 +30,7 @@ from sqlalchemy.orm import selectinload
 from app.admin import audit
 from app.admin.auth import Principal
 from app.catalog.indexing import enqueue_experience_reindex
+from app.catalog.publish_gate import publish_blockers, unpublishable_now
 from app.common.database import session_factory
 from app.common.errors import ApiError
 from app.common.models import (
@@ -100,6 +101,7 @@ class CatalogQuery:
     supplier: str | None = None
     destination: str | None = None
     promoted: bool | None = None
+    incomplete: bool | None = None
     page: int = 1
     page_size: int = 25
 
@@ -159,6 +161,12 @@ def _filtered(statement: Select, query: CatalogQuery) -> Select:
             Experience.boost != 1,
         )
         statement = statement.where(promoted if query.promoted else ~promoted)
+    if query.incomplete is not None:
+        # Finds the listings that are live and should not be. The gate refuses
+        # the transition; nothing re-examines a listing that already made it
+        # through, so without this the catalogue keeps whatever damage it had.
+        incomplete = unpublishable_now()
+        statement = statement.where(incomplete if query.incomplete else ~incomplete)
     if query.q:
         pattern = f"%{query.q.strip()}%"
         statement = statement.where(
@@ -324,6 +332,15 @@ async def get_experience(experience_id: UUID) -> dict[str, Any]:
                     }
                     for option in options
                 ],
+                # Computed on read rather than stored, because every one of
+                # these can be invalidated by something other than an edit to
+                # this row - deactivating an option, a reindex falling behind,
+                # a supplier being merged. A stored flag would be wrong within
+                # a day and nobody would know which day.
+                "publish_blockers": [
+                    item.as_dict() for item in await publish_blockers(session, experience)
+                ],
+                "source_language": experience.source_language,
             }
         )
         return detail
@@ -482,6 +499,18 @@ async def set_status(
     factory = _require_db()
     async with factory() as session, session.begin():
         experience = await _load(session, experience_id)
+        if status == "PUBLISHED":
+            blockers = await publish_blockers(session, experience)
+            if blockers:
+                raise ApiError(
+                    409,
+                    "Cannot publish",
+                    "Cannot publish: " + "; ".join(item.message for item in blockers),
+                    "publish-blocked",
+                    # Itemised, because an operator told only the first problem
+                    # fixes it, resubmits, and is told the next one.
+                    details={"blockers": [item.as_dict() for item in blockers]},
+                )
         before = {"status": experience.status, "needs_review": experience.needs_review}
         experience.status = status
         experience.review_note = note

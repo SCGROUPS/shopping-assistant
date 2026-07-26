@@ -300,3 +300,114 @@ test.describe('translation review', () => {
     })
   })
 })
+
+test.describe('publish gate', () => {
+  const KEY_FOR_GATE = process.env.ADMIN_API_KEY ?? 'demo-admin-key'
+
+  const GATE_ROW = {
+    id: 'exp-1',
+    external_id: 'T1',
+    title: 'Da Nang cable car ticket',
+    slug: 'da-nang-cable-car',
+    destination: 'Da Nang',
+    category: 'Attraction',
+    status: 'PENDING_REVIEW',
+    needs_review: false,
+    review_note: null,
+    supplier: 'Trippass',
+    rating: 4.5,
+    review_count: 10,
+    price: 900000,
+    boost: 1,
+    pinned: false,
+    suppressed: false,
+    promotion_label: null,
+    promotion_starts_at: null,
+    promotion_ends_at: null,
+    overridden_fields: [],
+    updated_at: '2026-07-26T00:00:00Z',
+  }
+
+  test('an incomplete listing says why, and cannot be published from here', async ({ page }) => {
+    // The gate refuses server-side regardless, but a disabled button with no
+    // reason next to it is indistinguishable from a broken one - and the whole
+    // point of itemising blockers is that the operator can act on them.
+    // The list is mocked too, and the row is deliberately PENDING_REVIEW.
+    // Against real data the clicked row is often already PUBLISHED, which
+    // disables the publish button on its own - so the assertion below would
+    // pass whether or not blockers do anything.
+    await page.route('**/api/v1/admin/experiences?*', async (route) => {
+      await route.fulfill({
+        json: { items: [GATE_ROW], total: 1, page: 1, page_size: 25 },
+      })
+    })
+    await page.route('**/api/v1/admin/experiences/*', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback()
+      await route.fulfill({
+        json: {
+          ...GATE_ROW,
+          description: '',
+          short_description: 'Unlimited round-trip rides.',
+          meeting_point: 'Ba Na Hills lower station',
+          source_language: 'en',
+          overridden_fields: [],
+          image_urls: [],
+          options: [],
+          publish_blockers: [
+            { code: 'missing-description', message: 'write a description in en' },
+            { code: 'no-image', message: 'add at least one image' },
+          ],
+        },
+      })
+    })
+
+    await page.goto('/admin')
+    await page.getByLabel('Operator key').fill(KEY_FOR_GATE)
+    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.getByRole('button', { name: 'Catalogue' }).click()
+    await page.locator('.ops-table tbody tr').first().click()
+    await expect(page.locator('.ops-editor')).toBeVisible()
+
+    const blockers = page.locator('.ops-blockers')
+    await expect(blockers).toBeVisible()
+    await expect(blockers.getByText('write a description in en')).toBeVisible()
+    await expect(blockers.getByText('add at least one image')).toBeVisible()
+
+    await expect(page.getByRole('button', { name: 'published', exact: true })).toBeDisabled()
+    // Withdrawing a broken listing must stay possible, or the gate traps
+    // exactly the records an operator most needs to pull.
+    await expect(page.getByRole('button', { name: 'archived', exact: true })).toBeEnabled()
+  })
+
+  test('the catalogue can list what would not publish today', async ({ page }) => {
+    let asked: string | null = null
+    await page.route('**/api/v1/admin/experiences?*', async (route) => {
+      const url = new URL(route.request().url())
+      asked = url.searchParams.get('incomplete')
+      await route.fulfill({
+        json: {
+          items:
+            asked === 'true'
+              ? [{ ...GATE_ROW, status: 'PUBLISHED' }]
+              : [],
+          total: asked === 'true' ? 1 : 0,
+          page: 1,
+          page_size: 25,
+        },
+      })
+    })
+
+    await page.goto('/admin')
+    await page.getByLabel('Operator key').fill(KEY_FOR_GATE)
+    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.getByRole('button', { name: 'Catalogue' }).click()
+    // An empty result still renders one row: the empty-state message.
+    await expect(page.locator('.ops-table tbody tr td[colspan]')).toBeVisible()
+
+    await page.getByLabel('Would not publish today').check()
+
+    await expect.poll(() => asked).toBe('true')
+    await expect(page.locator('.ops-table tbody tr')).toHaveCount(1)
+    await expect(page.getByText('Da Nang cable car ticket')).toBeVisible()
+  })
+})

@@ -135,6 +135,7 @@ export interface CatalogFilters {
   supplier?: string
   destination?: string
   promoted?: boolean
+  incomplete?: boolean
   page?: number
   pageSize?: number
 }
@@ -149,9 +150,16 @@ export const fetchCatalog = (filters: CatalogFilters = {}) => {
   if (filters.destination) params.set('destination', filters.destination)
   if (filters.promoted !== undefined)
     params.set('promoted', String(filters.promoted))
+  if (filters.incomplete !== undefined)
+    params.set('incomplete', String(filters.incomplete))
   params.set('page', String(filters.page ?? 1))
   params.set('page_size', String(filters.pageSize ?? 25))
   return request<CatalogPage>(`/experiences?${params.toString()}`)
+}
+
+export interface PublishBlocker {
+  code: string
+  message: string
 }
 
 export const fetchExperience = (id: string) =>
