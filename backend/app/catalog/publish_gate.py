@@ -40,7 +40,6 @@ from app.common.models import (
     ExperienceMedia,
     ExperienceOption,
     ExperienceSearchDocument,
-    IndexWorkItem,
     OptionPrice,
     Supplier,
 )
@@ -224,40 +223,34 @@ async def _index_blockers(
     if document.index_fingerprint == expected:
         return []
 
-    # Stale text with a rebuild already scheduled is not the defect this rule
-    # exists to catch. `IndexWorkItem` is an outbox, and its guarantee is
-    # written on the model: "if the write commits the reindex is guaranteed".
-    # The state §1.4 described is content nothing will *ever* index - not
-    # content a worker is a few seconds behind on.
+    # A scheduled rebuild used to satisfy this rule, on the reasoning that
+    # `IndexWorkItem` is an outbox and editing a title makes the document stale
+    # by definition. The review overruled it, and the reason is sound: the
+    # outbox guarantees an *intent* was committed, not that indexing will
+    # succeed. A worker can exhaust its retries and mark the item failed long
+    # after the listing went live, which leaves exactly the §1.4 state - live
+    # inventory no shopper can find - reached by a slower route.
     #
-    # The distinction is what keeps the gate usable. Editing a title makes the
-    # document stale by definition, so without this an operator who fixes a
-    # typo and publishes is refused with "wait" - and a gate whose only remedy
-    # is to wait is a gate people learn to route around.
-    scheduled = await session.scalar(
-        select(func.count())
-        .select_from(IndexWorkItem)
-        .where(
-            IndexWorkItem.experience_id == experience.id,
-            IndexWorkItem.locale == locale,
-            # 'failed' is terminal and invisible to the leasing query, so it is
-            # emphatically not a promise that anything will be rebuilt.
-            IndexWorkItem.status.in_(("queued", "leased")),
-        )
-    )
-    if scheduled:
-        return []
+    # So the remedy really is to wait: save the edit, let the document catch
+    # up, then publish. The console shows the blocker, so the wait is visible
+    # rather than mysterious.
     return [
         Blocker(
             "stale-index",
-            "the search document describes older text and no rebuild is scheduled; "
-            "reindex the listing",
+            "the search document still describes older text; "
+            "wait for the rebuild to finish, then publish",
         )
     ]
 
 
 def unpublishable_now() -> ColumnElement[bool]:
-    """SQL for "this listing would be refused if it were published today".
+    """SQL for "this listing is missing content the gate requires".
+
+    Not the gate's full verdict, and the name and the console label both say so
+    now. Both fingerprint rules - stale document and placeholder embedding -
+    have to be recomputed per record, so they cannot appear here, and calling
+    this "would not publish today" left every index failure off the worklist
+    while implying it was complete.
 
     The gate guards a *transition*, so everything already PUBLISHED keeps its
     status no matter how incomplete it is. That is the right behaviour - a

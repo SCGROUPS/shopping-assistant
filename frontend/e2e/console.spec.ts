@@ -404,7 +404,7 @@ test.describe('publish gate', () => {
     // An empty result still renders one row: the empty-state message.
     await expect(page.locator('.ops-table tbody tr td[colspan]')).toBeVisible()
 
-    await page.getByLabel('Would not publish today').check()
+    await page.getByLabel('Missing required content').check()
 
     await expect.poll(() => asked).toBe('true')
     await expect(page.locator('.ops-table tbody tr')).toHaveCount(1)

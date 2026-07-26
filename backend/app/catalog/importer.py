@@ -27,7 +27,7 @@ from app.catalog.indexing import (
     mark_locale_indexed,
     upsert_search_document,
 )
-from app.catalog.publish_gate import publish_blockers
+from app.catalog.publish_gate import Blocker, publish_blockers
 from app.catalog.seed import stable_id
 from app.catalog.trippass import (
     TRIPPASS_SUPPLIER_EXTERNAL_ID,
@@ -395,6 +395,23 @@ async def upsert_catalog(
             if "status" not in protected and experience.status == "PUBLISHED":
                 await session.flush()
                 blockers = await publish_blockers(session, experience, require_index=False)
+                # `require_index=False` is right for the fingerprint checks -
+                # this transaction is what writes the document, so it cannot
+                # already match. It is not right for the embedding: when the
+                # provider failed we are about to store a deterministic vector,
+                # which is invisible to semantic search while looking perfectly
+                # healthy. That is the one index fact already known here, so it
+                # is checked here rather than skipped with the rest.
+                if is_fallback:
+                    blockers = [
+                        *blockers,
+                        Blocker(
+                            "placeholder-embedding",
+                            "the embedding provider failed and a placeholder vector was "
+                            "stored, so shoppers cannot find this by meaning; "
+                            "reindex once the provider recovers",
+                        ),
+                    ]
                 if blockers:
                     experience.status = "PENDING_REVIEW"
                     experience.needs_review = True

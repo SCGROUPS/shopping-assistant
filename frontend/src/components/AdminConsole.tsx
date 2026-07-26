@@ -1132,7 +1132,15 @@ export default function AdminConsole() {
                         setPageNumber(1)
                       }}
                     />
-                    <span>Would not publish today</span>
+                    {/* Named for what it actually queries. The filter is a
+                        single SQL predicate over columns and EXISTS, so it
+                        finds listings missing required content - it cannot see
+                        a stale or placeholder search document, because both of
+                        those need a fingerprint recomputed per record. Calling
+                        it "would not publish today" implied the gate's full
+                        verdict and quietly left index failures off the
+                        worklist. */}
+                    <span>Missing required content</span>
                   </label>
                 </div>
               )}

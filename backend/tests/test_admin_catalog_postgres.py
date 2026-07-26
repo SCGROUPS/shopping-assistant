@@ -364,6 +364,24 @@ async def test_the_console_endpoints_answer_end_to_end(factory):
         assert patched.json()["title"] == "Renamed by the console"
         assert patched.json()["overridden_fields"] == ["title"]
 
+        # Renaming the listing makes its search document stale, and the publish
+        # gate refuses stale text: a queued rebuild is a committed intent, not a
+        # document a shopper can find. So the console's own flow is edit, let
+        # the rebuild land, then publish - and the refusal in between is part of
+        # the contract, not an accident of ordering.
+        refused = await api.post(
+            f"/api/v1/admin/experiences/{experience.id}/status",
+            json={"status": "PUBLISHED", "note": "ready"},
+        )
+        assert refused.status_code == 409
+        assert "stale-index" in {
+            blocker["code"] for blocker in refused.json()["blockers"]
+        }
+
+        from app.catalog import indexing
+
+        assert await indexing.process_index_work(factory, _StubEmbedder(), limit=50) >= 1
+
         published = await api.post(
             f"/api/v1/admin/experiences/{experience.id}/status",
             json={"status": "PUBLISHED", "note": "ready"},

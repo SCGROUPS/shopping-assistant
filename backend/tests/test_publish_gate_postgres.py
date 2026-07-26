@@ -497,6 +497,50 @@ async def test_a_complete_product_still_imports_published(factory):
     assert result["held"] == 0
 
 
+class FailingEmbeddingProvider:
+    """A provider whose embedding call is down, as it was in the incident."""
+
+    async def embed(self, text: str) -> list[float]:
+        raise RuntimeError("embedding provider is down")
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("embedding provider is down")
+
+    async def extract_intent(self, text: str):
+        raise NotImplementedError
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None
+
+
+async def test_an_import_that_falls_back_to_a_placeholder_vector_is_held(factory):
+    """A complete listing nobody can find by meaning is still unsellable.
+
+    The importer skips the fingerprint checks because this transaction is what
+    writes the document, and the first version skipped the embedding check with
+    them. That let a provider outage publish a full catalogue of listings whose
+    vectors are deterministic placeholders - present in the grid, absent from
+    every semantic search, and indistinguishable from healthy rows.
+
+    Everything else about this product is complete, so the hold can only be
+    coming from the placeholder vector.
+    """
+    result = await upsert_catalog(
+        [to_catalog_product(RAW, FACETS, days=3)],
+        supplier_external_id="TRIPPASS",
+        supplier_name="Trippass",
+        ai_provider=FailingEmbeddingProvider(),
+    )
+
+    experience = await _only(factory)
+    assert experience.status == "PENDING_REVIEW"
+    assert result["held"] == 1
+    assert "placeholder" in (experience.review_note or "")
+
+
 async def test_a_held_import_is_counted_for_the_operator(factory):
     """An import that quietly holds half the feed is an import nobody trusts."""
     result = await upsert_catalog(
@@ -531,13 +575,18 @@ async def test_an_operators_published_ruling_survives_a_later_import(factory):
     assert [row["id"] for row in listed["items"]] == [str(experience.id)]
 
 
-async def test_an_edit_through_the_console_does_not_block_the_publish(factory):
-    """A gate whose only remedy is "wait" is one people route around.
+async def test_a_scheduled_rebuild_is_not_a_finished_one(factory):
+    """A committed intent to reindex is not a search document.
 
-    Editing a title makes the search document stale by definition, so the
-    strict reading refuses an operator who fixes a typo and publishes. The
-    outbox says on its own model that a committed change is guaranteed to be
-    reindexed, so a scheduled rebuild is a promise, not a gap.
+    This test used to assert the opposite. The reasoning was that editing a
+    title makes the document stale by definition, so refusing the operator who
+    fixes a typo makes the gate one people route around. The review overruled
+    it: the outbox guarantees the work was *enqueued*, and a worker that later
+    exhausts its retries reaches the very state the gate exists to prevent -
+    live inventory no shopper can find - just more slowly.
+
+    So an edit blocks publication until the rebuild lands, and the console
+    shows why.
     """
     await _seed()
     experience = await _only(factory)
@@ -550,14 +599,20 @@ async def test_an_edit_through_the_console_does_not_block_the_publish(factory):
     async with factory() as db:
         scheduled = await db.scalar(
             select(IndexWorkItem).where(
-                IndexWorkItem.experience_id == experience.id, IndexWorkItem.locale == "en"
+                IndexWorkItem.experience_id == experience.id,
+                IndexWorkItem.locale == "en",
+                IndexWorkItem.status.in_(("queued", "leased")),
             )
         )
-    assert scheduled is not None, "the edit must have enqueued a rebuild for this to mean anything"
+    assert scheduled is not None, "a rebuild must be pending for this to mean anything"
 
-    assert await _codes(factory, experience.id) == set()
-    result = await catalog_ops.set_status(experience.id, "PUBLISHED", OPERATOR)
-    assert result["status"] == "PUBLISHED"
+    assert await _codes(factory, experience.id) == {"stale-index"}
+    with pytest.raises(ApiError) as refused:
+        await catalog_ops.set_status(experience.id, "PUBLISHED", OPERATOR)
+    assert refused.value.status == 409
+    assert "stale-index" in {
+        blocker["code"] for blocker in (refused.value.details or {})["blockers"]
+    }
 
 
 async def test_a_failed_rebuild_is_not_a_promise_to_rebuild(factory):
