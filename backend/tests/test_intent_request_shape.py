@@ -88,7 +88,9 @@ async def test_intent_extraction_asks_for_an_effort_the_models_accept():
     )
 
 
-PROVIDER_SOURCE = (Path(__file__).resolve().parents[1] / "app" / "assistant" / "provider.py").read_text()
+PROVIDER_SOURCE = (
+    Path(__file__).resolve().parents[1] / "app" / "assistant" / "provider.py"
+).read_text()
 
 
 def _reasoning_efforts(source: str) -> list[tuple[int, str]]:

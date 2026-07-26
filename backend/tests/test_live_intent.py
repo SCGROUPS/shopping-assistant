@@ -204,9 +204,9 @@ async def test_a_named_city_is_read_as_a_destination_we_sell():
         assert named, "the model named no destination at all for an explicitly located query"
         for value in named:
             folded = strip_accents(value).casefold()
-            assert any(
-                folded == strip_accents(known).casefold() for known in destinations
-            ), f"{value!r} is not a destination this catalogue sells"
+            assert any(folded == strip_accents(known).casefold() for known in destinations), (
+                f"{value!r} is not a destination this catalogue sells"
+            )
 
 
 @pytest.mark.parametrize(

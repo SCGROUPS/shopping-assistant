@@ -27,19 +27,30 @@ CASES = [
     {"q": "hoi an lantern", "dest": "Hoi An", "mode": None, "dated": False},
     {"q": "da nang cable car", "dest": "Da Nang", "mode": None, "dated": False},
     {"q": "things to do in hanoi", "dest": "Hanoi", "mode": None, "dated": False},
-    {"q": "food tour in ho chi minh city", "dest": "Ho Chi Minh City", "mode": None, "dated": False},
+    {
+        "q": "food tour in ho chi minh city",
+        "dest": "Ho Chi Minh City",
+        "mode": None,
+        "dated": False,
+    },
     {"q": "\u0111i thuy\u1ec1n \u1edf h\u1ed9i an", "dest": "Hoi An", "mode": None, "dated": False},
     {"q": "\u4f1a\u5b89\u706f\u7b3c\u4e4b\u65c5", "dest": "Hoi An", "mode": None, "dated": False},
-    {"q": "we are a family of four with a toddler, looking for something gentle and mostly indoors in Hue, ideally with free cancellation",
-     "dest": "Hue", "mode": "assistant", "dated": False},
+    {
+        "q": "we are a family of four with a toddler, looking for something gentle and mostly indoors in Hue, ideally with free cancellation",
+        "dest": "Hue",
+        "mode": "assistant",
+        "dated": False,
+    },
     {"q": "cooking class in hoi an on 2026-09-14", "dest": "Hoi An", "mode": None, "dated": True},
 ]
 
 
 async def main() -> None:
     products = await catalog_products()
-    print(f"catalogue: {len(products)} products, "
-          f"{len({p['category'] for p in products})} categories\n")
+    print(
+        f"catalogue: {len(products)} products, "
+        f"{len({p['category'] for p in products})} categories\n"
+    )
     # An empty catalogue scores 100% on routing and dates because nothing is
     # ever contradicted. The first run of this harness reported exactly that
     # and looked like a pass. Refuse to grade a run that cannot fail.
@@ -83,20 +94,24 @@ async def main() -> None:
             rows["lat"].append(statistics.mean(lats))
 
             flag = f"  <-- {zero}/{RUNS} EMPTY" if zero else ""
-            print(f"  {case['q'][:42]:42} items={statistics.mean(hits):5.1f} "
-                  f"dest={dest_ok}/{RUNS} mode={mode_ok}/{RUNS} date={date_ok}/{RUNS} "
-                  f"lat={statistics.mean(lats):.2f}s{flag}")
+            print(
+                f"  {case['q'][:42]:42} items={statistics.mean(hits):5.1f} "
+                f"dest={dest_ok}/{RUNS} mode={mode_ok}/{RUNS} date={date_ok}/{RUNS} "
+                f"lat={statistics.mean(lats):.2f}s{flag}"
+            )
         report[model] = rows
         print()
 
     print("=== summary ===")
     for model, rows in report.items():
-        print(f"{model:14} destination {statistics.mean(rows['dest']):.0%} | "
-              f"assistant-routing {statistics.mean(rows['mode']):.0%} | "
-              f"dates {statistics.mean(rows['date']):.0%} | "
-              f"mean items {statistics.mean(rows['items']):.1f} | "
-              f"empty responses {rows['zero']}/{len(CASES) * RUNS} | "
-              f"latency {statistics.mean(rows['lat']):.2f}s")
+        print(
+            f"{model:14} destination {statistics.mean(rows['dest']):.0%} | "
+            f"assistant-routing {statistics.mean(rows['mode']):.0%} | "
+            f"dates {statistics.mean(rows['date']):.0%} | "
+            f"mean items {statistics.mean(rows['items']):.1f} | "
+            f"empty responses {rows['zero']}/{len(CASES) * RUNS} | "
+            f"latency {statistics.mean(rows['lat']):.2f}s"
+        )
         print(f"{'':14} categories: {Counter(rows['cats']).most_common()}")
 
 
