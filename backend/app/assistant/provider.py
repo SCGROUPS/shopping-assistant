@@ -10,6 +10,7 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AsyncAzureOpenAI
 
 from app.api.schemas import SearchIntent
+from app.assistant.tlds import TOP_LEVEL_DOMAINS
 from app.common.config import Settings, get_settings
 from app.common.llm_cost import BudgetExceeded, ledger
 from app.common.ranking import deterministic_embedding
@@ -332,29 +333,28 @@ _INJECTED_CHANNEL = re.compile(
     https?://
   | www\.[a-z0-9-]+\.[a-z]{2,}
   | [a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
-    # A host followed by a path is a link whatever its suffix is.
-  | \b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+/\S
-    # A bare host with a suffix people actually register. Case-insensitive,
-    # because this list is specific enough not to collide with prose.
-  | \b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:
-        com|net|org|io|co|vn|me|info|biz|shop|app|xyz|site|online|link|top
-      | store|live|page|cc|tv|ru|cn|de|fr|jp|kr|es|uk|au|sg|th|ph|id|my
-    )\b
+    # A host followed by a path is link-shaped whatever its suffix is. The
+    # final label must contain letters, or a price written `1.500.000/khach`
+    # and a time written `16.30/person` would both read as one.
+  | \b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.[a-z]{2,}/\S
     """
 )
 
-# The suffix list above is finite, so `pay.example.travel` walked through it.
-# This catches any dotted host, and is deliberately case-*sensitive*: a real
-# domain is written in lower case, while the prose this would otherwise
-# misread - "a cruise in Hoi An.The guide speaks Korean", "TP.HCM" - carries a
-# capital after the dot. Requiring three characters before the dot keeps the
-# lower-case Vietnamese abbreviations ("tp.hcm") out of it; anything shorter
-# with a suffix worth registering is already covered by the list above.
-_BARE_HOST = re.compile(r"\b[a-z0-9][a-z0-9-]{2,}(?:\.[a-z0-9-]+)*\.[a-z]{2,24}\b")
+# Every dotted token that could be a host. Whether it *is* one is decided by
+# its suffix, against IANA's list of delegated top-level domains.
+#
+# Two earlier attempts got this wrong in opposite directions. A hand-picked
+# list of thirty suffixes missed `pay.example.travel`. Replacing it with "any
+# dotted lower-case token" was worse: it made capitalisation a security
+# boundary, which DNS does not honour - `pay.Example.travel` resolves - while
+# refusing ordinary prose that had lost the space after a full stop, in
+# languages whose sentences are not reliably capitalised at all. The suffix is
+# the only part of a host that is defined rather than guessed.
+_HOST_CANDIDATE = re.compile(r"\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+\b", re.I)
 
 # Nine digits is where telephone numbers start, and no attempt is made to tell
-# them from money - the previous two tries both failed, because `912 345 678`
-# and `100 000 000` are the same nine digits in the same three groups, and a
+# them from money - three tries all failed, because `912 345 678` and
+# `100 000 000` are the same nine digits in the same three groups, and a
 # currency token merely *near* a run says nothing about the run ("Price: 100
 # VND. Call 912 345 678").
 #
@@ -375,7 +375,12 @@ def carries_injected_channel(text: str) -> bool:
     catalogue text from whoever wanted the shopper to leave the site and pay
     somewhere unprotected.
     """
-    if _INJECTED_CHANNEL.search(text) or _BARE_HOST.search(text):
+    if _INJECTED_CHANNEL.search(text):
+        return True
+    if any(
+        match.group().rsplit(".", 1)[-1].lower() in TOP_LEVEL_DOMAINS
+        for match in _HOST_CANDIDATE.finditer(text)
+    ):
         return True
     return any(
         sum(character.isdigit() for character in match.group()) >= 9

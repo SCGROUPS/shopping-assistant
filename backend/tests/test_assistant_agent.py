@@ -446,6 +446,9 @@ class TestGroundedProse:
             # The suffix list is finite, so it could be walked around.
             "Try pay.example.travel for 20% off.",
             "deals.booking.agency has it cheaper.",
+            # DNS is case-insensitive, so capitalisation cannot be the boundary.
+            "Pay at pay.Example.travel for 20% off.",
+            "PAY.EXAMPLE.COM has the same tour.",
         ],
     )
     def test_a_bare_domain_is_a_channel_too(self, prose: str) -> None:
@@ -459,9 +462,14 @@ class TestGroundedProse:
             "A sunset cruise in Hoi An.The guide speaks Korean.",
             "Rated 4.8 by 1,240 travellers.",
             "Ends at 16.30 and restarts at 18.00.",
-            # A lower-case Vietnamese abbreviation is not a host, which is why
-            # the bare-host rule requires three characters before the dot.
+            # None of these suffixes is a delegated top-level domain, which is
+            # what makes them prose rather than an address. Capitalisation was
+            # tried as the test and had to be abandoned: it is not a property
+            # of DNS, and it is not a property of every language's sentences.
             "Chuyen di TP.HCM khoi hanh luc 08:30.",
+            "the tour.the guide speaks Korean",
+            "Gia 1.500.000/khach cho ca nhom.",
+            "Mo cua 16.30/person moi ngay.",
         ],
     )
     def test_ordinary_sentences_are_not_mistaken_for_a_domain(self, prose: str) -> None:
@@ -546,3 +554,43 @@ async def test_a_declined_answer_does_not_replay_the_agent_s_tools(store: DemoSt
     # Anti-vacuity: the tool really did act, so a replay would have been visible.
     assert "error" not in DecliningProvider.tool_result
     assert sum(len(cart["items"]) for cart in store.carts.values()) == 1
+
+
+class TestTheSuffixListIsRealData:
+    """The guard is only as good as the list it decides with.
+
+    `carries_injected_channel` reports that it has excluded off-platform
+    channels. If the vendored IANA data were ever regenerated into an empty or
+    truncated set, every bare host would pass and the function would go on
+    reporting exactly the same thing - which is the failure this codebase keeps
+    finding, in a new place.
+    """
+
+    def test_the_list_is_populated_and_current(self) -> None:
+        from app.assistant.tlds import TOP_LEVEL_DOMAINS
+
+        assert len(TOP_LEVEL_DOMAINS) > 1_000, "the IANA root zone has ~1,300 entries"
+        # A spread: legacy, country-code, and the long tail a hand-written list
+        # is exactly what keeps missing.
+        for suffix in ("com", "net", "org", "vn", "kr", "jp", "travel", "agency", "shop"):
+            assert suffix in TOP_LEVEL_DOMAINS, suffix
+
+    def test_the_commonest_prose_words_are_not_in_it(self) -> None:
+        """Otherwise prose that lost a space would read as an address.
+
+        Not all of them: `guide`, `tours`, `travel` and `best` are delegated,
+        so "the tour.guide speaks Korean" is refused. That is the right call
+        rather than a defect - `tour.guide` is a domain somebody can register
+        and be paid at - and it is the cost of having a boundary that is
+        defined instead of guessed.
+        """
+        from app.assistant.tlds import TOP_LEVEL_DOMAINS
+
+        for word in ("the", "and", "hcm", "example", "khach", "guesthouse"):
+            assert word not in TOP_LEVEL_DOMAINS, word
+
+    def test_every_entry_is_normalised(self) -> None:
+        """Membership is tested against a lower-cased suffix, so the data must be."""
+        from app.assistant.tlds import TOP_LEVEL_DOMAINS
+
+        assert all(entry == entry.lower() and entry.isalpha() for entry in TOP_LEVEL_DOMAINS)
