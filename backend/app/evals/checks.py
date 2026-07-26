@@ -112,6 +112,29 @@ def expect_terms_in_top(
     ]
 
 
+def expect_slugs_in_top(
+    products: Sequence[dict[str, Any]], slugs: Sequence[str], k: int
+) -> list[Violation]:
+    """The right *product*, named in a way translation cannot move.
+
+    Every other content check reads the text a shopper sees, which is exactly
+    what a multilingual case cannot assert on: the Vietnamese title of the
+    cooking class is not the English one, and writing the expected translation
+    into the case would test the translator's word choice rather than whether
+    search found the right thing. The slug is derived once from the source
+    listing and is identical in all eight locales, so it is the only handle
+    that means the same thing in every language.
+    """
+    if not slugs:
+        return []
+    head = {str(product.get("slug") or "") for product in products[:k]}
+    return [
+        Violation("expect_slugs_in_top", f"'{slug}' absent from top {k}")
+        for slug in slugs
+        if slug not in head
+    ]
+
+
 def max_price(products: Sequence[dict[str, Any]], ceiling: float) -> list[Violation]:
     """A budget is a promise, not a preference."""
     return [
@@ -265,6 +288,11 @@ def run_checks(
         if name == "expect_terms_in_top":
             violations.extend(
                 expect_terms_in_top(products, argument["terms"], argument.get("k", 5))
+            )
+            continue
+        if name == "expect_slugs_in_top":
+            violations.extend(
+                expect_slugs_in_top(products, argument["slugs"], argument.get("k", 5))
             )
             continue
         if name == "message_mentions":

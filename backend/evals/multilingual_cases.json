@@ -1,0 +1,165 @@
+{
+  "suite": "multilingual",
+  "description": "Locale-aware storefront search against PostgreSQL. Every case asks in one of the seven added languages for a product the catalogue certainly has, and names it by slug — the only handle that means the same thing in every locale. These cases are expected to FAIL until the translation pipeline lands; they are the gate, and a gate written after the thing it gates is not a gate. Requires POSTGRES_TEST_DATABASE_URL or DATABASE_URL: the locale column, the per-locale text-search configuration and the fallback chain exist only in the PostgreSQL path, so running these against the demo store would pass vacuously and prove nothing.",
+  "cases": [
+    {
+      "id": "vi-cooking-class-hanoi",
+      "locale": "vi",
+      "query": "lớp học nấu ăn ở Hà Nội",
+      "why": "Vietnamese is a source language, not only a target: an operator writes here first. Diacritics are the whole test — 'Hà Nội' and 'ha noi' must reach the same listing, which is what the explicit fold in the tokenizer exists for.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "hanoi-west-lake-cooking-class"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "vi-sunset-cruise-hoi-an",
+      "locale": "vi",
+      "query": "du thuyền ngắm hoàng hôn ở Hội An",
+      "why": "The ocean-not-mountain failure, asked in Vietnamese. If locale-aware ranking regresses, this is where it shows first.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "hoi-an-thu-bon-sunset-cruise"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "zh-cooking-class-hanoi",
+      "locale": "zh",
+      "query": "河内烹饪课",
+      "why": "Chinese has no spaces, so this passes only if the tokenizer emits CJK bigrams. It is the case that caught the tokenizer emitting nothing at all.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "hanoi-west-lake-cooking-class"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "zh-night-cruise-da-nang",
+      "locale": "zh",
+      "query": "岘港夜游船",
+      "why": "A second CJK case on a different destination, so a single lucky bigram cannot carry the language.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "da-nang-dragon-bridge-night-cruise"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "ja-cooking-class-hanoi",
+      "locale": "ja",
+      "query": "ハノイの料理教室",
+      "why": "Japanese mixes katakana, kanji and a particle. Segmentation that only handles Han characters drops the katakana place name, which is the destination.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "hanoi-west-lake-cooking-class"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "ko-coffee-hanoi-old-quarter",
+      "locale": "ko",
+      "query": "하노이 구시가지 커피 투어",
+      "why": "Korean is spaced but agglutinative, so `simple` tokenisation keeps particles attached. Included precisely because it is the language most likely to need a different treatment from the other three CJK locales.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "hanoi-old-quarter-coffee"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "fr-cycling-west-lake",
+      "locale": "fr",
+      "query": "balade à vélo autour du lac de l'Ouest",
+      "why": "Rewritten after the first run: 'cours de cuisine à Hanoï' passed against a purely English corpus, because 'cuisine' is also an English word and 'Hanoï' folds to 'hanoi'. A Latin-script case can be carried entirely by cognates and proper nouns and so test nothing. Every content word here — balade, vélo, lac, Ouest — is absent from the English document, and the destination is never named, so only a translated corpus can answer it.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "hanoi-west-lake-cycling"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "de-cycling-hanoi",
+      "locale": "de",
+      "query": "Radtour am Westsee in Hanoi",
+      "why": "German compounds: 'Radtour' must reach a cycling listing. The stemmer is what makes that possible, so this fails loudly if the trigger falls back to `simple`.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "hanoi-west-lake-cycling"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "es-cooking-class-no-place-name",
+      "locale": "es",
+      "query": "clase de cocina tradicional vietnamita",
+      "why": "Rewritten for the same reason as the French case: 'tour gastronómico ... en Hoi An' passed on 'tour' plus the place name alone. 'clase', 'cocina' and 'tradicional' have no English cognate in the document and no destination is given, so the right listing can only be reached through translated text.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "hanoi-west-lake-cooking-class"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "en-still-works",
+      "locale": "en",
+      "query": "cooking class in Hanoi",
+      "why": "The control. Every other case in this suite is expected to fail today; if this one ever fails, the suite is broken rather than the translations missing, and the difference has to be visible at a glance.",
+      "expect": {
+        "min_results": 3,
+        "expect_slugs_in_top": {
+          "slugs": [
+            "hanoi-west-lake-cooking-class"
+          ],
+          "k": 5
+        }
+      }
+    },
+    {
+      "id": "vi-falls-back-rather-than-emptying",
+      "locale": "vi",
+      "query": "Ha Long Bay",
+      "why": "A proper noun spelled the same in every language. Whatever happens to translation, a locale must never return less supply than English for a query that needs no translation — candidate starvation is the failure mode the missing locale filter caused in the first place.",
+      "expect": {
+        "min_results": 5
+      }
+    }
+  ]
+}

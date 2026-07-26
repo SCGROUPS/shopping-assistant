@@ -17,6 +17,7 @@ from app.evals.runner import (
     format_report,
     load_cases,
     run_assistant_suite,
+    run_multilingual_suite,
     run_search_suite,
     write_baseline,
 )
@@ -37,6 +38,8 @@ async def _run(suites: list[str]) -> list[SuiteReport]:
         cases = load_cases(suite)
         if suite == "search":
             reports.append(await run_search_suite(cases))
+        elif suite == "multilingual":
+            reports.append(await run_multilingual_suite(cases))
         else:
             reports.append(await run_assistant_suite(cases))
     return reports
@@ -47,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--suite",
         action="append",
-        choices=["search", "assistant"],
+        choices=["search", "assistant", "multilingual"],
         help="Repeatable. Defaults to search only, which needs no model.",
     )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable output.")
@@ -66,6 +69,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     suites = args.suite or ["search"]
+    if "multilingual" in suites and not database_mode():
+        # Same reasoning as the assistant suite: a suite that cannot run must
+        # say so, not report a pass rate for cases it answered from the wrong
+        # corpus.
+        print("multilingual suite needs DATABASE_URL and a seeded catalogue", file=sys.stderr)
+        return 2
     if "assistant" in suites and not _model_configured():
         # Silently passing a suite that never ran is how a green build starts
         # meaning nothing.

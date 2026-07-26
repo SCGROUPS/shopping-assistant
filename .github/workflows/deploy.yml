@@ -75,12 +75,23 @@ jobs:
         working-directory: backend
         run: uv run python -m app.evals.cli --suite search
 
+  # Split from the backend rather than appended to it. The two share no state,
+  # so running them in sequence spent the frontend's whole duration waiting for
+  # a test suite it does not depend on.
+  validate-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.2
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-
-      - name: Enable Corepack
-        run: corepack enable
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
 
       - name: Validate frontend
         working-directory: frontend
@@ -94,7 +105,7 @@ jobs:
 
   deploy:
     if: github.event_name == 'push'
-    needs: validate
+    needs: [validate, validate-frontend]
     runs-on: ubuntu-latest
     environment: production
     permissions:
@@ -121,19 +132,45 @@ jobs:
           AZURE_POSTGRES_LOCATION: centralus
         run: ./scripts/deploy.sh
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.2
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - name: Enable Corepack
-        run: corepack enable
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      # Chromium is ~150MB and is redownloaded on every run without this. Keyed
+      # on the lockfile so a Playwright upgrade misses the cache rather than
+      # testing against the browser the previous version pinned.
+      - name: Restore Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('frontend/pnpm-lock.yaml') }}
+
+      # The cache holds the browser, not the OS libraries it links against, so
+      # a hit still has to install those - just not the 150MB download.
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Install Playwright system dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        working-directory: frontend
+        run: pnpm exec playwright install-deps chromium
 
       - name: Run live browser journeys
         working-directory: frontend
         env:
           PLAYWRIGHT_BASE_URL: ${{ steps.deploy.outputs.app_url }}
           ADMIN_API_KEY: ${{ secrets.ADMIN_BOOTSTRAP_KEY }}
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm exec playwright install --with-deps chromium
-          pnpm test:e2e
+        run: pnpm test:e2e

@@ -1624,6 +1624,44 @@ rates. Without this the next multilingual regression is silent too.
 
 ---
 
+### 10.1 The multilingual gate, and why it is failing on purpose
+
+`evals/multilingual_cases.json` holds eleven cases, one or two per added
+language, and nine of them fail today. That is the deliverable. A gate written
+after the feature only ever certifies the feature's own assumptions — the
+tokenizer taught that lesson when cases added afterwards passed vacuously
+against an index that contained nothing at all.
+
+Three properties make the cases mean something.
+
+**They assert on slugs, not text.** Every other content check reads what a
+shopper sees, which is exactly what a multilingual case cannot use: the
+Vietnamese title is not the English one, and writing the expected translation
+into the case would test the translator's word choice rather than whether
+search found the right listing. A slug is derived once from the source and is
+identical in all eight locales.
+
+**They run against the whole catalogue.** Asking for a cooking class among
+fifteen fixtures proves nothing about ranking, because the right answer has
+nothing to beat. The suite seeds all 379 experiences and mirrors the English
+document into every locale — which is not a shortcut around the outbox but a
+statement of what the outbox currently produces, since an untranslated locale
+resolves through the source language.
+
+**They contain no words English can answer.** The first run exposed the trap:
+the French and Spanish cases passed with no translated content whatsoever. See
+§13. Latin-script queries must be written from content words with no English
+form, and must not name the destination.
+
+The gate is green while the expected failures fail, and turns red the moment
+one of them passes — which forces a deliberate decision about whether the
+translation pipeline has landed or the case was never testing what it claimed.
+The two cases that must pass today are the English control and the guarantee
+that a locale never returns less supply than English for a query needing no
+translation.
+
+---
+
 ## 11. Migration
 
 379 live records, live carts and bookings, and existing embeddings.
@@ -1854,6 +1892,7 @@ first, then revision 2's.
 | **`replicaRetryLimit: 1` is harmless caution** | It lets one execution outlive the deployment script's wait by a whole replica timeout while still looking like it might succeed, so the deployment fails for a job that is running perfectly well (§9.4) |
 | **The slow part of a deployment is the work it does** | The availability refresh did almost no work and took eleven of thirty-four minutes, because it spent them on 22,680 sequential round trips to a database in another datacentre. Latency, not computation, is what a deployment pays for (§9.5) |
 | **A table lock is too blunt for a maintenance job** | It is priced in the duration of the transaction that holds it, and that is a number you control. Eleven minutes of blocked checkout is intolerable; two seconds is cheaper than the oversell it prevents (§9.5) |
+| **A case written in the target language tests that language** | Not in Latin script. 'cours de cuisine à Hanoï' and 'tour gastronómico en Hoi An' both passed against a purely English corpus: 'cuisine' and 'tour' are English words and the place names fold to the same tokens. Cognates and proper nouns can carry a case entirely, so it certifies nothing. Content words must have no English form, and the destination must not be named (§10.1) |
 | **`SHARE ROW EXCLUSIVE` excludes writers** | It does not exclude `SELECT ... FOR UPDATE`, which takes only `ROW SHARE`. A writer can take the row lock, then block on the table lock, while the holder of the table lock blocks on the row - a deadlock that reads like mutual exclusion (§9.5) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,

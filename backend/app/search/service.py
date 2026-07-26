@@ -31,6 +31,7 @@ from app.common.features import (
     quality,
 )
 from app.common.llm_cost import BudgetExceeded
+from app.common.locales import normalize_locale
 from app.common.persistence import catalog_products, demand_stats
 from app.common.ranking import (
     cosine_similarity,
@@ -574,6 +575,7 @@ class SearchService:
                         semantic_limit=self.settings.search_semantic_candidates,
                         rrf_k=self.settings.search_rrf_k,
                         page_size=max(request.page_size * 3, 50),
+                        locale=normalize_locale(request.locale),
                     )
             except Exception:
                 logger.exception("PostgreSQL hybrid retrieval failed")
