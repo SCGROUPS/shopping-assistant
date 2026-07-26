@@ -55,6 +55,52 @@ const TEXT_PROPERTIES = new Set([
   'title',
 ])
 
+// Properties and attributes whose string values are machinery, never prose.
+// `className` is a CSS class list, `value` is the half of a typed UI structure
+// that the backend matches on while its sibling key carries the label, and the
+// rest name things rather than say them.
+const MACHINERY_PROPERTIES = new Set([
+  'className',
+  'class',
+  'id',
+  'key',
+  'type',
+  'value',
+  'data-testid',
+  'href',
+  'src',
+])
+
+// Calls whose string arguments are selectors, queries or comparison targets
+// rather than language. The comparison methods are here because a literal
+// being *matched against* is never rendered - `badge.includes('free
+// cancellation')` is reading supplier data, not addressing the shopper.
+const MACHINERY_CALLS = new Set([
+  'matchMedia',
+  'querySelector',
+  'querySelectorAll',
+  'getElementById',
+  'setAttribute',
+  'getItem',
+  'setItem',
+  'removeItem',
+  'includes',
+  'startsWith',
+  'endsWith',
+  'indexOf',
+])
+
+// Language names are written in their own language in every interface -
+// `Tiếng Việt` is correct on an English page and a Japanese one. Translating
+// an endonym would make the switcher unreadable to the very shopper looking
+// for their language in it.
+const ENDONYM_DECLARATIONS = new Set(['LOCALE_NAMES'])
+
+// The dictionary itself. Every entry here is a translation or the English
+// source of one, so the file is the destination for findings rather than a
+// place that can contain them.
+const DICTIONARY = new Set(['src/lib/i18n.ts'])
+
 // Sample catalogue content, not interface chrome. In production every one of
 // these fields is served from the database already translated, so the English
 // here is a fixture standing in for supplier data rather than a string the
@@ -86,7 +132,11 @@ const walkFiles = (dir, out = []) => {
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry)
     if (statSync(full).isDirectory()) walkFiles(full, out)
-    else if (entry.endsWith('.tsx') || entry.endsWith('.ts')) out.push(full)
+    else if (
+      (entry.endsWith('.tsx') || entry.endsWith('.ts')) &&
+      !DICTIONARY.has(relative(ROOT, full))
+    )
+      out.push(full)
   }
   return out
 }
@@ -95,6 +145,78 @@ const walkFiles = (dir, out = []) => {
 // English actually hides in: a plain string, a template with substitutions
 // (`Ask Mai about ${title}` - the sentence is in the spans), and both arms of
 // a ternary, which is what a half-translated line looks like.
+// Two or more words with letters in them. One word is a token - a filter
+// value, a CSS class, an event name; a sentence needs at least two.
+const isProse = (text) => {
+  const trimmed = text.trim()
+  if (isAllowed(trimmed)) return false
+  const words = trimmed.split(/\s+/).filter((word) => /\p{Letter}{2,}/u.test(word))
+  return words.length >= 2
+}
+
+// Whether a literal is an argument or value in a position that is structurally
+// not language: a class list, a machinery-named property, or a DOM query.
+const inMachineryContext = (node) => {
+  const parent = node.parent
+  if (!parent) return false
+  // `new Error('...')` is diagnostic text for a log or a developer. Every
+  // caller that shows something to a shopper catches and renders its own
+  // translated message, so the thrown string never reaches a screen.
+  if (ts.isNewExpression(parent) && ts.isIdentifier(parent.expression)) {
+    if (parent.expression.text === 'Error') return true
+  }
+  if (
+    ts.isPropertyAssignment(parent) &&
+    ts.isVariableDeclaration(parent.parent?.parent ?? {}) &&
+    ts.isIdentifier(parent.parent.parent.name) &&
+    ENDONYM_DECLARATIONS.has(parent.parent.parent.name.text)
+  ) {
+    return true
+  }
+  if (
+    (ts.isPropertyAssignment(parent) || ts.isJsxAttribute(parent)) &&
+    (ts.isIdentifier(parent.name) || ts.isStringLiteral(parent.name)) &&
+    MACHINERY_PROPERTIES.has(parent.name.text)
+  ) {
+    return true
+  }
+  if (ts.isJsxExpression(parent) && parent.parent) {
+    return inMachineryContext(parent)
+  }
+  // `badge === 'Top pick'` reads supplier data to pick an icon; the literal is
+  // a comparison target and is never rendered.
+  if (ts.isBinaryExpression(parent)) {
+    const op = parent.operatorToken.kind
+    if (
+      op === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+      op === ts.SyntaxKind.ExclamationEqualsEqualsToken ||
+      op === ts.SyntaxKind.EqualsEqualsToken ||
+      op === ts.SyntaxKind.ExclamationEqualsToken
+    ) {
+      return true
+    }
+    return inMachineryContext(parent)
+  }
+  if (ts.isConditionalExpression(parent)) {
+    return inMachineryContext(parent)
+  }
+  if (ts.isCallExpression(parent)) {
+    // `String(x ?? 'fallback')` is a conversion, so what matters is the
+    // context the conversion itself sits in.
+    if (ts.isIdentifier(parent.expression) && parent.expression.text === 'String') {
+      return inMachineryContext(parent)
+    }
+    const callee = parent.expression
+    const name = ts.isPropertyAccessExpression(callee)
+      ? callee.name.text
+      : ts.isIdentifier(callee)
+        ? callee.text
+        : ''
+    if (MACHINERY_CALLS.has(name)) return true
+  }
+  return false
+}
+
 const collectText = (expression, emit) => {
   if (!expression) return
   if (
@@ -182,6 +304,27 @@ for (const file of walkFiles(SRC)) {
       collectText(node.initializer, (literal) =>
         report(literal, literal.text),
       )
+    }
+
+    // A sentence written anywhere at all.
+    //
+    // The rules above find strings by where they sit - in markup, or under a
+    // property named `label`. Three times now, English has been found sitting
+    // somewhere neither rule looks: a local array joined into a summary line, a
+    // module-level constant, a ternary inside a `.map`. What all of those have
+    // in common is not their position but their shape: they are prose. Two or
+    // more words is prose; `wheelchair`, `ADD_TO_CART` and `active` are not.
+    //
+    // So this asks the opposite question. Instead of listing the places text
+    // can appear, it treats every multi-word literal as text and excludes the
+    // contexts that are demonstrably machinery: class lists, the `value` half
+    // of a typed UI structure, and DOM/query calls.
+    if (
+      (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      isProse(node.text) &&
+      !inMachineryContext(node)
+    ) {
+      report(node, node.text)
     }
 
     // Attribute values a shopper reads: aria-label="Close"

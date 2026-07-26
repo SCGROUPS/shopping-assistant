@@ -73,7 +73,7 @@ export function ProductCard({
       <button
         className={`save-button ${saved ? 'saved' : ''}`}
         onClick={() => setSaved((value) => !value)}
-        aria-label={saved ? 'Remove from saved' : 'Save experience'}
+        aria-label={saved ? t('product.unsave') : t('product.save')}
       >
         <Heart size={18} fill={saved ? 'currentColor' : 'none'} />
       </button>

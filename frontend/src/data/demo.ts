@@ -324,13 +324,10 @@ export const demoExperiences: Experience[] = [
   },
 ]
 
-export const categories = [
-  'All',
-  'Culture',
-  'Day trip',
-  'Food',
-  'Family',
-  'Water',
-  'Nature',
-  'Wellness',
-]
+// Fills the demo checkout so the flow can be walked without typing. Kept with
+// the rest of the fixtures rather than in the component: a real checkout must
+// not arrive pre-filled with somebody else's name.
+export const demoCustomer = {
+  name: 'Alex Traveller',
+  email: 'alex@example.com',
+}

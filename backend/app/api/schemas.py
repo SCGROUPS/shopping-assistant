@@ -60,6 +60,12 @@ class IntentValue(BaseModel):
 
 class SearchIntent(BaseModel):
     search_text: str
+    # Whether this request is better answered by a conversation than by a grid.
+    # The model decides, because deciding it here meant matching English
+    # function words: a Vietnamese shopper's request scored zero and could
+    # never reach the assistant, so the guided path was English-only and
+    # language became a hidden variable in every assistant conversion figure.
+    interaction_mode: Literal["assistant", "grid"] = "grid"
     destination: IntentValue = Field(default_factory=IntentValue)
     hard_constraints: list[dict[str, Any]] = Field(default_factory=list)
     soft_preferences: list[dict[str, Any]] = Field(default_factory=list)
@@ -183,6 +189,9 @@ class SearchResponse(BaseModel):
     recommendations: list[ExperienceCard] | None = None
     facets: dict[str, dict[str, int]]
     relaxed_preferences: list[str] = Field(default_factory=list)
+    # Lifted out of `intent` onto the envelope: the client needs it on every
+    # response, including the ones where intent extraction never ran.
+    interaction_mode: Literal["assistant", "grid"] = "grid"
     # On the envelope, not only on the cards. Zero results is exactly the case
     # where a client most needs to know which corpus was searched, and exactly
     # the case where there is no card to carry it.

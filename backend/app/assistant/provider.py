@@ -12,6 +12,7 @@ from openai import AsyncAzureOpenAI
 from app.api.schemas import IntentValue, SearchIntent
 from app.common.config import Settings, get_settings
 from app.common.llm_cost import BudgetExceeded, ledger
+from app.common.query_shape import looks_conversational
 from app.common.ranking import deterministic_embedding
 
 logger = logging.getLogger(__name__)
@@ -319,6 +320,13 @@ def deterministic_intent(text: str) -> SearchIntent:
         hard_constraints=hard,
         soft_preferences=soft,
         exclusions=exclusions,
+        # The patterns above are English, but they only ever add filters. The
+        # routing judgement must not inherit their bias, so it uses the same
+        # language-neutral shape test that decided this query was worth
+        # interpreting in the first place. Without this, a model outage would
+        # silently route every stated need that lacks a question mark to the
+        # keyword grid - the queries that need the assistant most.
+        interaction_mode="assistant" if looks_conversational(text) else "grid",
     )
 
 
@@ -553,6 +561,7 @@ class AzureOpenAIProvider:
                 },
                 "needs_clarification": {"type": "boolean"},
                 "clarification_question": {"type": ["string", "null"]},
+                "interaction_mode": {"type": "string", "enum": ["assistant", "grid"]},
             },
             "required": [
                 "search_text",
@@ -562,6 +571,7 @@ class AzureOpenAIProvider:
                 "exclusions",
                 "needs_clarification",
                 "clarification_question",
+                "interaction_mode",
             ],
             "additionalProperties": False,
         }
@@ -572,6 +582,11 @@ class AzureOpenAIProvider:
                     "role": "system",
                     "content": (
                         "Extract tourism search intent. Never invent unknown values. "
+                        "Set interaction_mode to 'assistant' when the request describes a "
+                        "trip in prose, asks a question, or states preferences that need to "
+                        "be traded off against each other, and 'grid' when it names a "
+                        "specific thing to look up. Judge this from what the shopper means, "
+                        "in whatever language they wrote it - not from the words used. "
                         f"Today is {datetime.now(UTC):%Y-%m-%d}. "
                         "Only emit visit_start or visit_end when the user explicitly states a "
                         "calendar date or relative date phrase such as today, tomorrow, next "

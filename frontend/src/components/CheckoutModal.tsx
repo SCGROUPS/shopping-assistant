@@ -16,6 +16,8 @@ import { useState } from 'react'
 import type { CartItem, Voucher } from '../types'
 import { useLocale, useT } from '../lib/useLocale'
 import { formatMoney } from '../lib/format'
+import { api } from '../lib/api'
+import { demoCustomer } from '../data/demo'
 
 type CheckoutModalProps = {
   open: boolean
@@ -38,8 +40,12 @@ export function CheckoutModal({
   const t = useT()
   const money = (currency: string, amount: number) =>
     formatMoney(locale, currency, amount)
-  const [name, setName] = useState('Alex Traveller')
-  const [email, setEmail] = useState('alex@example.com')
+  const [name, setName] = useState(
+    api.demoFallbackEnabled ? demoCustomer.name : '',
+  )
+  const [email, setEmail] = useState(
+    api.demoFallbackEnabled ? demoCustomer.email : '',
+  )
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const total = items.reduce((sum, item) => sum + item.total, 0)
@@ -131,13 +137,18 @@ export function CheckoutModal({
                   <span>
                     <User size={15} /> {t('checkout.fullName')}
                   </span>
-                  <input value={name} onChange={(event) => setName(event.target.value)} />
+                  <input
+                    data-testid="checkout-name"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                  />
                 </label>
                 <label>
                   <span>
                     <Mail size={15} /> {t('checkout.email')}
                   </span>
                   <input
+                    data-testid="checkout-email"
                     type="email"
                     value={email}
                     onChange={(event) => setEmail(event.target.value)}

@@ -35,12 +35,12 @@ type AssistantPanelProps = {
   onView: (product: Experience) => void
 }
 
-const prompts = [
-  'Plan a relaxed half-day',
-  'Best for a family?',
-  'What works if it rains?',
-  'Find accessible options',
-]
+const promptKeys = [
+  'assistant.quick.halfDay',
+  'assistant.quick.family',
+  'assistant.quick.rain',
+  'assistant.quick.accessible',
+] as const
 
 export function AssistantPanel({
   open,
@@ -164,13 +164,13 @@ export function AssistantPanel({
                     onClick={() => toggleSpeech(message)}
                     aria-label={
                       speakingMessageId === message.id
-                        ? 'Stop reading this response'
-                        : 'Read this response aloud'
+                        ? t('assistant.speech.stopLong')
+                        : t('assistant.speech.startLong')
                     }
                     title={
                       speakingMessageId === message.id
-                        ? 'Stop reading'
-                        : 'Listen to response'
+                        ? t('assistant.speech.stop')
+                        : t('assistant.speech.start')
                     }
                   >
                     {speakingMessageId === message.id ? (
@@ -226,7 +226,7 @@ export function AssistantPanel({
                               {money(product.currency, product.price)}
                             </small>
                             <em>
-                              {product.reason ?? 'Recommended for this trip'}
+                              {product.reason ?? t('assistant.recommendedReason')}
                             </em>
                           </span>
                           <ArrowRight size={17} />
@@ -322,9 +322,9 @@ export function AssistantPanel({
       </div>
 
       <div className="prompt-row">
-        {prompts.map((prompt) => (
-          <button key={prompt} onClick={() => onSend(prompt)} disabled={busy}>
-            {prompt}
+        {promptKeys.map((key) => (
+          <button key={key} onClick={() => onSend(t(key))} disabled={busy}>
+            {t(key)}
           </button>
         ))}
       </div>

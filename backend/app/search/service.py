@@ -17,6 +17,7 @@ from app.assistant.provider import AIProvider, build_ai_provider, deterministic_
 from app.catalog.service import product_card, starting_price
 from app.common.config import get_settings
 from app.common.database import session_factory
+from app.common.query_shape import looks_conversational
 from app.common.embedding_cache import embedding_cache
 from app.common.features import (
     availability_fit,
@@ -94,15 +95,8 @@ DATE_CONSTRAINT_FIELDS = {
 
 
 def should_extract_intent(request: SearchRequest) -> bool:
-    query = request.query.strip()
-    if not query:
-        return False
-    conversational = re.search(
-        r"\b(for|with|under|below|next|tomorrow|family|wheelchair|indoor|outdoor|prefer|quiet)\b",
-        query,
-        re.I,
-    )
-    return bool(conversational or len(query.split()) > 5)
+    """Whether a query is worth spending a model call on."""
+    return looks_conversational(request.query)
 
 
 def sanitize_intent(query: str, intent: SearchIntent) -> SearchIntent:
@@ -475,7 +469,15 @@ class SearchService:
                 logger.exception("Intent extraction failed; using deterministic parsing")
                 intent = deterministic_intent(request.query)
         else:
-            intent = SearchIntent(search_text=request.query)
+            # No model ran, so nothing judged this query. A terminal question
+            # mark is the one signal available that means the same thing in
+            # every language this catalogue serves.
+            intent = SearchIntent(
+                search_text=request.query,
+                interaction_mode=(
+                    "assistant" if looks_conversational(request.query) else "grid"
+                ),
+            )
         intent = sanitize_intent(request.query, intent)
         if intent.destination.name:
             inferred = intent.destination.name.casefold()
@@ -515,6 +517,7 @@ class SearchService:
                 items=[],
                 facets={},
                 locale=locale,
+                interaction_mode=intent.interaction_mode,
             )
         eligible, filters, relaxed_preferences = relax_until_results(
             available_products, filters, request.party
@@ -667,6 +670,7 @@ class SearchService:
             locale=locale,
             query_id=uuid4(),
             intent=intent,
+            interaction_mode=intent.interaction_mode,
             effective_filters=filters,
             items=[
                 product_card(

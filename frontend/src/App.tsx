@@ -33,7 +33,7 @@ import { CartDrawer } from './components/CartDrawer'
 import { CheckoutModal } from './components/CheckoutModal'
 import { ProductCard } from './components/ProductCard'
 import { VoiceInputButton } from './components/VoiceInputButton'
-import { categories, demoExperiences } from './data/demo'
+import { demoExperiences } from './data/demo'
 import {
   SUPPORTED_CURRENCIES,
   LOCALE_NAMES,
@@ -46,12 +46,12 @@ import {
 import { formatCount, formatDate as intlDate, formatMoney } from './lib/format'
 import { LocaleProvider } from './lib/LocaleContext'
 import { buildTranslator } from './lib/useLocale'
+import type { Translator } from './lib/useLocale'
 import { chromeReady, isFallback, resolveText, translate } from './lib/i18n'
 import type { LocalizedText } from './lib/i18n'
 import {
   detectFriction,
   findScheduleClash,
-  isConversationalQuery,
   type FrictionSignal,
   type Nudge,
 } from './lib/presence'
@@ -81,15 +81,18 @@ const initialMessage: AssistantMessage = {
   timestamp: new Date(),
 }
 
-const suggestionQueries = [
-  'A magical Hoi An evening',
-  'Family day near Da Nang',
-  'Food, culture, and no rushing',
-  'Rainy-day experiences',
-]
+// Keys, not queries. These are submitted as well as displayed, so a shopper
+// browsing in Vietnamese has to send a Vietnamese query - shipping the English
+// text would have them searching in a language they did not choose.
+const suggestionKeys = [
+  'app.suggestion.evening',
+  'app.suggestion.family',
+  'app.suggestion.unhurried',
+  'app.suggestion.rainy',
+] as const
 
-const formatDate = (locale: string, date: string) => {
-  if (!date) return 'Choose date'
+const formatDate = (locale: string, date: string, t: Translator) => {
+  if (!date) return t('app.date.choose')
   // Noon, so a timezone west of UTC cannot render the previous day.
   return intlDate(locale, `${date}T12:00:00`, {
     month: 'short',
@@ -97,7 +100,10 @@ const formatDate = (locale: string, date: string) => {
   })
 }
 
-const ANY_DESTINATION = 'Anywhere in Vietnam'
+// A sentinel, not a label. It was both, so the one string had to stay English:
+// translating it would have changed the value the option list is keyed and
+// compared on, and leaving it English put untranslated text in the control.
+const ANY_DESTINATION = '__any__'
 
 const isoDay = (offsetDays: number) =>
   new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10)
@@ -133,12 +139,29 @@ const durationChoices = [
 
 const ratingChoices = [4.0, 4.5, 4.8]
 
+// The value is a filter the backend understands; the label is chrome. Keeping
+// them as one string meant the filter could not be translated without changing
+// what was queried.
 const accessibilityChoices = [
-  'wheelchair',
-  'step-free',
-  'audio guide',
-  'sign language',
-]
+  { value: 'wheelchair', key: 'filter.access.wheelchair' },
+  { value: 'step-free', key: 'filter.access.stepFree' },
+  { value: 'audio guide', key: 'filter.access.audioGuide' },
+  { value: 'sign language', key: 'filter.access.signLanguage' },
+] as const
+
+// Category tabs when the catalogue has reported no facets yet. Same split: the
+// value is matched against backend facet names, the label is ours to translate.
+const ALL_CATEGORIES = 'All'
+const fallbackCategories = [
+  { value: ALL_CATEGORIES, key: 'filter.category.all' },
+  { value: 'Culture', key: 'filter.category.culture' },
+  { value: 'Day trip', key: 'filter.category.dayTrip' },
+  { value: 'Food', key: 'filter.category.food' },
+  { value: 'Family', key: 'filter.category.family' },
+  { value: 'Water', key: 'filter.category.water' },
+  { value: 'Nature', key: 'filter.category.nature' },
+  { value: 'Wellness', key: 'filter.category.wellness' },
+] as const
 
 function App() {
   const [products, setProducts] = useState<Experience[]>(
@@ -397,7 +420,15 @@ function App() {
         // which have an interface to show it in. Offering one without the
         // other produces a page that is half translated, and the shopper
         // cannot tell that from one that is broken.
-        setEnabledLocales(cohort.enabledLocales.filter(chromeReady))
+        // Demo mode serves English fixtures for every locale, so a translated
+        // interface would be wrapped around English products - the same
+        // half-translated page the `chromeReady` filter exists to prevent,
+        // arrived at from the catalogue side instead of the chrome side.
+        setEnabledLocales(
+          api.demoFallbackEnabled
+            ? ['en']
+            : cohort.enabledLocales.filter(chromeReady),
+        )
         if (catalogue.length) setProducts(catalogue)
         if (recommendedNow.length) setRecommendations(recommendedNow)
         setMessages((current) =>
@@ -435,7 +466,7 @@ function App() {
   const visibleProducts = useMemo(() => {
     // Once a search has run the backend has already applied the category
     // filter; filtering again client-side would hide relaxed results.
-    if (hasSearched || category === 'All') return products
+    if (hasSearched || category === ALL_CATEGORIES) return products
     return products.filter((product) => product.category === category)
   }, [category, hasSearched, products])
 
@@ -446,14 +477,15 @@ function App() {
     const count = visibleProducts.length
     const parts = [
       count === 0
-        ? 'No exact match'
-        : `${count} ${count === 1 ? 'experience' : 'experiences'}`,
-      destination,
-      formatDate(locale, date),
-      `${travellers} ${travellers === 1 ? 'traveller' : 'travellers'}`,
+        ? t('app.results.noMatch')
+        : t.plural('app.experiences', count),
+      // The sentinel is not a label, so it cannot be shown as one.
+      destination === ANY_DESTINATION ? t('app.destination.any') : destination,
+      formatDate(locale, date, t),
+      t.plural('app.travellers', travellers),
     ]
     return parts.join(' · ')
-  }, [visibleProducts.length, destination, date, travellers, locale])
+  }, [visibleProducts.length, destination, date, travellers, locale, t])
 
   const resultsRef = useRef<HTMLElement>(null)
   const pendingScroll = useRef(false)
@@ -481,16 +513,29 @@ function App() {
 
   // Tabs follow the live catalogue rather than the demo labels, so a tab can
   // never point at a category the backend has nothing to return for.
-  const categoryTabs = useMemo(() => {
+  const categoryTabs = useMemo((): {
+    value: string
+    label: LocalizedText
+  }[] => {
     const counts = facets.category
-    if (!counts || Object.keys(counts).length === 0) return categories
+    if (!counts || Object.keys(counts).length === 0)
+      return fallbackCategories.map(({ value, key }) => ({
+        value,
+        label: { key },
+      }))
     const ranked = Object.entries(counts)
       .filter(([, count]) => count > 0)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 8)
       .map(([name]) => name)
-    if (category !== 'All' && !ranked.includes(category)) ranked.push(category)
-    return ['All', ...ranked]
+    if (category !== ALL_CATEGORIES && !ranked.includes(category))
+      ranked.push(category)
+    // A live facet name is catalogue data the server resolved for this locale,
+    // so it is already in the shopper's language and has no key.
+    return [
+      { value: ALL_CATEGORIES, label: { key: 'filter.category.all' } },
+      ...ranked.map((name) => ({ value: name, label: { raw: name } })),
+    ]
   }, [category, facets])
 
   const cartTotal = cartItems.reduce((sum, item) => sum + item.total, 0)
@@ -576,7 +621,7 @@ function App() {
       const result = await api.search(searchQuery, filters, travellers)
       api.track('search_submitted', {
         result_count: result.items.length,
-        conversational: isConversationalQuery(searchQuery),
+        conversational: result.interactionMode === 'assistant',
       })
       if (result.items.length === 0) api.track('search_zero_results', {})
       if (result.relaxedPreferences.length > 0) {
@@ -597,7 +642,11 @@ function App() {
       // The one sanctioned auto-open: a conversational query is an explicit
       // request for help, not an unprompted interruption. Keyword queries
       // always stay in the grid.
-      if (announce && isConversationalQuery(searchQuery)) {
+      // The server's judgement, not a regex over English function words. The
+      // old test could only ever fire for English queries, so the guided path
+      // was unreachable for everyone else and "the assistant converts better"
+      // was really measuring "English shoppers convert better".
+      if (announce && result.interactionMode === 'assistant') {
         const best = result.items.slice(0, 3)
         const relaxed = result.relaxedPreferences.length
           ? t('assistant.relaxedSuffix', {
@@ -824,9 +873,7 @@ function App() {
   const checkMyPlan = () => {
     setCartOpen(false)
     openAssistant()
-    void sendAssistantMessage(
-      'Check my plan: does the timing work, and is anything missing?',
-    )
+    void sendAssistantMessage(t('assistant.prompt.checkPlan'))
   }
 
   const handleAssistantAction = async (
@@ -868,7 +915,7 @@ function App() {
     }
     if (action.type === 'APPLY_FILTER' && action.value === 'family') {
       setAssistantOpen(false)
-      void runSearch('family-friendly experiences', {
+      void runSearch(t('assistant.prompt.familyQuery'), {
         family_friendly: true,
       })
       return
@@ -1109,9 +1156,13 @@ function App() {
                   >
                     {destinationOptions.map((name) => {
                       const count = facets.destination?.[name]
+                      const label =
+                        name === ANY_DESTINATION
+                          ? t('app.destination.any')
+                          : name
                       return (
                         <option key={name} value={name}>
-                          {count === undefined ? name : `${name} (${count})`}
+                          {count === undefined ? label : `${label} (${count})`}
                         </option>
                       )
                     })}
@@ -1122,7 +1173,7 @@ function App() {
                 <CalendarDays size={18} />
                 <span>
                   <small>{t('app.search.date')}</small>
-                  <strong>{formatDate(locale, date)}</strong>
+                  <strong>{formatDate(locale, date, t)}</strong>
                   <input
                     type="date"
                     value={date}
@@ -1172,12 +1223,9 @@ function App() {
 
             <div className="suggestion-row">
               <span>{t('app.search.try')}</span>
-              {suggestionQueries.map((suggestion) => (
-                <button
-                  key={suggestion}
-                  onClick={() => chooseSuggestion(suggestion)}
-                >
-                  {suggestion}
+              {suggestionKeys.map((key) => (
+                <button key={key} onClick={() => chooseSuggestion(t(key))}>
+                  {t(key)}
                 </button>
               ))}
             </div>
@@ -1240,19 +1288,19 @@ function App() {
             <div className="category-tabs">
               {categoryTabs.map((item) => {
                 const count =
-                  item === 'All'
+                  item.value === ALL_CATEGORIES
                     ? Object.values(facets.category ?? {}).reduce(
                         (sum, value) => sum + value,
                         0,
                       )
-                    : facets.category?.[item]
+                    : facets.category?.[item.value]
                 return (
                   <button
-                    className={category === item ? 'active' : ''}
-                    key={item}
-                    onClick={() => setCategory(item)}
+                    className={category === item.value ? 'active' : ''}
+                    key={item.value}
+                    onClick={() => setCategory(item.value)}
                   >
-                    {item}
+                    {resolveText(locale, item.label)}
                     {hasSearched && count !== undefined && (
                       <em className="facet-count">{count}</em>
                     )}
@@ -1406,7 +1454,7 @@ function App() {
               <div className="filter-group">
                 <h4>{t('app.filter.accessibility')}</h4>
                 <div className="chip-row">
-                  {accessibilityChoices.map((value) => (
+                  {accessibilityChoices.map(({ value, key }) => (
                     <button
                       key={value}
                       className={
@@ -1423,7 +1471,7 @@ function App() {
                         }))
                       }
                     >
-                      {value}
+                      {t(key)}
                     </button>
                   ))}
                 </div>
@@ -1512,7 +1560,7 @@ function App() {
             <button
               className="outline-button"
               onClick={() =>
-                sendAssistantMessage('Build this into a relaxed full-day plan')
+                sendAssistantMessage(t('assistant.prompt.fullDay'))
               }
             >
               <Sparkles size={16} />
@@ -1820,7 +1868,7 @@ function App() {
                 <span>
                   <CalendarDays size={18} />
                   <small>{t('app.detail.selectedDate')}</small>
-                  <strong>{formatDate(locale, date)}</strong>
+                  <strong>{formatDate(locale, date, t)}</strong>
                 </span>
                 <span>
                   <Users size={18} />

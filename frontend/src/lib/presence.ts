@@ -1,6 +1,7 @@
 import type { CartItem } from '../types'
 import { getResolvedLocale } from './api'
 import { formatDate } from './format'
+import { translate } from './i18n'
 import type { LocalizedText } from './i18n'
 
 /**
@@ -39,30 +40,13 @@ export type PresenceState = {
   checkoutOpen: boolean
 }
 
-const QUESTION_SHAPED =
-  /^(what|which|where|when|why|how|who|can|could|would|should|is|are|do|does|did|help|find|show|suggest|recommend|plan|any|i need|i want|i'm|im|we need|we want|my|our)\b/i
-
-const NARRATIVE_MARKER =
-  /\b(with|without|and|but|for|near|around|plus|also|prefer|prefers|avoid|instead|because|while|during|who|that|under|over|before|after|between)\b/gi
-
-/**
- * Decide whether a hero-search query should be answered by the assistant
- * instead of the grid.
- *
- * Deliberately conservative: short keyword queries such as "hoi an cooking
- * class" must always stay in the grid, because hijacking them would break the
- * shopper's expectation that the search box searches.
- */
-export function isConversationalQuery(query: string): boolean {
-  const trimmed = query.trim()
-  if (!trimmed) return false
-  const words = trimmed.split(/\s+/)
-  if (words.length <= 3) return false
-  if (trimmed.endsWith('?')) return true
-  if (QUESTION_SHAPED.test(trimmed)) return true
-  const markers = trimmed.match(NARRATIVE_MARKER)?.length ?? 0
-  return words.length >= 6 && markers >= 2
-}
+// `isConversationalQuery` used to live here: a regex over English function
+// words deciding whether a search became a conversation. It was removed rather
+// than translated. Whichever language list it held, it would answer "not
+// conversational" for every language not on it, so the guided path was
+// unreachable for those shoppers no matter how clearly they asked. The server
+// returns `interaction_mode` on the search response instead, because it is the
+// only side that can read the query.
 
 const overlaps = (item: CartItem, other: CartItem): boolean => {
   if (!item.starts_at || !other.starts_at) return false
@@ -92,7 +76,7 @@ const clockTime = (item: CartItem) =>
         hour: 'numeric',
         minute: '2-digit',
       })
-    : 'the same time'
+    : translate(getResolvedLocale(), 'nudge.clash.sameTime')
 
 /**
  * Return at most one nudge, most specific first. Returning a single offer is

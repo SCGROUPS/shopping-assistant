@@ -1,5 +1,6 @@
 import { demoExperiences } from '../data/demo'
 import { formatTime } from './format'
+import { translate } from './i18n'
 import type { LocalizedText, MessageKey } from './i18n'
 import type {
   AssistantAction,
@@ -217,7 +218,7 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
       : []
     return {
       id: String(option.id),
-      name: String(option.name ?? 'Standard experience'),
+      name: String(option.name ?? translate(getResolvedLocale(), 'product.option.standard')),
       price: Number(adultPrice?.amount ?? item.price ?? 0),
       currency: String(adultPrice?.currency ?? item.currency ?? 'VND'),
       validity_type: option.validity_type
@@ -243,7 +244,7 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
   return {
     id: String(item.id ?? item.experience_id),
     slug: String(item.slug ?? item.id),
-    title: String(item.title ?? 'Vietnam experience'),
+    title: String(item.title ?? translate(getResolvedLocale(), 'product.untitled')),
     destination: String(item.destination ?? item.location ?? 'Vietnam'),
     location: String(item.location ?? item.destination ?? 'Vietnam'),
     category: String(item.category ?? 'Experience'),
@@ -517,6 +518,7 @@ export const api = {
     effectiveFilters: SearchFilters
     relaxedPreferences: string[]
     facets: Record<string, Record<string, number>>
+    interactionMode: 'assistant' | 'grid'
   }> {
     try {
       const payload = await request<Record<string, unknown>>('/search', {
@@ -539,6 +541,12 @@ export const api = {
         relaxedPreferences: (payload.relaxed_preferences as string[]) ?? [],
         facets:
           (payload.facets as Record<string, Record<string, number>>) ?? {},
+        // The server decides whether this request wanted a conversation,
+        // because only it can read the shopper's language. `grid` when the
+        // field is absent: an older backend must not silently start opening
+        // the assistant over every search.
+        interactionMode:
+          payload.interaction_mode === 'assistant' ? 'assistant' : 'grid',
       }
     } catch (error) {
       allowDemoFallbackOrThrow(error)
@@ -547,6 +555,7 @@ export const api = {
         effectiveFilters: filters,
         relaxedPreferences: [],
         facets: {},
+        interactionMode: 'grid',
       }
     }
   },

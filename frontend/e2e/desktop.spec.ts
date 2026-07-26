@@ -68,6 +68,10 @@ test('desktop voice discovery completes a real voucher purchase', async ({
   await expect(
     checkout.getByRole('heading', { name: 'One last check' }),
   ).toBeVisible()
+  // Typed rather than relying on a prefill: a real checkout must not arrive
+  // filled in with somebody else's name, so the fields start empty.
+  await checkout.getByTestId('checkout-name').fill('Alex Traveller')
+  await checkout.getByTestId('checkout-email').fill('alex@example.com')
   await checkout
     .getByRole('button', { name: 'Confirm demo purchase' })
     .click()
