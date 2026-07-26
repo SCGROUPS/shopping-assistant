@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -92,6 +93,21 @@ SHOPPING_TOOLS: list[dict[str, Any]] = [
             "max_total_price": {
                 "type": ["number", "null"],
                 "description": "Budget ceiling for the whole party, in VND.",
+            },
+            "relax_order": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Which of the shopper's constraints to give up first if nothing "
+                    "matches, most expendable first, from: max_duration, rating, "
+                    "instant_confirmation, free_cancellation, category, "
+                    "indoor_outdoor, language, family_friendly, dates, budget, "
+                    "destination. Fill this only from what the shopper has actually "
+                    "said - 'I can be flexible on dates but not on price' is "
+                    "['dates']. Empty when they have not said, which leaves the "
+                    "default order in place. Accessibility needs and exclusions are "
+                    "never relaxed and cannot be listed here."
+                ),
             },
             "limit": {
                 "type": ["integer", "null"],
@@ -298,7 +314,39 @@ def _offered_ids(result: dict[str, Any]) -> set[str]:
     return found
 
 
-def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer:
+# A link, an address or a phone number in the assistant's prose did not come
+# from a tool: no tool returns any of these. It came from the model, and the
+# most likely author is catalogue text written by whoever wanted the shopper to
+# leave the site and pay somewhere unprotected. Prose is the one part of the
+# answer we cannot verify by id, so it is checked for the things that are never
+# legitimate in it.
+_INJECTED_CHANNEL = re.compile(
+    r"""(?xi)
+    https?://
+  | www\.[a-z0-9-]+\.[a-z]{2,}
+  | [a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
+  | (?<![\d.]) (?:\+\d{1,3}[\s.-]?)? (?:\(\d{2,4}\)[\s.-]?)? \d{3,4}[\s.-]\d{3,4}(?:[\s.-]\d{3,4})+ (?![\d.])
+    """
+)
+
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer | None:
+    """Turn the model's final answer into one the storefront may render.
+
+    Filtering the selections was not enough. The ids were checked and the prose
+    was not, so an answer could name four experiences, have three of them
+    removed for not existing, and still tell the shopper about all four beside a
+    single card. The message is the part they actually read.
+
+    Nothing here reads the language - it cannot, the shopper may be writing in
+    any of eight. It checks two things that hold whatever the language is: that
+    the model was not trying to present offerings we refused, and that the prose
+    does not carry a channel no tool could have produced. Failing either, the
+    whole answer is declined and the deterministic path replies instead, because
+    a partly-trustworthy answer is not a thing we can hand to a shopper.
+    """
     selections: list[Selection] = []
     for raw in arguments.get("selections", []) or []:
         if not isinstance(raw, dict):
@@ -308,22 +356,37 @@ def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer:
             # The grounding contract: an id no tool returned cannot be rendered,
             # and presenting it would be an unverifiable claim.
             logger.warning("Agent selected an offering no tool returned: %s", experience_id)
-            continue
+            return None
         selections.append(
             Selection(
                 experience_id=experience_id,
                 reason=str(raw.get("reason", "")).strip(),
             )
         )
+
+    message = str(arguments.get("message", "")).strip()
     clarification = arguments.get("clarification")
+    clarification_text = (
+        clarification.strip()
+        if isinstance(clarification, str) and clarification.strip()
+        else None
+    )
+    prose = f"{message}\n{clarification_text or ''}"
+
+    if _INJECTED_CHANNEL.search(prose):
+        logger.warning("Agent prose carried a contact channel no tool returned; declining")
+        return None
+
+    selected = {selection.experience_id for selection in selections}
+    for mentioned in _UUID.findall(prose):
+        if mentioned.lower() not in {item.lower() for item in selected}:
+            logger.warning("Agent prose named an offering it did not select; declining")
+            return None
+
     return AgentAnswer(
-        message=str(arguments.get("message", "")).strip(),
+        message=message,
         selections=selections,
-        clarification=(
-            clarification.strip()
-            if isinstance(clarification, str) and clarification.strip()
-            else None
-        ),
+        clarification=clarification_text,
     )
 
 

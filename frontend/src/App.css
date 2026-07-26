@@ -3395,3 +3395,44 @@
   flex-shrink: 0;
   margin-top: 0.15rem;
 }
+
+/* The assistant answered without its model: it searched, but it could not act.
+   Warning-coloured and directly under the reply, because the failure this
+   describes is invisible - the shopper is looking at a perfectly ordinary list
+   of results that is not the answer to what they asked. */
+.message-degraded {
+  background: #fff6e5;
+  border-left: 3px solid #d98324;
+  border-radius: 0 6px 6px 0;
+  color: #7a4c12;
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+}
+
+/* A constraint the search understood and refused to apply. Distinct from the
+   relaxation notice: that one says what was given up to find results, this one
+   says the shopper's own words were not honoured at all. */
+.unresolved-notice {
+  align-items: flex-start;
+  background: #fff6e5;
+  border: 1px solid #f0d4a4;
+  border-radius: 10px;
+  color: #7a4c12;
+  display: flex;
+  gap: 9px;
+  margin-bottom: 14px;
+  padding: 11px 13px;
+}
+
+.unresolved-notice > svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.unresolved-notice p {
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}

@@ -1,7 +1,12 @@
 import { demoExperiences } from '../data/demo'
 import { formatTime } from './format'
 import { translate } from './i18n'
-import type { LocalizedText, MessageKey } from './i18n'
+import type {
+  LocalizedText,
+  MessageKey,
+  MessageVars,
+  PluralBase,
+} from './i18n'
 import type {
   AssistantAction,
   ContentFieldMeta,
@@ -165,6 +170,82 @@ const assistantProse = (value: unknown): LocalizedText =>
     ? { raw: value }
     : { key: 'assistant.defaultReply' }
 
+// Sentences the assistant service writes for itself rather than relaying from
+// the model. Those cannot be in the shopper's language - the service has no
+// dictionary - so it sends a code and the numbers that go in it, and the words
+// are chosen here. Every one of these lines used to arrive as English prose,
+// including the ones a shopper only ever sees when the model is unreachable.
+const KNOWN_MESSAGE_CODES = new Set([
+  'assistant.msg.searchResults',
+  'assistant.msg.noResults',
+  'assistant.msg.noResults.ask',
+  'assistant.msg.compareNeedsTwo',
+  'assistant.msg.comparison',
+  'assistant.msg.noComplement',
+  'assistant.msg.noComplement.ask',
+  'assistant.msg.complements',
+  'assistant.msg.added',
+  'assistant.msg.checkoutTotal',
+  'assistant.msg.cannotBookYet',
+  'assistant.msg.booked',
+])
+
+/**
+ * The assistant's line, preferring the code over the prose.
+ *
+ * A code the server sends and this build does not know is reported, not
+ * printed: `assistant.msg.added` in a chat bubble is worse than the English
+ * sentence it shipped alongside, so the fallback is the prose.
+ */
+// Codes whose sentence changes with a count, so the wording has to be chosen
+// against the shopper's language rather than by adding an "s".
+const PLURAL_MESSAGE_CODES = new Set([
+  'assistant.msg.searchResults',
+  'assistant.msg.checkoutTotal',
+])
+
+// The service sends an amount and a currency as two plain fields. Pairing them
+// here means the sentence is rendered with the shopper's own separators and
+// symbol placement instead of the server's `1,500,000 VND`.
+const readMessageVars = (value: unknown): MessageVars => {
+  const raw = (value ?? {}) as Record<string, unknown>
+  const vars: MessageVars = {}
+  for (const [name, item] of Object.entries(raw)) {
+    if (name === 'currency') continue
+    if (name === 'total' && typeof item === 'number') {
+      vars.total = {
+        amount: item,
+        currency: String(raw.currency ?? 'VND'),
+      }
+      continue
+    }
+    if (typeof item === 'string' || typeof item === 'number') vars[name] = item
+  }
+  return vars
+}
+
+const assistantMessage = (
+  code: unknown,
+  rawVars: unknown,
+  prose: unknown,
+): LocalizedText => {
+  if (typeof code === 'string' && code) {
+    if (KNOWN_MESSAGE_CODES.has(code)) {
+      const vars = readMessageVars(rawVars)
+      if (PLURAL_MESSAGE_CODES.has(code)) {
+        return {
+          plural: code as PluralBase,
+          count: Number(vars.count ?? 0),
+          vars,
+        }
+      }
+      return { key: code as MessageKey, vars }
+    }
+    reportContractViolation('message_code', code)
+  }
+  return assistantProse(prose)
+}
+
 const normalizeAssistantAction = (
   action: Record<string, unknown>,
 ): AssistantAction => ({
@@ -236,6 +317,26 @@ const readRelaxations = (value: unknown): string[] => {
   for (const code of codes) {
     if (!KNOWN_RELAXATION_CODES.has(code)) {
       reportContractViolation('relaxed_preferences', code)
+    }
+  }
+  return codes
+}
+
+// Constraints the server understood but did not apply. Unlike a relaxation,
+// which the search chose in order to find something, these were refused - so an
+// unknown code is reported and kept rather than dropped: the shopper is better
+// served by a vague warning than by no warning at all.
+const KNOWN_UNRESOLVED_CODES = new Set([
+  'date_unverified',
+  'date_implausible',
+])
+
+const readUnresolved = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  const codes = value.map(String)
+  for (const code of codes) {
+    if (!KNOWN_UNRESOLVED_CODES.has(code) && !code.startsWith('field.')) {
+      reportContractViolation('unresolved_constraints', code)
     }
   }
   return codes
@@ -606,6 +707,7 @@ export const api = {
     intent?: Record<string, unknown>
     effectiveFilters: SearchFilters
     relaxedPreferences: string[]
+    unresolvedConstraints: string[]
     facets: Record<string, Record<string, number>>
     interactionMode: 'assistant' | 'grid' | 'undetermined'
   }> {
@@ -628,6 +730,7 @@ export const api = {
         effectiveFilters:
           (payload.effective_filters as SearchFilters | undefined) ?? filters,
         relaxedPreferences: readRelaxations(payload.relaxed_preferences),
+        unresolvedConstraints: readUnresolved(payload.unresolved_constraints),
         facets:
           (payload.facets as Record<string, Record<string, number>>) ?? {},
         // The server decides whether this request wanted a conversation,
@@ -643,6 +746,7 @@ export const api = {
         items: filterDemoProducts(query, filters),
         effectiveFilters: filters,
         relaxedPreferences: [],
+        unresolvedConstraints: [],
         facets: {},
         // The demo catalogue is a fixture, not a judgement about the shopper.
         interactionMode: 'undetermined',
@@ -775,7 +879,15 @@ export const api = {
       return {
         id: crypto.randomUUID(),
         role: 'assistant',
-        text: assistantProse(response.message ?? response.text),
+        text: assistantMessage(
+          response.message_code,
+          response.message_vars,
+          response.message ?? response.text,
+        ),
+        // The service could not reach the model, so it searched for the text as
+        // written and nothing was added, prepared or booked. Saying so is the
+        // difference between a degraded answer and a wrong one.
+        degraded: response.degraded === true,
         products,
         actions,
         filters: statePatch.filters as SearchFilters | undefined,

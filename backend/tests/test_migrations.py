@@ -16,6 +16,7 @@ locale-aware tsvector trigger still depended on it.
 """
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -245,3 +246,104 @@ async def test_the_upgrade_restores_the_locale_aware_search_objects(migration_da
         "ck_experience_source_type",
         "ck_experience_external_id",
     } <= set(checks)
+
+
+# A schema dump of the database as production actually has it, taken at the
+# revision production is running. It is the one thing a from-scratch build
+# cannot provide: `0001_initial` uses `create_all`, so a fresh database silently
+# acquires every column the *current* models declare, and the round-trip test
+# above - which is a genuinely good test of the later migrations' DDL - still
+# sees the models and the schema agree. A column added to the model with no
+# migration behind it therefore passes every existing check and is missing only
+# where it matters. This file is how the test gets to stand somewhere that has
+# never seen the new model.
+BASELINE_SQL = BACKEND_ROOT / "migrations" / "baseline_0005.sql"
+BASELINE_REVISION = "0005_translation_operations"
+
+
+async def _load_baseline(engine) -> None:
+    statements = "\n".join(
+        line
+        for line in BASELINE_SQL.read_text().splitlines()
+        # psql meta-commands. Keeping the dump loadable without the psql binary
+        # means CI needs no extra tooling to run this.
+        if not line.startswith("\\")
+        # pg_dump empties the search path and schema-qualifies everything it
+        # writes. Left in, sequence defaults come back as
+        # `nextval('public.x_seq')` where the migrations record `nextval('x_seq')`
+        # - the same default, compared unequal.
+        and "set_config('search_path'" not in line
+    )
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(statements)
+
+
+async def test_a_database_at_the_released_revision_upgrades_to_the_models(migration_database):
+    """The check the from-scratch build cannot make.
+
+    Restore the schema a deployed database is running, upgrade it, and require
+    the result to satisfy the models. A model column with no migration behind it
+    fails here and nowhere else.
+    """
+    url, engine = migration_database
+
+    await _load_baseline(engine)
+    _alembic("stamp", BASELINE_REVISION, url=url)
+    _alembic("upgrade", "head", url=url)
+
+    drift = _drift(await _live_columns(engine))
+    assert drift == [], (
+        "these model columns are missing after upgrading a released database, "
+        f"so a migration for them was never written: {drift}"
+    )
+
+
+def _canonical(definition: str) -> str:
+    """One rendering for two spellings of the same constraint.
+
+    Restoring a `pg_dump` and building from `create_all` produce identical
+    CHECK constraints that Postgres prints differently - `ANY (ARRAY['a'::x,
+    ...])` against `ANY ((ARRAY['a', ...])::x[])`. Dropping the casts and the
+    punctuation leaves the part that carries meaning: the column, the operator
+    and the literals. A constraint that really changed still differs here.
+    """
+    for cast in ("::text[]", "::text", "::character varying"):
+        definition = definition.replace(cast, "")
+    return re.sub(r"[()\s]+", "", definition)
+
+
+async def test_upgrading_a_released_database_lands_where_a_fresh_install_does(
+    migration_database,
+):
+    """An upgraded database and a new one must be the same database.
+
+    Drift here is the kind that survives every other check: an index the
+    migration forgot, a default only `create_all` supplies, a type that differs
+    by a length. Each behaves correctly on a machine built from scratch - every
+    developer's, every test run's - and wrongly on the only one with customers.
+
+    This also keeps `baseline_0005.sql` honest. A dump that had drifted forward
+    would stop the upgrade doing any work, and the shapes would part company
+    here.
+    """
+    url, engine = migration_database
+
+    await _load_baseline(engine)
+    _alembic("stamp", BASELINE_REVISION, url=url)
+    _alembic("upgrade", "head", url=url)
+    upgraded = await _shape(engine)
+
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql("DROP SCHEMA public CASCADE")
+        await connection.exec_driver_sql("CREATE SCHEMA public")
+    _alembic("stamp", "base", url=url)
+    _alembic("upgrade", "head", url=url)
+    fresh = await _shape(engine)
+
+    for aspect in ("columns", "indexes"):
+        assert upgraded[aspect] == fresh[aspect], (
+            f"{aspect} differ between an upgraded database and a new one"
+        )
+    assert [_canonical(item) for item in upgraded["constraints"]] == [
+        _canonical(item) for item in fresh["constraints"]
+    ], "constraints differ between an upgraded database and a new one"

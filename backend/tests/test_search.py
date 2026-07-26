@@ -394,3 +394,114 @@ def test_take_rates_come_from_configuration():
     default = margin_fit(product)
     lifted = margin_fit(product, {"Transport ticket": 0.30, "Day trip": 0.18})
     assert lifted > default
+
+
+class TestExclusionsMatchWholeWords:
+    """"No spa" must not remove a planetarium.
+
+    Both search paths tested the shopper's exclusion as a substring - `exclusion
+    in searchable` in memory, `ILIKE '%spa%'` in Postgres - so ruling one thing
+    out silently removed whole categories that merely contained the letters.
+    The shopper saw a shorter list with no explanation, and the words they had
+    used were nowhere near the things that vanished.
+    """
+
+    def test_a_short_exclusion_does_not_swallow_longer_words(self) -> None:
+        from app.search.service import excluded_by
+
+        assert not excluded_by("A quiet space museum and planetarium", ["spa"])
+        assert not excluded_by("Sunrise start from Hoi An", ["art"])
+        assert not excluded_by("Barbecue dinner cruise", ["bar"])
+
+    def test_the_exclusion_still_matches_what_it_names(self) -> None:
+        from app.search.service import excluded_by
+
+        assert excluded_by("Luxury spa and hot spring", ["spa"])
+        # The plural is why the substring test existed; it has to keep working.
+        assert excluded_by("Marble Mountains half-day tour", ["mountain"])
+        assert excluded_by("Water sports at My Khe", ["water sport"])
+
+    def test_an_unaccented_exclusion_matches_accented_content(self) -> None:
+        from app.search.service import excluded_by
+
+        assert excluded_by("Tour núi Bà Nà", ["nui"])
+
+    def test_both_backends_are_given_the_same_definition(self) -> None:
+        """The in-memory path and the SQL path must rule out the same things.
+
+        They are separate implementations of one rule, and a disagreement
+        between them is invisible: the demo store would exclude a product that
+        production kept, with every test passing.
+        """
+        import re
+
+        from app.search.postgres import exclusion_patterns
+        from app.search.service import excluded_by
+
+        cases = [
+            ("A quiet space museum", "spa", False),
+            ("Luxury spa and hot spring", "spa", True),
+            ("Marble Mountains half-day tour", "mountain", True),
+            ("Sunrise start from Hoi An", "art", False),
+            ("Water sports at My Khe", "water sport", True),
+        ]
+        for text_value, term, expected in cases:
+            assert excluded_by(text_value, [term]) is expected, (text_value, term)
+            # Postgres applies `unaccent` before matching; `tokenize` folds the
+            # accents itself, so the Python-side stand-in does the same.
+            pattern = exclusion_patterns([term])[0].replace(r"\m", r"\b").replace(r"\M", r"\b")
+            folded = " ".join(_tokenize(text_value))
+            assert bool(re.search(pattern, folded, re.I)) is expected, (text_value, term)
+
+
+def _tokenize(text_value: str) -> list[str]:
+    from app.common.ranking import tokenize
+
+    return tokenize(text_value)
+
+
+class TestRelaxationOrderIsNotOurs:
+    """Which constraint a shopper can most afford to lose is their judgement.
+
+    The order was a fixed tuple here, so the search decided on everyone's behalf
+    that the language their guide speaks matters more than their budget. The
+    order is now something the caller can state - the agent fills it from what
+    the shopper actually said - and the default only applies when nobody has.
+    """
+
+    @staticmethod
+    def _filters(**overrides: object) -> SearchFilters:
+        return SearchFilters(
+            max_total_price=1.0,
+            language="klingon",
+            **overrides,  # type: ignore[arg-type]
+        )
+
+    def test_the_default_order_is_unchanged_when_nobody_states_one(self) -> None:
+        from app.search.service import relax_until_results
+
+        _, _, relaxed, _ = relax_until_results([], self._filters(), [])
+        # `language` comes before `budget` in the default sequence.
+        assert relaxed.index("language") < relaxed.index("budget")
+
+    def test_a_stated_order_is_honoured(self) -> None:
+        from app.search.service import relax_until_results
+
+        _, _, relaxed, _ = relax_until_results(
+            [], self._filters(), [], order=["budget", "language"]
+        )
+        assert relaxed.index("budget") < relaxed.index("language")
+
+    def test_an_unknown_code_does_not_discard_the_rest(self) -> None:
+        """The order comes from a model, so it can name something that is gone."""
+        from app.search.service import relax_until_results
+
+        _, _, relaxed, _ = relax_until_results(
+            [], self._filters(), [], order=["not_a_constraint"]
+        )
+        assert set(relaxed) == {"language", "budget"}
+
+    def test_candidates_are_reported_so_the_shopper_can_be_asked(self) -> None:
+        from app.search.service import relaxation_candidates
+
+        assert set(relaxation_candidates(self._filters())) == {"language", "budget"}

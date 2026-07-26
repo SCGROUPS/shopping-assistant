@@ -140,6 +140,36 @@ class TestDatesSurviveTheLanguageTheyWereWrittenIn:
         dropped = sanitize_intent("hoi an lantern tour", self._intent_with_date("next weekend"))
         assert not dropped.hard_constraints
 
+    def test_a_dropped_date_is_reported_rather_than_discarded(self) -> None:
+        """Refusing a constraint is allowed. Refusing it in silence is not.
+
+        The shopper was specific about a date. If we will not honour it they see
+        results for other days with nothing to distinguish that from an answer,
+        and no way to discover which of their words we ignored. So every refusal
+        leaves a code behind, and the storefront says it in their language.
+        """
+        unverified = sanitize_intent(
+            "hoi an lantern tour", self._intent_with_date("next weekend")
+        )
+        assert unverified.dropped_constraints == ["date_unverified"]
+
+        implausible = SearchIntent(
+            search_text="tour",
+            hard_constraints=[
+                {"field": "visit_start", "operator": "gte", "value": "1999-01-01"}
+            ],
+            date_phrase="tomorrow",
+        )
+        result = sanitize_intent("hoi an tour tomorrow", implausible)
+        assert not result.hard_constraints
+        assert result.dropped_constraints == ["date_implausible"]
+
+    def test_a_kept_date_reports_nothing(self) -> None:
+        """The signal has to be absent when nothing was dropped, or it is noise."""
+        kept = sanitize_intent("tour Hội An ngày mai", self._intent_with_date("ngày mai"))
+        assert kept.hard_constraints
+        assert kept.dropped_constraints == []
+
     def test_a_date_with_no_quote_is_dropped(self) -> None:
         dropped = sanitize_intent("hoi an lantern tour", self._intent_with_date(None))
         assert not dropped.hard_constraints

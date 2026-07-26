@@ -94,18 +94,27 @@ def test_final_answer_ties_each_claim_to_an_offering() -> None:
 
 
 def test_agent_cannot_present_an_offering_no_tool_returned() -> None:
-    """Grounding: an invented id is dropped rather than rendered."""
-    answer = _build_answer(
-        {
-            "message": "Try these.",
-            "selections": [
-                {"experience_id": "real-1", "reason": "on the water"},
-                {"experience_id": "hallucinated", "reason": "invented"},
-            ],
-        },
-        offered={"real-1"},
+    """Grounding: an invented id sinks the whole answer, not just its own card.
+
+    This used to keep the good selection and drop the invented one, which read
+    as the safe choice and was not: `message` still described both, so the
+    shopper was told about two experiences and shown one card, with no way to
+    tell which half was real. The prose cannot be repaired without reading it,
+    so the answer is declined and the deterministic path replies instead.
+    """
+    assert (
+        _build_answer(
+            {
+                "message": "Try these.",
+                "selections": [
+                    {"experience_id": "real-1", "reason": "on the water"},
+                    {"experience_id": "hallucinated", "reason": "invented"},
+                ],
+            },
+            offered={"real-1"},
+        )
+        is None
     )
-    assert [s.experience_id for s in answer.selections] == ["real-1"]
 
 
 def test_agent_answer_keeps_reasons_and_clarification() -> None:
@@ -219,3 +228,172 @@ def test_shopping_tools_exclude_the_answer_tool() -> None:
     """final_answer ends the loop; it is not a catalogue capability."""
     assert FINAL_ANSWER not in SHOPPING_TOOLS
     assert FINAL_ANSWER in AGENT_TOOLS
+
+
+async def test_the_agent_cannot_prepare_and_confirm_in_one_turn(store: DemoStore) -> None:
+    """A yes cannot answer a total the shopper has not been shown.
+
+    The agent may call several tools before it replies, so `prepare_checkout`
+    followed by `confirm_simulated_checkout` in the same turn sets the pending
+    state and then satisfies it, and the attestation is about a summary that
+    never left the server. Catalogue text can steer the agent; it cannot make
+    the shopper send another message, which is why the turn boundary is the
+    part worth enforcing.
+    """
+    from app.assistant.provider import AgentAnswer, DemoAIProvider
+    from app.assistant.service import AssistantService
+
+    class PrepareThenConfirm(DemoAIProvider):
+        def __init__(self):
+            self.prepared = None
+            self.outcome = None
+
+        async def run_agent(self, text, state, execute):
+            if text == "fill the cart":
+                found = await execute("search_experiences", {"query": "hoi an"})
+                await execute(
+                    "add_to_cart",
+                    {"experience_id": found["items"][0]["experience_id"]},
+                )
+                return AgentAnswer(message="added")
+            self.prepared = await execute("prepare_checkout", {})
+            self.outcome = await execute(
+                "confirm_simulated_checkout", {"shopper_confirmed": True}
+            )
+            return AgentAnswer(message="done")
+
+    agent = PrepareThenConfirm()
+    service = AssistantService(data=store, ai_provider=agent)
+    conversation = await service.create("one-turn-checkout", ConversationCreate())
+    await service.respond(
+        conversation["id"], "one-turn-checkout", MessageRequest(message="fill the cart")
+    )
+    await service.respond(
+        conversation["id"], "one-turn-checkout", MessageRequest(message="book it")
+    )
+
+    # Without a real cart `prepare_checkout` fails and the confirmation is
+    # refused for the wrong reason, which would pass this test while proving
+    # nothing.
+    assert "error" not in (agent.prepared or {}), agent.prepared
+    assert conversation["state"]["pending_action"] == "CONFIRM_CHECKOUT"
+    assert agent.outcome.get("error") == "confirmation-required", agent.outcome
+    assert conversation["state"].get("booking_id") is None
+
+
+async def test_a_confirmation_in_a_later_turn_is_honoured(store: DemoStore) -> None:
+    """The gate must not be a wall: a shopper who is shown a total and says yes
+    in their own words still books."""
+    from app.assistant.provider import AgentAnswer, DemoAIProvider
+    from app.assistant.service import AssistantService
+
+    class Scripted(DemoAIProvider):
+        def __init__(self):
+            self.prepared = None
+            self.outcome = None
+
+        async def run_agent(self, text, state, execute):
+            if text == "fill the cart":
+                found = await execute("search_experiences", {"query": "hoi an"})
+                await execute(
+                    "add_to_cart",
+                    {"experience_id": found["items"][0]["experience_id"]},
+                )
+                return AgentAnswer(message="added")
+            if text == "checkout":
+                self.prepared = await execute("prepare_checkout", {})
+                return AgentAnswer(message="here is your total")
+            self.outcome = await execute(
+                "confirm_simulated_checkout", {"shopper_confirmed": True}
+            )
+            return AgentAnswer(message="booked")
+
+    agent = Scripted()
+    service = AssistantService(data=store, ai_provider=agent)
+    conversation = await service.create("later-turn-checkout", ConversationCreate())
+    await service.respond(
+        conversation["id"], "later-turn-checkout", MessageRequest(message="fill the cart")
+    )
+    await service.respond(
+        conversation["id"], "later-turn-checkout", MessageRequest(message="checkout")
+    )
+    await service.respond(
+        conversation["id"], "later-turn-checkout", MessageRequest(message="đúng rồi, đặt đi")
+    )
+
+    assert "error" not in (agent.prepared or {}), agent.prepared
+    assert agent.outcome is not None
+    assert "error" not in agent.outcome, agent.outcome
+
+
+class TestGroundedProse:
+    """The message is the part the shopper reads, and it was never checked.
+
+    Selections were filtered by id, so an offering that did not exist could not
+    be rendered as a card. The prose beside the cards was passed through
+    untouched, which meant the model could describe four experiences, have three
+    silently removed, and leave the shopper reading about options that were not
+    there - or repeat a payment link out of catalogue text it had been told was
+    untrusted data.
+    """
+
+    @staticmethod
+    def _answer(**arguments: object):
+        from app.assistant.provider import _build_answer
+
+        return _build_answer(dict(arguments), {"11111111-1111-1111-1111-111111111111"})
+
+    def test_a_grounded_answer_is_kept(self) -> None:
+        answer = self._answer(
+            message="The sunrise cruise fits your morning.",
+            selections=[
+                {
+                    "experience_id": "11111111-1111-1111-1111-111111111111",
+                    "reason": "Departs at 06:00.",
+                }
+            ],
+        )
+        assert answer is not None
+        assert len(answer.selections) == 1
+
+    def test_an_offering_no_tool_returned_declines_the_whole_answer(self) -> None:
+        """Dropping the selection and keeping the sentence about it is worse.
+
+        The shopper would be told about an experience and shown no card for it,
+        with nothing anywhere saying which of the two was wrong.
+        """
+        assert (
+            self._answer(
+                message="Here are two great options for your trip.",
+                selections=[
+                    {"experience_id": "11111111-1111-1111-1111-111111111111"},
+                    {"experience_id": "22222222-2222-2222-2222-222222222222"},
+                ],
+            )
+            is None
+        )
+
+    def test_a_payment_link_in_the_prose_declines_the_answer(self) -> None:
+        for prose in (
+            "Book directly at https://cheap-tickets.example for a discount.",
+            "Email bookings@not-vietra.example to pay less.",
+            "Call +84 912 345 678 to confirm your seat.",
+        ):
+            assert self._answer(message=prose, selections=[]) is None, prose
+
+    def test_a_clarification_can_also_carry_an_injection(self) -> None:
+        assert (
+            self._answer(
+                message="Which morning suits you?",
+                clarification="Reply here or at www.not-vietra.example",
+                selections=[],
+            )
+            is None
+        )
+
+    def test_ordinary_prices_and_times_are_not_mistaken_for_a_phone_number(self) -> None:
+        answer = self._answer(
+            message="Two options, 3 hours each, from 1,500,000 VND, departing 08:30.",
+            selections=[{"experience_id": "11111111-1111-1111-1111-111111111111"}],
+        )
+        assert answer is not None

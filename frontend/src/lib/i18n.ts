@@ -12,7 +12,7 @@
 // sentence - which is the failure this file exists to prevent and the one that
 // a runtime `?? fallback` would hide.
 
-import { bcp47 } from './format'
+import { bcp47, formatMoney } from './format'
 
 const en = {
   'nav.experiences': 'Experiences',
@@ -320,6 +320,39 @@ const en = {
   'assistant.welcome':
     'Xin chào! I can turn a few preferences into a thoughtful Central Vietnam plan. I will check timing, travel fit, and availability before you book.',
   'assistant.defaultReply': 'I found a few experiences that fit.',
+
+  // Sentences the assistant service composes itself, sent as codes because the
+  // service has no dictionary. Everything counted or priced is rendered here so
+  // it follows the shopper's own conventions.
+  'unresolved.date_unverified':
+    'I could not confirm the date you mentioned, so these results are not limited to it. Please pick your dates in the filters.',
+  'unresolved.date_implausible':
+    'The date I read did not look like a date you could book, so these results are not limited to it. Please pick your dates in the filters.',
+  'assistant.degraded':
+    'I could not reach my planning model, so I searched for what you wrote. I could not add anything to your cart, prepare a checkout or book. Please try again in a moment.',
+  'assistant.msg.searchResults_one': 'I found one option that fits.',
+  'assistant.msg.searchResults_other':
+    'I found {count} options that fit. The first ones match your request most closely.',
+  'assistant.msg.noResults':
+    'Nothing is bookable even after I widened your dates and set aside the optional preferences. I kept your accessibility needs and everything you ruled out.',
+  'assistant.msg.noResults.ask':
+    'Would you like to change the destination or the travel dates?',
+  'assistant.msg.compareNeedsTwo':
+    'Please search for at least two experiences before asking me to compare.',
+  'assistant.msg.comparison': 'Here is a fact-based comparison of the leading options.',
+  'assistant.msg.noComplement':
+    'I could not find a complementary experience that is still bookable for your dates and party.',
+  'assistant.msg.noComplement.ask': 'Shall I look at nearby dates?',
+  'assistant.msg.complements': 'These options complement your current choice.',
+  'assistant.msg.added': 'Added {title} to your cart. The simulated total is {total}.',
+  'assistant.msg.checkoutTotal_one':
+    'Final simulated total for one item: {total}. No real payment will be taken. Confirm and I will create the booking and your QR voucher.',
+  'assistant.msg.checkoutTotal_other':
+    'Final simulated total for {count} items: {total}. No real payment will be taken. Confirm and I will create the booking and your QR voucher.',
+  'assistant.msg.cannotBookYet':
+    'I cannot book yet. Ask me to prepare the checkout first so you can review the total.',
+  'assistant.msg.booked':
+    'Your simulated booking {booking} is confirmed. Voucher {voucher} is ready.',
   'assistant.reserveFailed':
     'I could not reserve {title} because its availability changed. Please choose another time or experience.',
   'assistant.addedToTrip':
@@ -684,6 +717,33 @@ const vi: Dictionary = {
   'assistant.welcome':
     'Xin chào! Chỉ với một vài sở thích, tôi có thể dựng nên một hành trình miền Trung chu đáo. Tôi sẽ kiểm tra thời gian, mức độ phù hợp và tình trạng chỗ trước khi bạn đặt.',
   'assistant.defaultReply': 'Tôi tìm được một vài trải nghiệm phù hợp.',
+
+  'unresolved.date_unverified':
+    'Tôi chưa xác nhận được ngày bạn nhắc tới, nên kết quả này không giới hạn theo ngày đó. Vui lòng chọn ngày trong bộ lọc.',
+  'unresolved.date_implausible':
+    'Ngày tôi đọc được không giống một ngày có thể đặt, nên kết quả này không giới hạn theo ngày đó. Vui lòng chọn ngày trong bộ lọc.',
+  'assistant.degraded':
+    'Tôi chưa kết nối được tới mô hình lập kế hoạch, nên tôi chỉ tìm theo đúng nội dung bạn viết. Tôi chưa thể thêm vào giỏ, chuẩn bị thanh toán hay đặt chỗ. Vui lòng thử lại sau giây lát.',
+  'assistant.msg.searchResults_other':
+    'Tôi tìm được {count} lựa chọn phù hợp. Những lựa chọn đầu tiên sát với yêu cầu của bạn nhất.',
+  'assistant.msg.noResults':
+    'Không còn chỗ nào có thể đặt, ngay cả khi tôi đã nới rộng ngày và tạm bỏ các sở thích không bắt buộc. Tôi vẫn giữ nguyên nhu cầu tiếp cận và những điều bạn muốn loại trừ.',
+  'assistant.msg.noResults.ask': 'Bạn có muốn đổi điểm đến hoặc ngày đi không?',
+  'assistant.msg.compareNeedsTwo':
+    'Vui lòng tìm ít nhất hai trải nghiệm trước khi nhờ tôi so sánh.',
+  'assistant.msg.comparison':
+    'Đây là bảng so sánh dựa trên dữ liệu thực tế của những lựa chọn nổi bật.',
+  'assistant.msg.noComplement':
+    'Tôi chưa tìm được trải nghiệm bổ sung nào còn chỗ cho ngày và số khách của bạn.',
+  'assistant.msg.noComplement.ask': 'Tôi tìm thử những ngày gần đó nhé?',
+  'assistant.msg.complements': 'Những lựa chọn này bổ sung tốt cho trải nghiệm bạn đang chọn.',
+  'assistant.msg.added': 'Đã thêm {title} vào giỏ. Tổng tiền mô phỏng là {total}.',
+  'assistant.msg.checkoutTotal_other':
+    'Tổng tiền mô phỏng cho {count} mục: {total}. Sẽ không có khoản thanh toán thật nào. Bạn xác nhận thì tôi sẽ tạo đơn đặt và phiếu QR.',
+  'assistant.msg.cannotBookYet':
+    'Tôi chưa thể đặt chỗ. Hãy yêu cầu tôi chuẩn bị thanh toán trước để bạn xem lại tổng tiền.',
+  'assistant.msg.booked':
+    'Đơn đặt mô phỏng {booking} của bạn đã được xác nhận. Phiếu {voucher} đã sẵn sàng.',
   'assistant.reserveFailed':
     'Tôi không thể giữ chỗ {title} vì tình trạng chỗ đã thay đổi. Vui lòng chọn khung giờ hoặc trải nghiệm khác.',
   'assistant.addedToTrip':
@@ -738,7 +798,21 @@ const vi: Dictionary = {
 
 const dictionaries: Record<string, Dictionary> = { en, vi }
 
-export type MessageVars = Record<string, string | number>
+/**
+ * A money amount that has not been formatted yet, because it cannot be until
+ * the locale is known. The assistant service sends the number and the currency;
+ * where the grouping separators go, and whether the symbol leads or trails, is
+ * the shopper's convention and not the server's.
+ */
+export type MoneyVar = { amount: number; currency: string }
+
+export type MessageVars = Record<string, string | number | MoneyVar>
+
+const isMoney = (value: unknown): value is MoneyVar =>
+  typeof value === 'object' &&
+  value !== null &&
+  typeof (value as MoneyVar).amount === 'number' &&
+  typeof (value as MoneyVar).currency === 'string'
 
 const PLURAL_KEY = /^(.*)_(zero|one|two|few|many|other)$/
 
@@ -754,18 +828,26 @@ const pluralCategories = (locale: string): string[] => {
   }
 }
 
-const interpolate = (template: string, vars?: MessageVars): string =>
+const interpolate = (
+  locale: string,
+  template: string,
+  vars?: MessageVars,
+): string =>
   vars
-    ? template.replace(/\{(\w+)\}/g, (whole, name: string) =>
-        name in vars ? String(vars[name]) : whole,
-      )
+    ? template.replace(/\{(\w+)\}/g, (whole, name: string) => {
+        if (!(name in vars)) return whole
+        const value = vars[name]
+        return isMoney(value)
+          ? formatMoney(locale, value.currency, value.amount)
+          : String(value)
+      })
     : template
 
 export const translate = (
   locale: string,
   key: MessageKey,
   vars?: MessageVars,
-): string => interpolate(dictionaries[locale]?.[key] ?? en[key], vars)
+): string => interpolate(locale, dictionaries[locale]?.[key] ?? en[key], vars)
 
 /**
  * Text that has not been rendered yet, and therefore still has a language.
@@ -783,10 +865,18 @@ export const translate = (
  */
 export type LocalizedText =
   | { key: MessageKey; vars?: MessageVars }
+  // A counted sentence. The category has to be chosen against the locale, which
+  // is only known at render, so the count travels with the text rather than
+  // being resolved where the message is built.
+  | { plural: PluralBase; count: number; vars?: MessageVars }
   | { raw: string }
 
-export const resolveText = (locale: string, text: LocalizedText): string =>
-  'raw' in text ? text.raw : translate(locale, text.key, text.vars)
+export const resolveText = (locale: string, text: LocalizedText): string => {
+  if ('raw' in text) return text.raw
+  if ('plural' in text)
+    return translatePlural(locale, text.plural, text.count, text.vars)
+  return translate(locale, text.key, text.vars)
+}
 
 // The bases of the counted messages, derived from the `_other` form every
 // language has. Typed from the dictionary so a mistyped base is a build error.
@@ -816,7 +906,7 @@ export const translatePlural = (
     // missing `_many` is English's `_other`, not a lookup that returns nothing.
     en[key as MessageKey] ??
     en[`${base}_other` as MessageKey]
-  return interpolate(template ?? base, { count, ...vars })
+  return interpolate(locale, template ?? base, { count, ...vars })
 }
 
 // Which keys a locale has not yet been given. The enablement decision is made

@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   ArrowRight,
   Bot,
   CalendarDays,
@@ -45,7 +46,7 @@ import {
 } from './lib/api'
 import { formatCount, formatDate as intlDate, formatMoney } from './lib/format'
 import { LocaleProvider } from './lib/LocaleContext'
-import { relaxationSentence } from './lib/badges'
+import { relaxationSentence, unresolvedLabels } from './lib/badges'
 import { buildTranslator } from './lib/useLocale'
 import type { Translator } from './lib/useLocale'
 import { chromeReady, isFallback, resolveText, translate } from './lib/i18n'
@@ -203,6 +204,9 @@ function App() {
   }>({ query: '', filters: {}, resultIds: [] })
   const viewedIds = useRef<string[]>([])
   const [relaxedPreferences, setRelaxedPreferences] = useState<string[]>([])
+  const [unresolvedConstraints, setUnresolvedConstraints] = useState<string[]>(
+    [],
+  )
   const [facets, setFacets] = useState<Record<string, Record<string, number>>>(
     {},
   )
@@ -302,6 +306,7 @@ function App() {
         setProducts(catalogue)
         if (searched) {
           setRelaxedPreferences(searched.relaxedPreferences)
+          setUnresolvedConstraints(searched.unresolvedConstraints)
           setFacets(searched.facets)
           setSearchContext({
             query,
@@ -633,6 +638,7 @@ function App() {
       }
       setProducts(result.items)
       setRelaxedPreferences(result.relaxedPreferences)
+      setUnresolvedConstraints(result.unresolvedConstraints)
       setFacets(result.facets)
       setSearchContext({
         query: searchQuery,
@@ -1488,6 +1494,13 @@ function App() {
               >
                 {t('app.filter.clear')}
               </button>
+            </div>
+          )}
+
+          {unresolvedConstraints.length > 0 && (
+            <div className="unresolved-notice" role="status">
+              <AlertTriangle size={16} />
+              <p>{unresolvedLabels(unresolvedConstraints, t).join(' ')}</p>
             </div>
           )}
 

@@ -51,6 +51,12 @@ class SearchRequest(BaseModel):
     # tell them apart, and would override a session's chosen Vietnamese with an
     # English nobody requested.
     locale: str | None = None
+    # Which constraints to give up first when nothing matches, most expendable
+    # first. Empty means the search has not been told, and falls back to a
+    # default order - which is what used to be the only behaviour, so the search
+    # decided on every shopper's behalf that their budget mattered less to them
+    # than the language their guide speaks. Codes, from `relaxation_candidates`.
+    relax_order: list[str] = Field(default_factory=list)
 
 
 class IntentValue(BaseModel):
@@ -84,6 +90,11 @@ class SearchIntent(BaseModel):
     # the model and then silently deleted here. Checking that the quote really
     # occurs in the request catches an invented date in any language.
     date_phrase: str | None = None
+    # Constraints the sanitizer refused to apply, as codes. A dropped date used
+    # to vanish without trace: the shopper typed one, the search ignored it, and
+    # the results looked like an ordinary answer. Whatever we will not honour
+    # has to be said out loud, and a code can be said in any language.
+    dropped_constraints: list[str] = Field(default_factory=list)
     needs_clarification: bool = False
     clarification_question: str | None = None
 
@@ -218,6 +229,23 @@ class SearchResponse(BaseModel):
             "Codes for the constraints that were relaxed to find results, in the "
             "order they were given up. Codes, not prose: the client renders them "
             "in the shopper's language."
+        ),
+    )
+    relaxation_candidates: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Codes for constraints still in force that could be given up if the "
+            "shopper wants more results. Offered so the choice can be theirs "
+            "rather than a fixed order decided here."
+        ),
+    )
+    unresolved_constraints: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Codes for constraints that were understood but not applied, either "
+            "because they could not be verified or because this build does not "
+            "know the field. The client tells the shopper, so a filter is never "
+            "dropped in silence."
         ),
     )
     # Lifted out of `intent` onto the envelope: the client needs it on every
@@ -358,6 +386,20 @@ class AssistantProduct(ExperienceCard):
 
 class AssistantResponse(BaseModel):
     message: str
+    # When the assistant speaks for itself rather than relaying the model, the
+    # sentence is written here as a code the client renders from the shopper's
+    # own dictionary. `message` keeps the English so a non-UI consumer still
+    # gets something, but a storefront that has a code must prefer it: every one
+    # of these lines used to reach a Vietnamese shopper in English, and they are
+    # exactly the lines that appear when the model is unavailable - the moment a
+    # shopper is least able to work around them.
+    message_code: str | None = None
+    message_vars: dict[str, Any] = Field(default_factory=dict)
+    clarification_code: str | None = None
+    # True when the assistant answered without the model. It can still search,
+    # but it cannot act, and saying so is better than appearing to ignore a
+    # request to book.
+    degraded: bool = False
     state_patch: dict[str, Any] = Field(default_factory=dict)
     products: list[AssistantProduct] = Field(default_factory=list)
     comparison: dict[str, Any] | None = None

@@ -74,8 +74,11 @@ jobs:
           POSTGRES_TEST_DATABASE_URL: postgresql+psycopg://vietra:vietra@127.0.0.1:5432/vietra_test
         run: |
           uv sync --dev --locked
-          uv run pytest -q
+          # Lint first. It takes seconds and used to run after the test suite,
+          # so a misplaced import was reported minutes late, behind a run that
+          # had already done all its work.
           uv run ruff check .
+          uv run pytest -q
           uv run pyright
 
       # Types and unit tests cannot tell you the answers got worse. This can:

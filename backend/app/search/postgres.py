@@ -1,10 +1,34 @@
 import json
+import re
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.locales import text_search_config
+from app.common.ranking import tokenize
+
+
+def exclusion_patterns(exclusions: list[str]) -> list[str]:
+    """Word-boundary regexes for what the shopper ruled out.
+
+    Built here rather than in SQL so the escaping is done once, in a language
+    with a regex escaper: these terms come from the model reading the shopper,
+    and a `(` in one of them must be a bracket and not a capture group.
+
+    The shape mirrors `excluded_by` in the in-memory path exactly - tokenised,
+    accent-folded, English plural allowed on the last word only - because two
+    search backends that disagree about what "no spa" means is a defect a test
+    cannot see and a shopper cannot explain.
+    """
+    patterns: list[str] = []
+    for exclusion in exclusions:
+        terms = tokenize(exclusion)
+        if not terms:
+            continue
+        body = r"\s+".join(re.escape(term) for term in terms)
+        patterns.append(rf"\m{body}(s|es)?\M")
+    return patterns
 
 HYBRID_SEARCH_SQL = text(
     """
@@ -72,12 +96,18 @@ HYBRID_SEARCH_SQL = text(
             WHERE lower(supported_language) = lower(CAST(:language AS text))
           )
         )
+        -- Whole words, not substrings. This was ILIKE '%spa%', which also
+        -- removed every experience whose description mentioned a *space*, and
+        -- '%art%' removed anything that *started* anywhere. The patterns are
+        -- built and escaped in Python so both search paths rule the same things
+        -- out; `unaccent` on the haystack matches tokenize()'s accent folding,
+        -- so a shopper typing `nui` still excludes `Núi`.
         AND (
-          coalesce(cardinality(CAST(:exclusions AS text[])), 0) = 0
+          coalesce(cardinality(CAST(:exclusion_patterns AS text[])), 0) = 0
           OR NOT EXISTS (
             SELECT 1
-            FROM unnest(CAST(:exclusions AS text[])) exclusion
-            WHERE concat_ws(
+            FROM unnest(CAST(:exclusion_patterns AS text[])) exclusion_pattern
+            WHERE unaccent(concat_ws(
               ' ',
               e.title,
               e.short_description,
@@ -85,7 +115,7 @@ HYBRID_SEARCH_SQL = text(
               e.category,
               array_to_string(e.subcategories, ' '),
               array_to_string(e.interest_tags, ' ')
-            ) ILIKE ('%' || exclusion || '%')
+            )) ~* exclusion_pattern
           )
         )
         AND (
@@ -245,7 +275,7 @@ async def hybrid_search(
             "max_total_price": max_total_price,
             "accessibility": accessibility,
             "language": language,
-            "exclusions": exclusions,
+            "exclusion_patterns": exclusion_patterns(exclusions or []),
             "visit_start": visit_start,
             "visit_end": visit_end,
             "party": json.dumps(party or [{"type": "adult", "count": 1}]),

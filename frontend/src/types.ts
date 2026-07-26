@@ -127,6 +127,11 @@ export type AssistantMessage = {
   products?: Experience[]
   actions?: AssistantAction[]
   filters?: SearchFilters
+  // The assistant answered without the model: it could search, but it could not
+  // add to a cart, prepare a checkout or book. Rendered as a notice next to the
+  // reply, because otherwise a shopper whose request was never carried out sees
+  // only a list of results and no reason to doubt it.
+  degraded?: boolean
   timestamp: Date
 }
 

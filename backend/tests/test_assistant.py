@@ -84,7 +84,10 @@ async def test_assistant_requires_explicit_confirmation(client: AsyncClient, pla
         json={"message": "Add the first one to cart"},
     )
     assert added.status_code == 200
-    assert "Added" in added.json()["message"]
+    # Assert on the code, not the English. A test that reads the prose is a test
+    # that has to be rewritten the day the sentence is translated, and it proves
+    # nothing about what a Vietnamese shopper is shown.
+    assert added.json()["message_code"] == "assistant.msg.added"
 
     premature_conversation = await client.post("/api/v1/conversations", json={})
     premature_id = premature_conversation.json()["id"]
@@ -92,18 +95,20 @@ async def test_assistant_requires_explicit_confirmation(client: AsyncClient, pla
         f"/api/v1/conversations/{premature_id}/messages?stream=false",
         json={"message": "confirm"},
     )
-    assert "cannot book yet" in premature.json()["message"]
+    assert premature.json()["message_code"] == "assistant.msg.cannotBookYet"
 
     prepared = await client.post(
         f"/api/v1/conversations/{conversation_id}/messages?stream=false",
         json={"message": "prepare checkout"},
     )
-    assert "Reply exactly" in prepared.json()["message"]
+    assert prepared.json()["message_code"] == "assistant.msg.checkoutTotal"
+    assert prepared.json()["message_vars"]["count"] >= 1
     confirmed = await client.post(
         f"/api/v1/conversations/{conversation_id}/messages?stream=false",
         json={"message": "confirm"},
     )
-    assert "is confirmed" in confirmed.json()["message"]
+    assert confirmed.json()["message_code"] == "assistant.msg.booked"
+    assert confirmed.json()["message_vars"]["voucher"]
     assert confirmed.json()["state_patch"]["booking_id"]
 
 
@@ -315,3 +320,27 @@ async def test_an_offering_outside_the_results_is_refused(client: AsyncClient, p
         json={"message": "add that one"},
     )
     assert added.status_code == 409
+
+
+async def test_the_shopper_is_told_when_the_assistant_cannot_act(client: AsyncClient):
+    """An outage must not look like an answer.
+
+    With no model there is no plan, and the only thing the assistant can do is
+    search for the text as written. It used to do exactly that and say nothing:
+    a shopper asking to add something to their cart got a list of search
+    results, phrased as though it were the reply to their request, with the cart
+    untouched. The results are still worth showing - but the client has to be
+    able to tell the shopper that the thing they asked for did not happen.
+    """
+    conversation = await client.post("/api/v1/conversations", json={})
+    conversation_id = conversation.json()["id"]
+    reply = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages?stream=false",
+        json={"message": "add the sunrise cruise to my cart"},
+    )
+    body = reply.json()
+    assert body["degraded"] is True
+    # And the sentence it did produce is a code, not English prose, because the
+    # shopper this protects is the one who is not reading English.
+    assert body["message_code"] == "assistant.msg.searchResults"
+    assert body["message_vars"]["count"] == len(body["products"])

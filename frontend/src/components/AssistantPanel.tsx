@@ -182,6 +182,11 @@ export function AssistantPanel({
                   </button>
                 )}
               </div>
+              {message.degraded && (
+                <p className="message-degraded" role="status">
+                  {t('assistant.degraded')}
+                </p>
+              )}
               {message.products && message.products.length > 0 && (
                 <div className="assistant-product-stack">
                   {message.products.slice(0, 3).map((product) => {

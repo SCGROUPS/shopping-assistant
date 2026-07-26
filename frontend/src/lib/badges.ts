@@ -75,6 +75,20 @@ export const relaxationLabels = (codes: string[], t: Translator): string[] =>
 
 // Joining with ", " is an English habit. Vietnamese, Japanese and German each
 // punctuate a list differently, and the platform already knows how.
+// A constraint the search understood and refused. The shopper is told which
+// one, because the alternative - results that quietly ignore the single thing
+// they were most specific about - is indistinguishable from a correct answer.
+const UNRESOLVED_KEYS: Record<string, MessageKey> = {
+  date_unverified: 'unresolved.date_unverified',
+  date_implausible: 'unresolved.date_implausible',
+}
+
+export const unresolvedLabels = (codes: string[], t: Translator): string[] =>
+  codes
+    .map((code) => UNRESOLVED_KEYS[code])
+    .filter((key): key is MessageKey => Boolean(key))
+    .map((key) => t(key))
+
 export const relaxationSentence = (
   codes: string[],
   locale: string,
