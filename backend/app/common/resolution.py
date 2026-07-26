@@ -24,19 +24,17 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.common.field_policy import fields_never_served_stale
+from app.common.field_policy import fields_never_served_stale, translated_fields
 from app.common.locales import DEFAULT_LOCALE, fallback_chain
 from app.common.models import Experience, ExperienceTranslation, TranslationField
 
-# The four free-text fields on an experience. Everything else is either
+# The free-text fields on an experience: everything else is either
 # language-neutral (price, coordinates, duration) or taxonomy, which is
-# translated through labels rather than prose (spec 4.2).
-TRANSLATED_FIELDS: tuple[str, ...] = (
-    "title",
-    "short_description",
-    "description",
-    "meeting_point",
-)
+# translated through labels rather than prose (spec 4.2). Derived from the
+# policy registry rather than listed again here - a field enqueued for
+# translation but never resolved, or resolved but never enqueued, shows up
+# only as text permanently in the wrong language, with nothing failing.
+TRANSLATED_FIELDS: tuple[str, ...] = translated_fields()
 
 # Where a string came from. Origin only - whether it is *current* is a
 # separate fact, and whether it is the shopper's own language is a third.

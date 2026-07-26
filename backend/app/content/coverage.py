@@ -20,10 +20,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from datetime import date
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.config import get_settings
@@ -196,15 +195,23 @@ async def _attach_queue_state(session: AsyncSession, reports: dict[str, LocaleCo
 
 
 async def spend_today(session: AsyncSession) -> dict[str, Any]:
+    """Today's spend, on the database's UTC day rather than the runner's.
+
+    `date.today()` is the application container's local date, and the ledger is
+    written with `(now() AT TIME ZONE 'utc')::date`. Any container not on UTC
+    reports the wrong row for part of every day - most visibly reading zero
+    spend while the budget is in fact nearly exhausted, which is the reading
+    that would prompt someone to raise concurrency.
+    """
     settings = get_settings()
-    today = date.today()
+    today = await session.scalar(text("SELECT (now() AT TIME ZONE 'utc')::date"))
     amount = await session.scalar(
         select(TranslationSpend.amount).where(TranslationSpend.day == today)
     )
     spent = float(amount or 0)
     budget = float(settings.translation_daily_budget)
     return {
-        "day": today.isoformat(),
+        "day": today.isoformat() if today else None,
         "spent_usd": round(spent, 4),
         "budget_usd": budget,
         "percent": _percent(int(spent * 10000), int(budget * 10000)),

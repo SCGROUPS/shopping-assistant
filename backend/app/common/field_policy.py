@@ -51,23 +51,45 @@ PROSE = FieldPolicy(requires_review=False, serve_stale=True)
 # someone who can check an address.
 DIRECTIONS = FieldPolicy(requires_review=True, serve_stale=False)
 
-_REGISTRY: dict[tuple[str, str], FieldPolicy] = {
+
+
+_EXPERIENCE_FIELDS: dict[tuple[str, str], FieldPolicy] = {
     (ENTITY_EXPERIENCE, "title"): PROSE,
     (ENTITY_EXPERIENCE, "short_description"): PROSE,
     (ENTITY_EXPERIENCE, "description"): PROSE,
     (ENTITY_EXPERIENCE, "meeting_point"): DIRECTIONS,
 }
 
+# What an unregistered field gets: reviewed before publication, never served
+# stale. Defaulting to prose was fail-*open* - someone adding a `pickup_point`
+# or `cancellation_terms` column would get auto-publication and stale serving
+# by omission, which are precisely the two properties such a field must not
+# have. Being wrong in this direction costs a review queue; being wrong in the
+# other direction puts a traveller at the wrong address.
+UNREGISTERED = FieldPolicy(requires_review=True, serve_stale=False)
+
+_REGISTRY: dict[tuple[str, str], FieldPolicy] = dict(_EXPERIENCE_FIELDS)
+
 
 def policy_for(field: str, entity_type: str = ENTITY_EXPERIENCE) -> FieldPolicy:
-    """The policy for a field, defaulting to prose.
+    """The policy for a field, failing closed for anything unregistered.
 
-    An unregistered field is treated as prose rather than rejected: adding a
-    translated column should not be able to take the storefront down. It is the
-    *safe* default in the availability sense, and the registry is small enough
-    that a field needing stricter handling is a deliberate one-line entry.
+    In practice this is never reached with an unknown field, because the
+    registry also decides *which* fields are translated at all - but a lookup
+    that answers safely is what makes that a defence rather than a coincidence.
     """
-    return _REGISTRY.get((entity_type, field), PROSE)
+    return _REGISTRY.get((entity_type, field), UNREGISTERED)
+
+
+def translated_fields(entity_type: str = ENTITY_EXPERIENCE) -> tuple[str, ...]:
+    """The fields translated for an entity, in registration order.
+
+    Authoritative. The resolver and the enqueuer each used to carry their own
+    tuple, so a field could be enqueued for translation and never resolved, or
+    resolved and never enqueued - and the symptom of either is text that is
+    simply always in the wrong language, with nothing failing.
+    """
+    return tuple(field for (owner, field) in _REGISTRY if owner == entity_type)
 
 
 def fields_requiring_review(entity_type: str = ENTITY_EXPERIENCE) -> frozenset[str]:

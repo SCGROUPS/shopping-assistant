@@ -25,7 +25,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.config import get_settings
-from app.common.field_policy import fields_requiring_review
+from app.common.field_policy import fields_requiring_review, translated_fields
 from app.common.locales import SUPPORTED_LOCALES
 from app.common.models import (
     Experience,
@@ -42,12 +42,7 @@ from app.content.fingerprints import (
 # The prose a shopper reads. Deliberately not every text column on the row:
 # `slug` is an identifier, and translating it would break every link that has
 # ever been shared.
-EXPERIENCE_FIELDS: tuple[str, ...] = (
-    "title",
-    "short_description",
-    "description",
-    "meeting_point",
-)
+EXPERIENCE_FIELDS: tuple[str, ...] = translated_fields()
 
 # Fields whose machine translation is held for a human (§6.5). The split is by
 # consequence, not by environment: a wrong adjective costs relevance, a wrong

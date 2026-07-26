@@ -13,7 +13,6 @@ from app.api.schemas import (
 )
 from app.catalog.service import get_product
 from app.common.errors import ApiError
-from app.common.locales import DEFAULT_LOCALE
 from app.common.models import (
     AvailabilitySlot,
     Cart,
@@ -37,7 +36,7 @@ class CartService:
     def __init__(self, data: DemoStore = store) -> None:
         self.data = data
 
-    async def get_cart(self, session_id: str, locale: str = DEFAULT_LOCALE) -> CartView:
+    async def get_cart(self, session_id: str, locale: str) -> CartView:
         if not database_mode():
             return self._demo_get_cart(session_id)
         factory = require_session_factory()
@@ -60,7 +59,7 @@ class CartService:
         session_id: str,
         request: CartItemRequest,
         idempotency_key: str,
-        locale: str = DEFAULT_LOCALE,
+        locale: str,
     ) -> CartView:
         if not database_mode():
             return self._demo_add_item(session_id, request, idempotency_key)
@@ -224,7 +223,7 @@ class CartService:
         session_id: str,
         item_id: UUID,
         idempotency_key: str,
-        locale: str = DEFAULT_LOCALE,
+        locale: str,
     ) -> CartView:
         if not database_mode():
             return self._demo_remove_item(session_id, item_id, idempotency_key)
@@ -273,7 +272,7 @@ class CartService:
             )
             return response
 
-    async def validate(self, session_id: str, locale: str = DEFAULT_LOCALE) -> CartView:
+    async def validate(self, session_id: str, locale: str) -> CartView:
         if not database_mode():
             return self._demo_validate(session_id)
         factory = require_session_factory()

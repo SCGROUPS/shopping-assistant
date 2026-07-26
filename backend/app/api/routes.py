@@ -44,7 +44,7 @@ from app.common.config import get_settings
 from app.common.database import database_ready
 from app.common.errors import ApiError
 from app.common.llm_cost import ledger
-from app.common.locales import DEFAULT_LOCALE, canonical_locale, negotiate_locale
+from app.common.locales import canonical_locale, negotiate_locale
 from app.common.models import BehaviorEvent
 from app.common.persistence import (
     catalog_products,
@@ -191,9 +191,11 @@ async def recommendations(
 
 @router.post("/events", status_code=202)
 async def capture_event(
-    request: EventRequest, session_id: SessionHeader = "demo-session"
+    request: EventRequest,
+    locale: RequestLocale,
+    session_id: SessionHeader = "demo-session",
 ) -> dict[str, Any]:
-    return await _capture(session_id, request)
+    return await _capture(session_id, request, locale)
 
 
 @router.post("/conversations", status_code=201)
@@ -490,9 +492,7 @@ async def api_health() -> dict[str, Any]:
     }
 
 
-async def _capture(
-    session_id: str, request: EventRequest, locale: str = DEFAULT_LOCALE
-) -> dict[str, Any]:
+async def _capture(session_id: str, request: EventRequest, locale: str) -> dict[str, Any]:
     """Record an event, always stamped with the locale it happened in.
 
     Stamped here rather than at each call site because a locale recorded on
@@ -530,7 +530,12 @@ async def _capture(
         for key, value in request.properties.items()
         if key.casefold() not in {"message", "text", "email", "phone", "name"}
     }
-    safe_properties.setdefault("locale", locale)
+    # Assigned, not defaulted. `setdefault` let a client send
+    # `properties: {"locale": "ko"}` on a Vietnamese request and have it stored
+    # verbatim, so the one number used to decide whether a locale stays enabled
+    # was writable by anyone with curl. The server resolved this request; the
+    # request does not get a second opinion about itself.
+    safe_properties["locale"] = locale
     if not database_mode():
         event = {
             "id": len(store.events) + 1,

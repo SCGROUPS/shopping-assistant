@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.cart.service import CartService
 from app.catalog import indexing
 from app.common.config import Settings, get_settings
+from app.common.field_policy import policy_for, translated_fields
 from app.common.locales import negotiate_locale, parse_accept_language
 from app.common.models import (
     Cart,
@@ -34,6 +35,7 @@ from app.common.models import (
 )
 from app.common.persistence import load_products
 from app.common.resolution import (
+    TRANSLATED_FIELDS,
     content_meta,
     fallback_fields,
     resolution_chain,
@@ -853,3 +855,61 @@ async def test_the_checkout_review_names_products_in_the_shopper_s_language(fact
     # The English request must still get English, or the test would pass on a
     # service that ignored the argument and always returned Vietnamese.
     assert english.items[0].experience_title == "Hoi An lantern walk"
+
+
+async def test_a_client_cannot_declare_its_own_locale_on_an_event(api_client):
+    """The one number that decides a locale's fate must not be client-writable.
+
+    `properties` is a free-form map, so a client could send
+    `{"locale": "ko"}` on a request the server resolved as Vietnamese. Stored
+    with `setdefault` it won, which made Korean adoption - the metric used to
+    decide whether Korean stays enabled - something anyone with curl could
+    manufacture, or accidentally corrupt by echoing a stale UI value.
+    """
+    settings = get_settings()
+    settings.enabled_locales = ["en", "vi"]
+    try:
+        response = await api_client.post(
+            "/api/v1/events",
+            json={"event_type": "assistant_opened", "properties": {"locale": "ko"}},
+            headers={"X-Session-ID": "event-locale", "Accept-Language": "vi"},
+        )
+    finally:
+        settings.enabled_locales = ["en"]
+
+    assert response.status_code == 202, response.text
+    # Asserted against what was stored, not what was returned: the endpoint
+    # echoes neither, and the stored row is the thing the decision is made from.
+    from app.common.store import store
+
+    stored = next(
+        item for item in reversed(store.events) if item["id"] == response.json()["event_id"]
+    )
+    assert stored["properties"]["locale"] == "vi"
+
+
+def test_an_unregistered_field_is_not_translated_and_fails_closed():
+    """Fail-open here auto-publishes a field nobody reviewed.
+
+    The registry decides which fields are translated at all, so an unregistered
+    one never reaches the resolver. If it somehow does, it must not inherit
+    prose's two properties - auto-publication and stale serving - because the
+    fields most likely to be added next are pickup points and cancellation
+    terms, which are exactly the kind that must not have either.
+    """
+    assert "pickup_point" not in translated_fields()
+    policy = policy_for("pickup_point")
+    assert policy.requires_review is True
+    assert policy.serve_stale is False
+
+
+def test_the_enqueuer_and_the_resolver_translate_the_same_fields():
+    """Two lists of the same thing drift, and the symptom is silent.
+
+    A field enqueued but never resolved is translated into every language and
+    displayed in none of them; a field resolved but never enqueued falls back
+    forever. Neither raises, and neither shows up in a test of one side.
+    """
+    from app.content.enqueue import EXPERIENCE_FIELDS
+
+    assert TRANSLATED_FIELDS == EXPERIENCE_FIELDS == translated_fields()
