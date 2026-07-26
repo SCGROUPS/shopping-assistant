@@ -13,6 +13,9 @@ So there is no heuristic. The model decides, and when the model cannot be
 reached the answer is `undetermined` rather than a guess.
 """
 
+import unicodedata
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from app.api.schemas import SearchIntent, SearchRequest
@@ -38,6 +41,42 @@ REQUESTS = [
 @pytest.mark.parametrize("query", REQUESTS)
 def test_the_fallback_never_guesses_where_an_answer_belongs(query: str) -> None:
     assert deterministic_intent(query).interaction_mode == "undetermined"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "wheelchair access in Hoi An under 500000 with free cancellation",
+        "family indoor tour, no nightlife, in English",
+        "cần chỗ cho xe lăn ở Hội An",
+    ],
+)
+def test_the_fallback_invents_no_constraints(query: str) -> None:
+    """Routing was only half of it.
+
+    An earlier version of this test asserted `interaction_mode` alone, and
+    passed while the same function was still reading destinations, budgets,
+    accessibility and exclusions out of English keywords - so the check
+    reported that language had been removed from the decision while language
+    was still deciding what the shopper had asked for.
+    """
+    intent = deterministic_intent(query)
+    assert intent.hard_constraints == []
+    assert intent.soft_preferences == []
+    assert intent.exclusions == []
+    assert intent.destination.name is None
+
+
+@pytest.mark.parametrize("query", REQUESTS)
+def test_the_fallback_keeps_the_shoppers_own_words(query: str) -> None:
+    """The English branch used to delete words from the search text.
+
+    `hoi an`, `family`, `indoor` and others were stripped before searching, so
+    an English request was searched with a mutilated query and a Vietnamese one
+    was not. Whatever else the fallback cannot do, it must not edit the
+    request.
+    """
+    assert deterministic_intent(query).search_text == query.strip()
 
 
 @pytest.mark.parametrize("query", REQUESTS)
@@ -77,11 +116,10 @@ class TestDatesSurviveTheLanguageTheyWereWrittenIn:
     """
 
     def _intent_with_date(self, phrase: str | None) -> SearchIntent:
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date().isoformat()
         return SearchIntent(
             search_text="tour",
-            hard_constraints=[
-                {"field": "visit_start", "operator": "gte", "value": "2026-01-02"}
-            ],
+            hard_constraints=[{"field": "visit_start", "operator": "gte", "value": tomorrow}],
             date_phrase=phrase,
         )
 
@@ -99,11 +137,53 @@ class TestDatesSurviveTheLanguageTheyWereWrittenIn:
 
     def test_an_invented_date_is_dropped(self) -> None:
         """The quote must actually occur in the request."""
-        dropped = sanitize_intent(
-            "hoi an lantern tour", self._intent_with_date("next weekend")
-        )
+        dropped = sanitize_intent("hoi an lantern tour", self._intent_with_date("next weekend"))
         assert not dropped.hard_constraints
 
     def test_a_date_with_no_quote_is_dropped(self) -> None:
         dropped = sanitize_intent("hoi an lantern tour", self._intent_with_date(None))
         assert not dropped.hard_constraints
+
+    def test_a_date_in_the_past_is_dropped(self) -> None:
+        """A quote proves the shopper mentioned a date, not that we read it right."""
+        intent = SearchIntent(
+            search_text="tour",
+            hard_constraints=[{"field": "visit_start", "operator": "gte", "value": "2019-04-01"}],
+            date_phrase="tomorrow",
+        )
+        assert not sanitize_intent("hoi an tour tomorrow", intent).hard_constraints
+
+    def test_a_date_years_away_is_dropped(self) -> None:
+        intent = SearchIntent(
+            search_text="tour",
+            hard_constraints=[{"field": "visit_start", "operator": "gte", "value": "2099-04-01"}],
+            date_phrase="ngày mai",
+        )
+        assert not sanitize_intent("tour ngày mai", intent).hard_constraints
+
+    def test_a_date_next_week_is_kept(self) -> None:
+        soon = (datetime.now(UTC) + timedelta(days=7)).date().isoformat()
+        intent = SearchIntent(
+            search_text="tour",
+            hard_constraints=[{"field": "visit_start", "operator": "gte", "value": soon}],
+            date_phrase="tuần sau",
+        )
+        assert sanitize_intent("tour tuần sau", intent).hard_constraints
+
+    def test_a_decomposed_vietnamese_quote_still_matches(self) -> None:
+        """The same word typed two ways is the same word.
+
+        Vietnamese reaches us both precomposed and decomposed, depending on the
+        keyboard and the client. Comparing the raw strings dropped a date the
+        shopper had plainly typed.
+        """
+        query = unicodedata.normalize("NFD", "tour Hội An ngày mai")
+        kept = sanitize_intent(query, self._intent_with_date("ngày mai"))
+        assert kept.hard_constraints, "a decomposed Vietnamese date was dropped"
+
+    def test_a_composed_query_matches_a_decomposed_quote(self) -> None:
+        kept = sanitize_intent(
+            "tour Hội An ngày mai",
+            self._intent_with_date(unicodedata.normalize("NFD", "ngày mai")),
+        )
+        assert kept.hard_constraints

@@ -1,5 +1,4 @@
 import logging
-import re
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -42,44 +41,6 @@ from app.search.service import SearchService
 
 logger = logging.getLogger(__name__)
 
-CONFIRM_PHRASES = {"confirm", "confirm booking", "yes, confirm", "confirm checkout"}
-
-ORDINALS = {
-    "first": 0,
-    "1st": 0,
-    "one": 0,
-    "second": 1,
-    "2nd": 1,
-    "two": 1,
-    "third": 2,
-    "3rd": 2,
-    "three": 2,
-    "fourth": 3,
-    "4th": 3,
-    "four": 3,
-    "fifth": 4,
-    "5th": 4,
-    "five": 4,
-    "last": -1,
-}
-
-
-def keyword_tool(lowered: str) -> str | None:
-    """Deterministic fallback used only when the planner is unavailable."""
-    if lowered in CONFIRM_PHRASES:
-        return "confirm_simulated_checkout"
-    if any(term in lowered for term in ("checkout", "pay", "book now")):
-        return "prepare_checkout"
-    if "add" in lowered and "cart" in lowered:
-        return "add_to_cart"
-    if "availability" in lowered or "available" in lowered:
-        return "check_availability"
-    if "compare" in lowered:
-        return "compare_experiences"
-    if any(term in lowered for term in ("similar", "also like", "complete my day")):
-        return "get_recommendations"
-    return None
-
 
 def _offering(item: Any) -> dict[str, Any]:
     """One catalogue result, described so the agent can judge it and refer back
@@ -101,31 +62,30 @@ def _offering(item: Any) -> dict[str, Any]:
     }
 
 
-def _join(labels: list[str]) -> str:
-    if len(labels) == 1:
-        return labels[0]
-    return f"{', '.join(labels[:-1])} and {labels[-1]}"
+def _resolve_referent(products: list[dict[str, Any]], reference: str) -> dict[str, Any]:
+    """Return the offering the agent named, by the id a tool gave it.
 
+    This used to read English ordinals ("the second one") and match titles as
+    substrings of the message. That could only work in English, and it silently
+    returned the first result whenever it failed - including for the agent path,
+    which passes an experience_id that no ordinal or title would ever match. So
+    "check the third one" answered about the first, and reported success.
 
-def _resolve_referent(products: list[dict[str, Any]], message: str) -> dict[str, Any]:
-    """Resolve which of the last results the shopper means.
-
-    Falls back to the first result, but honours an explicit title mention or an
-    ordinal reference such as "add the second one to my cart".
+    The agent resolves the reference itself and names an id. An id we cannot
+    place is an error the agent can see and correct, never a substitution.
     """
-    if not message:
+    if not reference:
         return products[0]
-    lowered = message.casefold()
-    titled = [product for product in products if product["title"].casefold() in lowered]
-    if titled:
-        return titled[0]
-    for word, index in ORDINALS.items():
-        if re.search(rf"\b{re.escape(word)}\b", lowered):
-            try:
-                return products[index]
-            except IndexError:
-                break
-    return products[0]
+    for product in products:
+        if str(product["id"]) == reference:
+            return product
+    raise ApiError(
+        409,
+        "Unknown experience",
+        "That offering is not among the results shown to the shopper. "
+        "Use an experience_id returned by a tool in this conversation.",
+        "unknown-referent",
+    )
 
 
 class AssistantService:
@@ -322,7 +282,6 @@ class AssistantService:
                 "Start a new conversation to continue.",
                 "assistant-turn-limit",
             )
-        lowered = request.message.casefold().strip()
         self._merge_context(conversation, request.context)
         # Let the agent work the request with the tools first. It only falls
         # through to the single-tool path when reasoning is unavailable, which is
@@ -339,25 +298,24 @@ class AssistantService:
             logger.exception("Assistant action planning failed")
             plan = None
 
-        # The agent decides and fills its own arguments; keyword matching is only a
-        # fallback for when planning is unavailable (demo mode) or returns nothing.
-        if plan is None:
-            fallback = keyword_tool(lowered)
-            plan = ToolPlan(tool=fallback) if fallback else None
+        # The agent decides and fills its own arguments. There is no keyword
+        # fallback: choosing the tool from English words meant a shopper writing
+        # in any other language could reach no tool at all, and an English one
+        # could have a checkout started because a word appeared in a sentence
+        # that was never a request to act.
         tool = plan.tool if plan else None
-        # The agent resolves references itself; fall back to the raw message so the
-        # deterministic path can still pick out an ordinal or a title.
-        referent = (plan.text("reference") if plan else None) or request.message
+        # The agent names the offering by an id a tool returned. Empty means
+        # "the one they are looking at", which is the first of the last results.
+        referent = (plan.text("experience_id") if plan else None) or ""
         if tool == "confirm_simulated_checkout" and not self._confirmation_allowed(
-            conversation, lowered
+            conversation, plan
         ):
-            # Re-show the summary if the shopper is mid-checkout, otherwise treat the
-            # planner's guess as noise rather than acting on it.
-            tool = (
-                "prepare_checkout"
-                if conversation["state"].get("pending_action") == "CONFIRM_CHECKOUT"
-                else None
-            )
+            # Mid-checkout without an unambiguous yes: show the summary again
+            # rather than book. Nothing pending: keep the tool so the shopper is
+            # told there is nothing to confirm, instead of quietly searching for
+            # whatever word they used.
+            if conversation["state"].get("pending_action") == "CONFIRM_CHECKOUT":
+                tool = "prepare_checkout"
 
         response: AssistantResponse
         if tool == "confirm_simulated_checkout":
@@ -385,13 +343,20 @@ class AssistantService:
         return response
 
     @staticmethod
-    def _confirmation_allowed(conversation: dict[str, Any], lowered: str) -> bool:
-        """A simulated booking requires an explicit user confirmation and is never
-        triggered by a model decision alone.
+    def _confirmation_allowed(conversation: dict[str, Any], plan: ToolPlan | None) -> bool:
+        """A booking needs the shopper's explicit go-ahead, in their own language.
 
-        `_confirm_checkout` separately enforces that a booking summary is pending.
+        This used to require the message to be one of four English phrases, so a
+        shopper writing `xac nhan` could never complete a booking at all. The
+        judgement of whether someone said yes is language understanding, and the
+        agent does that; what we will not delegate is the state. Two conditions
+        both hold: a summary the shopper has actually been shown is pending, and
+        the agent attests that their latest message was an unambiguous
+        confirmation of it rather than a question about it.
         """
-        return lowered in CONFIRM_PHRASES
+        if conversation["state"].get("pending_action") != "CONFIRM_CHECKOUT":
+            return False
+        return bool(plan and plan.flag("shopper_confirmed"))
 
     @staticmethod
     def _merge_context(conversation: dict[str, Any], context: AssistantContext | None) -> None:
@@ -596,11 +561,20 @@ class AssistantService:
             return {"outcome": response.message}
 
         if name == "confirm_simulated_checkout":
-            # A booking is never taken on the agent's say-so alone.
-            return {
-                "error": "confirmation-required",
-                "detail": "Ask the shopper to confirm explicitly before booking.",
-            }
+            # A booking needs a summary the shopper has seen and their own
+            # unambiguous yes. Refusing unconditionally here left the agent no
+            # way to ever complete a booking: it asked the shopper to confirm,
+            # they did, and it was refused again.
+            if not self._confirmation_allowed(conversation, ToolPlan(name, arguments)):
+                return {
+                    "error": "confirmation-required",
+                    "detail": (
+                        "Show the shopper their checkout summary and wait for an "
+                        "unambiguous yes before calling this."
+                    ),
+                }
+            response = await self._confirm_checkout(conversation, session_id)
+            return {"outcome": response.message}
 
         return {"error": "unknown-tool", "detail": name}
 
@@ -650,16 +624,13 @@ class AssistantService:
             }
             for product in result.items[:4]
         ]
-        if result.relaxed_preferences:
-            message_text = (
-                f"No exact match, so I relaxed {_join(result.relaxed_preferences)} "
-                f"and found {len(products)} bookable options."
-            )
-        else:
-            message_text = (
-                f"I found {len(products)} grounded options. "
-                "The first choices best match your request."
-            )
+        # What was relaxed travels as codes in `relaxed_preferences`, which the
+        # client renders from the shopper's own dictionary. Naming it again here
+        # would put untranslatable English back into the sentence.
+        message_text = (
+            f"I found {len(products)} grounded options. "
+            "The first choices best match your request."
+        )
         try:
             enhanced = await self.ai.enhance_assistant(message, facts)
             if enhanced:

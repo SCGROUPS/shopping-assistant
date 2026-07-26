@@ -45,6 +45,7 @@ import {
 } from './lib/api'
 import { formatCount, formatDate as intlDate, formatMoney } from './lib/format'
 import { LocaleProvider } from './lib/LocaleContext'
+import { relaxationSentence } from './lib/badges'
 import { buildTranslator } from './lib/useLocale'
 import type { Translator } from './lib/useLocale'
 import { chromeReady, isFallback, resolveText, translate } from './lib/i18n'
@@ -653,7 +654,7 @@ function App() {
         const best = result.items.slice(0, 3)
         const relaxed = result.relaxedPreferences.length
           ? t('assistant.relaxedSuffix', {
-              list: result.relaxedPreferences.join(', '),
+              list: relaxationSentence(result.relaxedPreferences, locale, t),
             })
           : ''
         const announcement: LocalizedText = best.length
@@ -1495,7 +1496,9 @@ function App() {
               <Sparkles size={16} />
               <p>
                 {t('app.relaxed.prefix')}{' '}
-                <strong>{relaxedPreferences.join(', ')}</strong>{' '}
+                <strong>
+                  {relaxationSentence(relaxedPreferences, locale, t)}
+                </strong>{' '}
                 {t('app.relaxed.suffix')}
               </p>
             </div>

@@ -212,7 +212,14 @@ class SearchResponse(BaseModel):
     items: list[ExperienceCard]
     recommendations: list[ExperienceCard] | None = None
     facets: dict[str, dict[str, int]]
-    relaxed_preferences: list[str] = Field(default_factory=list)
+    relaxed_preferences: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Codes for the constraints that were relaxed to find results, in the "
+            "order they were given up. Codes, not prose: the client renders them "
+            "in the shopper's language."
+        ),
+    )
     # Lifted out of `intent` onto the envelope: the client needs it on every
     # response, including the ones where intent extraction never ran.
     # Required, with no default: a response that cannot say how it should be
@@ -357,5 +364,12 @@ class AssistantResponse(BaseModel):
     filter_updates: list[dict[str, Any]] = Field(default_factory=list)
     actions: list[AssistantAction] = Field(default_factory=list)
     clarification: str | None = None
-    relaxed_preferences: list[str] = Field(default_factory=list)
+    relaxed_preferences: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Codes for the constraints that were relaxed to find results, in the "
+            "order they were given up. Codes, not prose: the client renders them "
+            "in the shopper's language."
+        ),
+    )
     citations: list[dict[str, Any]] = Field(default_factory=list)

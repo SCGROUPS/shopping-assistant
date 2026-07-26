@@ -190,6 +190,66 @@ const reportContractViolation = (field: string, value: unknown): void => {
   api.track('api_contract_violation', { field, value: String(value) })
 }
 
+// A fact the catalogue is required to state. Coercing an absent field to
+// `false` would mark every experience sold out, non-refundable and unsuitable
+// for families the moment a backend stopped sending it - and the storefront
+// would render that with complete confidence. The safe value is still used, so
+// the page works, but the disagreement is reported.
+const readFact = (item: Record<string, unknown>, field: string): boolean => {
+  const value = item[field]
+  if (typeof value === 'boolean') return value
+  reportContractViolation(field, value)
+  return false
+}
+
+// Codes this build knows how to render. An unrecognised one means the
+// catalogue is describing the product in terms the storefront cannot show, so
+// it is reported once here rather than silently vanishing at render time.
+const KNOWN_BADGE_CODES = new Set([
+  'instant_confirmation',
+  'family_friendly',
+  'free_cancellation',
+  'available',
+  'sold_out',
+])
+
+// The constraints the search gave up to find results. Codes, because this
+// sentence is read by the shopper: assembling it as English prose on the server
+// meant a Vietnamese storefront explained its own compromises in English.
+const KNOWN_RELAXATION_CODES = new Set([
+  'max_duration',
+  'rating',
+  'instant_confirmation',
+  'free_cancellation',
+  'category',
+  'indoor_outdoor',
+  'language',
+  'family_friendly',
+  'dates',
+  'budget',
+  'destination',
+])
+
+const readRelaxations = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  const codes = value.map(String)
+  for (const code of codes) {
+    if (!KNOWN_RELAXATION_CODES.has(code)) {
+      reportContractViolation('relaxed_preferences', code)
+    }
+  }
+  return codes
+}
+
+const readBadges = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  const codes = value.map(String)
+  for (const code of codes) {
+    if (!KNOWN_BADGE_CODES.has(code)) reportContractViolation('badges', code)
+  }
+  return codes
+}
+
 // How the server said this answer should be shown. An unrecognised value is
 // reported rather than coerced: the storefront can render a grid safely while
 // still making it visible that routing was never decided, which is the whole
@@ -261,9 +321,7 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
       })),
     }
   })
-  const badges = Array.isArray(item.badges)
-    ? item.badges.map(String)
-    : []
+  const badges = readBadges(item.badges)
   return {
     id: String(item.id ?? item.experience_id),
     slug: String(item.slug ?? item.id),
@@ -295,11 +353,14 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
     // English words in the badge text, so a translated catalogue would have
     // reported every experience as unavailable, non-refundable and unsuitable
     // for families - silently, because the parse always "succeeded".
-    available: Boolean(item.available ?? item.availability === 'AVAILABLE'),
-    instant_confirmation: Boolean(item.instant_confirmation),
+    available:
+      item.available === undefined && item.availability !== undefined
+        ? item.availability === 'AVAILABLE'
+        : readFact(item, 'available'),
+    instant_confirmation: readFact(item, 'instant_confirmation'),
     free_cancellation: Number(item.free_cancellation_hours ?? 0) > 0,
     free_cancellation_hours: Number(item.free_cancellation_hours ?? 0),
-    family_friendly: Boolean(item.family_friendly),
+    family_friendly: readFact(item, 'family_friendly'),
     accessibility_features: Array.isArray(item.accessibility_features)
       ? item.accessibility_features.map(String)
       : [],
@@ -566,7 +627,7 @@ export const api = {
         intent: payload.intent as Record<string, unknown> | undefined,
         effectiveFilters:
           (payload.effective_filters as SearchFilters | undefined) ?? filters,
-        relaxedPreferences: (payload.relaxed_preferences as string[]) ?? [],
+        relaxedPreferences: readRelaxations(payload.relaxed_preferences),
         facets:
           (payload.facets as Record<string, Record<string, number>>) ?? {},
         // The server decides whether this request wanted a conversation,

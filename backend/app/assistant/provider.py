@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -9,7 +8,7 @@ from typing import Any, Protocol, cast
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AsyncAzureOpenAI
 
-from app.api.schemas import IntentValue, SearchIntent
+from app.api.schemas import SearchIntent
 from app.common.config import Settings, get_settings
 from app.common.llm_cost import BudgetExceeded, ledger
 from app.common.ranking import deterministic_embedding
@@ -27,6 +26,10 @@ class ToolPlan:
     def text(self, key: str) -> str | None:
         value = self.arguments.get(key)
         return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def flag(self, key: str) -> bool:
+        """A boolean the agent set. Anything else is not an attestation."""
+        return self.arguments.get(key) is True
 
     def strings(self, key: str) -> list[str]:
         value = self.arguments.get(key)
@@ -121,8 +124,20 @@ SHOPPING_TOOLS: list[dict[str, Any]] = [
     ),
     function_tool(
         "confirm_simulated_checkout",
-        "Complete the booking. Only after the shopper explicitly confirms.",
-        {},
+        "Complete the booking, charging the shopper. Only call this after they "
+        "have been shown the checkout summary and have unambiguously agreed to "
+        "it in their own words, in any language.",
+        {
+            "shopper_confirmed": {
+                "type": "boolean",
+                "description": (
+                    "True only when the shopper's latest message is an "
+                    "unambiguous yes to the booking summary they were shown. "
+                    "A question about the total, a hedge, or a request to "
+                    "change something is not a confirmation."
+                ),
+            },
+        },
     ),
 ]
 
@@ -219,111 +234,26 @@ class AIProvider(Protocol):
 
 
 def deterministic_intent(text: str) -> SearchIntent:
-    lowered = text.casefold()
-    destination = next(
-        (
-            name
-            for name in ("Hoi An", "Da Nang", "Hue", "Ba Na Hills")
-            if name.casefold() in lowered
-        ),
-        None,
-    )
-    hard: list[dict[str, Any]] = []
-    soft: list[dict[str, Any]] = []
-    if "indoor" in lowered or "rain" in lowered:
-        hard.append({"field": "indoor_outdoor", "operator": "in", "value": ["indoor", "mixed"]})
-    if any(word in lowered for word in ("wheelchair", "accessible", "mobility")):
-        hard.append({"field": "accessibility", "operator": "contains", "value": "wheelchair"})
-    if any(word in lowered for word in ("family", "child", "children", "kids")):
-        soft.append({"field": "family_friendly", "value": True, "weight": 0.9})
-    if "free cancellation" in lowered:
-        hard.append(
-            {
-                "field": "free_cancellation",
-                "operator": "eq",
-                "value": True,
-            }
-        )
-    if "instant confirmation" in lowered:
-        hard.append(
-            {
-                "field": "instant_confirmation",
-                "operator": "eq",
-                "value": True,
-            }
-        )
-    language = next(
-        (
-            language
-            for language in ("English", "Vietnamese", "French", "Korean", "Japanese")
-            if re.search(rf"\b{language.casefold()}\b", lowered)
-        ),
-        None,
-    )
-    if language:
-        hard.append({"field": "language", "operator": "eq", "value": language})
-    budget_match = re.search(
-        r"\b(?:under|below|max(?:imum)?|up to)\s*"
-        r"(?:(vnd|usd|\$|₫)\s*)?([0-9][0-9,]*(?:\.[0-9]+)?)",
-        lowered,
-    )
-    if budget_match:
-        currency_token, amount = budget_match.groups()
-        hard.append(
-            {
-                "field": "max_total_price",
-                "operator": "lte",
-                "value": float(amount.replace(",", "")),
-            }
-        )
-        if currency_token:
-            hard.append(
-                {
-                    "field": "currency",
-                    "operator": "eq",
-                    "value": "USD" if currency_token in {"usd", "$"} else "VND",
-                }
-            )
-    date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", lowered)
-    if date_match:
-        hard.append(
-            {
-                "field": "visit_start",
-                "operator": "eq",
-                "value": date_match.group(1),
-            }
-        )
-    duration_match = re.search(
-        r"\b(?:under|below|max(?:imum)?|up to)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\b",
-        lowered,
-    )
-    if duration_match:
-        amount = float(duration_match.group(1))
-        unit = duration_match.group(2)
-        hard.append(
-            {
-                "field": "max_duration_minutes",
-                "operator": "lte",
-                "value": int(amount * 60 if unit.startswith(("h", "hr")) else amount),
-            }
-        )
-    exclusions = re.findall(r"\bno\s+([a-z-]+)", lowered)
-    search_text = re.sub(
-        r"\b(hoi an|da nang|hue|under|below|family-friendly|family|indoor|outdoor)\b",
-        " ",
-        lowered,
-    )
+    """What can be honestly said about a request without interpreting it.
+
+    Almost nothing, which is why this function now says almost nothing.
+
+    It used to be a hundred lines of English pattern-matching, and it ran
+    whenever the model was unreachable or over budget. It read destinations
+    from four English names, accessibility from `wheelchair`, budgets from
+    `under`, exclusions from `no <word>`, and then deleted English words from
+    the search text - so a shopper writing Vietnamese had every constraint
+    ignored and their text left intact, while a shopper writing English had
+    constraints invented and their text cut apart. Two different products,
+    selected by language, with no signal anywhere that either had happened.
+
+    Guessing is worse than declining. A request that reaches this path is
+    answered as plain text search, in whatever language it was written, with
+    `undetermined` routing so the storefront knows the judgement was never
+    made rather than believing it was made and came back `grid`.
+    """
     return SearchIntent(
-        search_text=" ".join(search_text.split()) or text,
-        destination=IntentValue(name=destination, confidence=0.99 if destination else 0.0),
-        hard_constraints=hard,
-        soft_preferences=soft,
-        exclusions=exclusions,
-        # This function is English pattern-matching used when the model cannot
-        # be reached. It has no way to tell a lookup from a plea for help in a
-        # language it does not contain, so it declines to guess: every rule
-        # tried here was a proxy for meaning that turned out to be a proxy for
-        # language, and a wrong guess is worse than a reported absence.
+        search_text=text.strip(),
         interaction_mode="undetermined",
     )
 

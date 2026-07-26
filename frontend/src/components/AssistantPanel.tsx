@@ -233,9 +233,11 @@ export function AssistantPanel({
                           <ArrowRight size={17} />
                         </button>
                         <div className="assistant-product-footer">
-                          <span>
+                          <span className={product.available ? '' : 'sold-out'}>
                             <i />
-                            {t('assistant.availableOnDate')}
+                            {product.available
+                              ? t('assistant.availableOnDate')
+                              : t('assistant.soldOut')}
                           </span>
                           <div className="assistant-product-actions">
                             {productActions.slice(0, 3).map((action, index) => (
