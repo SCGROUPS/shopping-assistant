@@ -179,7 +179,7 @@ test('a zero-result search offers choices instead of quietly dropping constraint
   // The first request must have authorised nothing at all.
   expect(authorised[authorised.length - 1]).toEqual([])
 
-  await offer.getByRole('button', { name: 'Go over my budget' }).click()
+  await offer.getByRole('button', { name: 'Ignore my budget limit' }).click()
 
   await expect(page.locator('.product-grid .product-card')).toHaveCount(1)
   await expect(page.locator('.relaxation-notice')).toContainText('budget')

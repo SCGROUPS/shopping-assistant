@@ -332,17 +332,34 @@ _INJECTED_CHANNEL = re.compile(
     https?://
   | www\.[a-z0-9-]+\.[a-z]{2,}
   | [a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
+    # A host followed by a path is a link whatever its suffix is.
+  | \b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+/\S
+    # A bare host needs no scheme to be typed into a browser, so requiring
+    # `http://` or `www.` let `pay.example.com` straight through. Here the
+    # suffix is an explicit list rather than "any two letters", because prose
+    # that has lost a space after a full stop ("the tour.The guide") otherwise
+    # reads as a domain and would silently discard a sound answer.
+  | \b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:
+        com|net|org|io|co|vn|me|info|biz|shop|app|xyz|site|online|link|top
+      | store|live|page|cc|tv|ru|cn|de|fr|jp|kr|es|uk|au|sg|th|ph|id|my
+    )\b
     """
 )
 
-# Telephone numbers cannot be recognised by grouping alone: `100 000 000 VND`
-# and `0912 345 678` have the same shape, and reading a price as a phone number
-# silently threw away a legitimate answer. What separates them is how they
-# start. A diallable number carries a country code or a trunk `0`; a sum of
-# money does not begin with a leading zero. So the run is anchored on `+` or
-# `0`, and only then measured - a phone is 9 to 15 digits, which a time range
-# ("09.00 - 17.00", seven digits) is not.
-_DIALLABLE_RUN = re.compile(r"(?<![\d\w])(?:\+\d|0)[\d\s.()-]{6,}")
+# Any run long enough to dial. Which is also, exactly, the shape of a sum of
+# money: `912 345 678` and `100 000 000` are the same nine digits in the same
+# three groups, so no amount of looking at the digits alone can separate them.
+# An earlier attempt anchored on a leading `+` or trunk `0`, which let a locally
+# written `912 345 678` through. What actually distinguishes them is whether a
+# currency is attached - and a currency code is a closed set of tokens, not a
+# language to be interpreted.
+_LONG_DIGIT_RUN = re.compile(r"(?<![\d\w])[\d][\d\s.()-]{6,}")
+_CURRENCY_NEAR = re.compile(
+    r"(?i)(?:VND|USD|EUR|JPY|KRW|CNY|GBP|AUD|SGD|THB|MYR|PHP|IDR|"
+    r"[\u0111\u20ab$\u20ac\u00a5\u20a9\u00a3])"
+)
+# Enough to reach "VND" past a space, not enough to reach the next sentence.
+_CURRENCY_WINDOW = 12
 
 
 def carries_injected_channel(text: str) -> bool:
@@ -355,8 +372,14 @@ def carries_injected_channel(text: str) -> bool:
     """
     if _INJECTED_CHANNEL.search(text):
         return True
-    for run in _DIALLABLE_RUN.findall(text):
-        if 9 <= sum(character.isdigit() for character in run) <= 15:
+    for match in _LONG_DIGIT_RUN.finditer(text):
+        run = match.group()
+        if not 9 <= sum(character.isdigit() for character in run) <= 15:
+            continue
+        neighbourhood = text[
+            max(0, match.start() - _CURRENCY_WINDOW) : match.end() + _CURRENCY_WINDOW
+        ]
+        if not _CURRENCY_NEAR.search(neighbourhood):
             return True
     return False
 

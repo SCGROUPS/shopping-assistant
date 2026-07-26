@@ -207,8 +207,8 @@ const en = {
   // Offered, not applied. Nothing is given up until the shopper picks one.
   'app.relaxOffer.lead':
     'Nothing matches everything you asked for. Which of these could you set aside?',
-  'app.relaxOffer.choice.max_duration': 'Allow longer experiences',
-  'app.relaxOffer.choice.rating': 'Allow a lower rating',
+  'app.relaxOffer.choice.max_duration': 'Ignore my duration limit',
+  'app.relaxOffer.choice.rating': 'Ignore my rating limit',
   'app.relaxOffer.choice.instant_confirmation': 'Allow non-instant confirmation',
   'app.relaxOffer.choice.free_cancellation': 'Allow no free cancellation',
   'app.relaxOffer.choice.category': 'Allow other categories',
@@ -216,7 +216,7 @@ const en = {
   'app.relaxOffer.choice.language': 'Allow another guide language',
   'app.relaxOffer.choice.family_friendly': 'Allow non-family experiences',
   'app.relaxOffer.choice.dates': 'Widen my dates',
-  'app.relaxOffer.choice.budget': 'Go over my budget',
+  'app.relaxOffer.choice.budget': 'Ignore my budget limit',
   'app.relaxOffer.choice.destination': 'Look in other destinations',
   'app.plan.lede':
     'These experiences work together by location, pace, and time of day. Add one and Mai will reshape the rest of your plan.',
@@ -629,8 +629,8 @@ const vi: Dictionary = {
     'Mai có thể nới lỏng một tiêu chí mà vẫn giữ nguyên những điều kiện quan trọng với bạn.',
   'app.relaxOffer.lead':
     'Không có lựa chọn nào khớp với tất cả yêu cầu của bạn. Bạn có thể bỏ bớt tiêu chí nào?',
-  'app.relaxOffer.choice.max_duration': 'Chấp nhận thời lượng dài hơn',
-  'app.relaxOffer.choice.rating': 'Chấp nhận đánh giá thấp hơn',
+  'app.relaxOffer.choice.max_duration': 'Bỏ giới hạn thời lượng',
+  'app.relaxOffer.choice.rating': 'Bỏ giới hạn đánh giá',
   'app.relaxOffer.choice.instant_confirmation': 'Không cần xác nhận tức thì',
   'app.relaxOffer.choice.free_cancellation': 'Không cần hủy miễn phí',
   'app.relaxOffer.choice.category': 'Xem thêm danh mục khác',
@@ -638,7 +638,7 @@ const vi: Dictionary = {
   'app.relaxOffer.choice.language': 'Chấp nhận ngôn ngữ hướng dẫn khác',
   'app.relaxOffer.choice.family_friendly': 'Không cần phù hợp gia đình',
   'app.relaxOffer.choice.dates': 'Mở rộng ngày đi',
-  'app.relaxOffer.choice.budget': 'Vượt ngân sách một chút',
+  'app.relaxOffer.choice.budget': 'Bỏ giới hạn ngân sách',
   'app.relaxOffer.choice.destination': 'Tìm ở điểm đến khác',
   'app.plan.lede':
     'Những trải nghiệm này kết hợp tốt với nhau về địa điểm, nhịp độ và thời điểm trong ngày.',

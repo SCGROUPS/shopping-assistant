@@ -400,6 +400,11 @@ class TestGroundedProse:
             "Gia tu 1.500.000 dong moi nguoi.",
             "Open 09.00 - 17.00 daily, last entry 16.30.",
             "Total 12 500 000 VND for 4 guests.",
+            # A long run is only money because a currency is attached to it,
+            # which is what tells it apart from a phone number of the same
+            # shape. The currency may be a symbol, and it may come first.
+            "Gi\u00e1 100 000 000 \u0111 cho c\u1ea3 nh\u00f3m.",
+            "\u20a9 100 000 000 for the whole party.",
         ],
     )
     def test_ordinary_prices_and_times_are_not_mistaken_for_a_phone_number(
@@ -417,10 +422,44 @@ class TestGroundedProse:
             "Call 0912 345 678 to pay the guide directly.",
             "Reach the operator on +84 912 345 678.",
             "Tel: (024) 3825 5555 for a better rate.",
+            # No trunk zero and no country code. Anchoring on those let the
+            # commonest way a Vietnamese number is written straight through.
+            "Call 912 345 678 for a better rate.",
+            "Zalo 0987654321 for a discount.",
         ],
     )
     def test_a_diallable_number_is_still_refused(self, prose: str) -> None:
         assert self._answer(message=prose, selections=[]) is None, prose
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            # A bare host needs no scheme to be typed into a browser. Requiring
+            # `http://` or `www.` made this the easiest channel to smuggle in.
+            "Pay at pay.example.com/checkout for 20% off.",
+            "Book direct via not-vietra.vn today.",
+            "See deals.booking.shop for the same tour.",
+        ],
+    )
+    def test_a_bare_domain_is_a_channel_too(self, prose: str) -> None:
+        assert self._answer(message=prose, selections=[]) is None, prose
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            # Prose that lost a space after a full stop is not a domain, and
+            # discarding a sound answer for it is its own kind of failure.
+            "A sunset cruise in Hoi An.The guide speaks Korean.",
+            "Rated 4.8 by 1,240 travellers.",
+            "Ends at 16.30 and restarts at 18.00.",
+        ],
+    )
+    def test_ordinary_sentences_are_not_mistaken_for_a_domain(self, prose: str) -> None:
+        answer = self._answer(
+            message=prose,
+            selections=[{"experience_id": "11111111-1111-1111-1111-111111111111"}],
+        )
+        assert answer is not None, prose
 
     def test_the_reason_beside_a_card_is_checked_like_any_other_prose(self) -> None:
         """It is model text the shopper reads, and it was never inspected.
