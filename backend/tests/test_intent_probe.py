@@ -114,3 +114,62 @@ async def test_readiness_is_withheld_while_the_model_rejects_us(monkeypatch):
 
 async def _always_ready() -> bool:
     return True
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_is_still_caught_when_the_catalogue_will_not_load(monkeypatch):
+    """The probe must reach the model even if the database is still waking.
+
+    The first version loaded the catalogue for its enums and recorded a *pass*
+    when that raised. A cold database at startup would therefore have let the
+    revision through without a single word being said to the model - the same
+    silence the probe exists to break, reintroduced by the probe itself.
+    """
+    import app.main as main
+
+    intent_health.reset()
+
+    async def _no_catalogue():
+        raise RuntimeError("database is still starting up")
+
+    monkeypatch.setattr("app.common.persistence.catalog_products", _no_catalogue)
+    monkeypatch.setattr(
+        main, "build_ai_provider", lambda: RejectingProvider("'none' is not supported"), raising=False
+    )
+    monkeypatch.setattr(
+        "app.assistant.provider.build_ai_provider",
+        lambda: RejectingProvider("'none' is not supported"),
+    )
+
+    await main._run_intent_probe()
+
+    probe = intent_health.probe()
+    assert probe is not None and not probe.ok, (
+        "the catalogue was unavailable so the probe reported a pass without ever asking "
+        "the model, and a revision that rejects every query would have taken traffic"
+    )
+    intent_health.reset()
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_model_is_recorded_as_unverified_not_as_healthy(monkeypatch):
+    """Unreachable is not evidence our request is wrong, but it is not a pass either."""
+    import app.main as main
+
+    intent_health.reset()
+    monkeypatch.setattr(main, "PROBE_ATTEMPTS", 2)
+    monkeypatch.setattr(main, "PROBE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(
+        "app.assistant.provider.build_ai_provider",
+        lambda: FlakyProvider(TimeoutError("timed out")),
+    )
+
+    await main._run_intent_probe()
+
+    probe = intent_health.probe()
+    assert probe is not None and probe.ok, "an unreachable model must not block the deploy"
+    assert "unverified" in probe.detail, (
+        f"reported as a clean pass ({probe.detail!r}); nothing ever confirmed the "
+        "deployment accepts our request"
+    )
+    intent_health.reset()

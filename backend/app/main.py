@@ -24,29 +24,76 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-async def _run_intent_probe() -> None:
-    """Record whether the intent deployment accepts the request we send it."""
-    from app.assistant.provider import build_ai_provider
+PROBE_ATTEMPTS = 5
+PROBE_RETRY_SECONDS = 3.0
+
+
+async def _probe_vocabulary() -> tuple[list[str], list[str]]:
+    """The enums to probe with, preferring the real catalogue.
+
+    The catalogue is not always loadable the instant the process starts - the
+    database may still be waking - and a probe that gives up then would report
+    a pass without ever having spoken to the model, which is the exact silence
+    it exists to break. The failure being hunted here is in the request shape,
+    not the enum contents, so a small stand-in is a faithful enough probe and
+    far better than not asking.
+    """
     from app.common.persistence import catalog_products
 
     try:
         products = await catalog_products()
-        result = await probe_intent(
-            build_ai_provider(),
-            categories=sorted({product["category"] for product in products}),
-            destinations=sorted({product["destination"] for product in products}),
-        )
     except Exception as error:  # noqa: BLE001
-        # The probe failing to run is not the deployment rejecting us, and must
-        # not be reported as though it were.
-        logger.warning("Intent probe did not run: %s", error)
-        intent_health.record_probe(ok=True, detail=f"probe did not run: {error}")
-        return
-    if result.ok:
-        logger.info("Intent probe: %s", result.detail)
-    else:
-        logger.error("Intent probe FAILED: %s", result.detail)
-    intent_health.record_probe(ok=result.ok, detail=result.detail)
+        logger.warning("Intent probe could not load the catalogue: %s", error)
+        products = []
+    if not products:
+        return ["Food", "Transport"], ["Hoi An", "Hanoi"]
+    return (
+        sorted({product["category"] for product in products}),
+        sorted({product["destination"] for product in products}),
+    )
+
+
+async def _run_intent_probe() -> None:
+    """Record whether the intent deployment accepts the request we send it.
+
+    Retried, because "could not tell" must never be allowed to settle as "fine".
+    A rejection is deterministic and answers on the first attempt; the retries
+    are for the startup-shaped problems - a cold upstream, a connection not yet
+    open - that would otherwise leave the question permanently unanswered and
+    the revision permanently trusted.
+    """
+    from app.assistant.provider import build_ai_provider
+
+    categories, destinations = await _probe_vocabulary()
+    detail = "the intent probe never completed"
+    for attempt in range(1, PROBE_ATTEMPTS + 1):
+        try:
+            result = await probe_intent(
+                build_ai_provider(), categories=categories, destinations=destinations
+            )
+        except Exception as error:  # noqa: BLE001
+            detail = f"the intent probe could not run: {error}"
+            logger.warning("Intent probe attempt %s could not run: %s", attempt, error)
+        else:
+            if not result.ok:
+                logger.error("Intent probe FAILED: %s", result.detail)
+                intent_health.record_probe(ok=False, detail=result.detail)
+                return
+            if "inconclusive" not in result.detail:
+                logger.info("Intent probe: %s", result.detail)
+                intent_health.record_probe(ok=True, detail=result.detail)
+                return
+            detail = result.detail
+            logger.warning("Intent probe attempt %s inconclusive: %s", attempt, result.detail)
+        if attempt < PROBE_ATTEMPTS:
+            await asyncio.sleep(PROBE_RETRY_SECONDS)
+
+    # Every attempt failed for reasons that were not a rejection. Serving is
+    # still the right call - the model being unreachable is not evidence that
+    # our request is wrong, and the running service already degrades safely -
+    # but this is reported as unverified rather than as a pass.
+    logger.error("Intent probe gave up after %s attempts: %s", PROBE_ATTEMPTS, detail)
+    intent_health.record_probe(ok=True, detail=f"unverified: {detail}")
 
 
 @asynccontextmanager
