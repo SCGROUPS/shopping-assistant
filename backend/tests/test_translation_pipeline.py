@@ -18,6 +18,7 @@ from conftest import create_postgres_schema, reset_postgres
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.common.llm_cost import BudgetExceeded
 from app.common.models import (
     Destination,
     Experience,
@@ -28,15 +29,20 @@ from app.common.models import (
     TranslationGlossary,
     TranslationJob,
 )
+from app.content import translator as translator_module
 from app.content.enqueue import (
     enqueue_experience_translations,
     mark_manual_translation,
 )
 from app.content.translator import (
+    MAX_ATTEMPTS,
     GlossaryViolation,
     commit_translation,
     drain,
+    fail_job,
     lease_jobs,
+    revive_failed_jobs,
+    sweep_stalled_leases,
     verify_glossary,
 )
 
@@ -385,12 +391,37 @@ async def test_an_expired_lease_returns_the_job_to_the_pool(factory):
 
 def test_glossary_verification_catches_a_translated_brand():
     terms = [TranslationGlossary(term="Hoi An", target_locale="de", do_not_translate=True)]
-    verify_glossary("Ein Abend in Hoi An", terms)
+    source = "An evening in Hoi An"
+    verify_glossary(source, "Ein Abend in Hoi An", terms)
     with pytest.raises(GlossaryViolation):
-        verify_glossary("Ein Abend in der Altstadt", terms)
+        verify_glossary(source, "Ein Abend in der Altstadt", terms)
 
 
-async def test_a_glossary_violation_fails_the_job_without_publishing(factory):
+def test_glossary_only_polices_terms_the_source_actually_uses():
+    """Otherwise a glossary gets less usable with every term added to it.
+
+    "Japanese Bridge" does not mention Hoi An, and demanding that its
+    translation does would fail every field of every listing that happens not
+    to name the town - which is most of them.
+    """
+    terms = [
+        TranslationGlossary(term="Hoi An", target_locale="de", do_not_translate=True),
+        TranslationGlossary(term="Vietra", target_locale="de", do_not_translate=True),
+    ]
+    verify_glossary("Japanese Bridge", "Japanische Brücke", terms)
+    # And it still bites on the term that *is* present.
+    with pytest.raises(GlossaryViolation):
+        verify_glossary("Vietra in Hoi An", "Vietra in der Altstadt", terms)
+
+
+async def test_a_glossary_violation_fails_only_the_field_that_used_the_term(factory):
+    """Two of the four source fields name Hoi An; the other two must publish.
+
+    An earlier version of `verify_glossary` required every term in the locale's
+    glossary to appear in every output, so adding "Hoi An" failed the
+    translation of "Japanese Bridge" as well. The test asserted four failures
+    and called it correct.
+    """
     async with factory() as session:
         session.add(
             TranslationGlossary(
@@ -400,16 +431,25 @@ async def test_a_glossary_violation_fails_the_job_without_publishing(factory):
         await session.commit()
     await _enqueue(factory, locales=["vi"])
 
-    async def bad_translator(*, job, glossary):
-        return "Dạo bộ đèn lồng phố cổ"
+    async def drops_the_brand(*, job, glossary):
+        return job.source_text.replace("Hoi An", "phố cổ")
 
-    counts = await drain(factory, bad_translator, limit=4)
-    assert counts["failed"] == 4
-    assert counts["published"] == 0
+    counts = await drain(factory, drops_the_brand, limit=10)
+    # `title` and `description` name the town; `short_description` and
+    # `meeting_point` do not.
+    assert counts["published"] == 2
+    assert counts["retrying"] == 2
+    assert counts["failed"] == 0
 
     async with factory() as session:
         row = await session.get(ExperienceTranslation, (EXPERIENCE_ID, "vi"))
-    assert row is None
+    assert row is not None
+    assert row.short_description == "An evening walk"
+    assert row.title == ""  # never published
+    # `meeting_point` also survived the glossary check, but it is policy-bearing
+    # so it is held as a candidate rather than served (§6.5).
+    held = (await _fields(factory, field="meeting_point", locale="vi"))[0]
+    assert held.status == "needs_review"
 
 
 async def test_a_clean_drain_publishes_and_marks_current(factory):
@@ -419,15 +459,25 @@ async def test_a_clean_drain_publishes_and_marks_current(factory):
         return f"[vi] {job.source_text}"
 
     counts = await drain(factory, good_translator, limit=10)
-    assert counts == {"leased": 4, "published": 4, "superseded": 0, "failed": 0}
+    assert counts == {
+        "leased": 4,
+        "published": 4,
+        "superseded": 0,
+        "retrying": 0,
+        "failed": 0,
+        "deferred": 0,
+    }
 
     async with factory() as session:
         row = await session.get(ExperienceTranslation, (EXPERIENCE_ID, "vi"))
     assert row is not None
     assert row.title == "[vi] Hoi An lantern walk"
-    assert row.meeting_point == "[vi] Japanese Bridge"
 
-    assert {field.status for field in await _fields(factory, locale="vi")} == {"current"}
+    assert {field.status for field in await _fields(factory, locale="vi")} == {
+        "current",
+        "needs_review",
+    }
+    # Both outcomes complete the job: a held candidate is work that finished.
     assert {job.status for job in await _jobs(factory, locale="vi")} == {"done"}
 
     # And a second drain has nothing to do, because enqueueing is fingerprint
@@ -435,26 +485,236 @@ async def test_a_clean_drain_publishes_and_marks_current(factory):
     assert await _enqueue(factory, locales=["vi"]) == 0
 
 
-async def test_review_mode_holds_the_translation_back(factory):
-    """`needs_review` must store the candidate and serve nothing."""
+async def test_policy_bearing_fields_are_held_but_prose_is_not(factory):
+    """The split is by consequence, not by environment (§6.5).
+
+    A wrong adjective costs relevance; a wrong meeting point puts a traveller on
+    the wrong street. Holding everything floods a queue nobody can staff, and
+    holding nothing ships the meeting point because nobody reads Korean.
+    """
     await _enqueue(factory, locales=["ko"])
 
     async def good_translator(*, job, glossary):
         return f"[ko] {job.source_text}"
 
-    counts = await drain(factory, good_translator, limit=10, requires_review=True)
+    counts = await drain(factory, good_translator, limit=10)
     assert counts["published"] == 4
 
     async with factory() as session:
         row = await session.get(ExperienceTranslation, (EXPERIENCE_ID, "ko"))
-    assert row is None  # nothing served
+    assert row is not None
+    assert row.title == "[ko] Hoi An lantern walk"
+    # Policy-bearing: never served until a human approves it.
+    assert row.meeting_point == ""
 
-    fields = await _fields(factory, locale="ko")
-    assert {field.status for field in fields} == {"needs_review"}
-    assert all(field.candidate_value.startswith("[ko] ") for field in fields)
-    assert all(field.published_fingerprint is None for field in fields)
+    held = (await _fields(factory, field="meeting_point", locale="ko"))[0]
+    assert held.status == "needs_review"
+    assert held.candidate_value == "[ko] Japanese Bridge"
+    assert held.published_fingerprint is None
     # The candidate names the fingerprint it answered, so a reviewer can prove
     # it still describes the current source before approving it.
-    assert all(
-        field.candidate_fingerprint == field.desired_fingerprint for field in fields
-    )
+    assert held.candidate_fingerprint == held.desired_fingerprint
+
+    assert {f.status for f in await _fields(factory, field="title", locale="ko")} == {"current"}
+
+
+async def test_a_field_awaiting_review_is_not_re_enqueued_every_import(factory):
+    """It reads as stale forever by design, but nothing has changed about it.
+
+    Refilling the queue with work a human was already asked to look at teaches
+    operators that the queue is noise.
+    """
+    await _enqueue(factory, locales=["ko"])
+
+    async def good_translator(*, job, glossary):
+        return f"[ko] {job.source_text}"
+
+    await drain(factory, good_translator, limit=10)
+    held = (await _fields(factory, field="meeting_point", locale="ko"))[0]
+    assert held.published_fingerprint != held.desired_fingerprint  # stale, deliberately
+
+    assert await _enqueue(factory, locales=["ko"]) == 0
+
+
+async def test_a_late_worker_cannot_clear_a_newer_lease(factory):
+    """Worker A's lease expires, worker B takes the job, then A finishes.
+
+    Matching a job transition on `id` alone lets A write
+    `status='queued', lease_token=NULL` over B's live lease. B's own completion
+    is then rejected, and a third worker is free to start a job B is still
+    running. The token is what makes a late worker harmless.
+    """
+    await _enqueue(factory, locales=["vi"])
+    first = await _lease_one(factory)
+
+    async with factory() as session:
+        await session.execute(
+            update(TranslationJob)
+            .where(TranslationJob.id == first.job_id)
+            .values(leased_until=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await session.commit()
+
+    second = await _lease_one(factory)
+    assert second.job_id == first.job_id
+    assert second.lease_token != first.lease_token
+
+    # The late worker reports its failure. It must change nothing.
+    async with factory() as session:
+        assert await fail_job(session, first, "timed out") is False
+        await session.commit()
+
+    async with factory() as session:
+        job = await session.get(TranslationJob, first.job_id)
+    assert job.status == "leased"
+    assert job.lease_token == second.lease_token
+
+    # And the current holder can still publish.
+    async with factory() as session:
+        assert await commit_translation(
+            session, second, translated="Dạo bộ", requires_review=False
+        )
+        await session.commit()
+
+
+async def test_a_job_that_died_on_its_last_attempt_is_swept_up(factory):
+    """`lease_jobs` refuses anything at the attempt cap, so nothing else finds it.
+
+    Without the sweep the row sits `leased` and expired forever, looking like
+    work in progress that no query in the module can see.
+    """
+    await _enqueue(factory, locales=["vi"])
+    job = await _lease_one(factory)
+
+    async with factory() as session:
+        # Every lease has expired, and this one died on its final attempt.
+        await session.execute(
+            update(TranslationJob).values(leased_until=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await session.execute(
+            update(TranslationJob)
+            .where(TranslationJob.id == job.job_id)
+            .values(attempts=MAX_ATTEMPTS)
+        )
+        await session.commit()
+
+    async with factory() as session:
+        reclaimed = await lease_jobs(session, limit=10)
+        await session.commit()
+    # The other three come back; the exhausted one is invisible to the query.
+    assert len(reclaimed) == 3
+    assert job.job_id not in {row.job_id for row in reclaimed}
+
+    async with factory() as session:
+        stranded = await session.get(TranslationJob, job.job_id)
+        assert stranded.status == "leased"  # invisible to everything
+
+        assert await sweep_stalled_leases(session) == 1
+        await session.commit()
+
+    async with factory() as session:
+        swept = await session.get(TranslationJob, job.job_id)
+    assert swept.status == "failed"
+    assert swept.lease_token is None
+
+
+async def test_a_provider_outage_does_not_park_translations_forever(factory):
+    """Five failures is not proof a field cannot be translated.
+
+    Re-enqueueing cannot revive it: the desired fingerprint has not moved, so
+    the uniqueness key still holds the dead job and nothing new is created.
+    """
+    await _enqueue(factory, locales=["vi"])
+
+    async def always_down(*, job, glossary):
+        raise RuntimeError("provider unavailable")
+
+    for _ in range(MAX_ATTEMPTS):
+        await drain(factory, always_down, limit=10)
+        async with factory() as session:
+            await session.execute(
+                update(TranslationJob).values(leased_until=datetime.now(UTC) - timedelta(seconds=1))
+            )
+            await session.commit()
+
+    assert {job.status for job in await _jobs(factory)} == {"failed"}
+    assert {field.status for field in await _fields(factory, locale="vi")} == {"failed"}
+    # Re-importing identical content does nothing, which is correct and is also
+    # why an explicit revival has to exist.
+    assert await _enqueue(factory, locales=["vi"]) == 0
+
+    async with factory() as session:
+        assert await revive_failed_jobs(session) == 4
+        await session.commit()
+
+    async def recovered(*, job, glossary):
+        return f"[vi] {job.source_text}"
+
+    counts = await drain(factory, recovered, limit=10)
+    assert counts["published"] == 4
+
+    async with factory() as session:
+        row = await session.get(ExperienceTranslation, (EXPERIENCE_ID, "vi"))
+    assert row is not None and row.title == "[vi] Hoi An lantern walk"
+
+
+async def test_a_failing_commit_does_not_strand_the_rest_of_the_batch(factory):
+    """A database fault on one job must not leave eleven others leased.
+
+    Letting the exception out of `drain` abandons every remaining lease, so the
+    batch goes quiet for the lease duration and then retries - having spent an
+    attempt each on a fault that had nothing to do with them.
+    """
+    await _enqueue(factory, locales=["vi"])
+
+    calls = {"n": 0}
+    real_commit = translator_module.commit_translation
+
+    async def exploding_commit(session, job, **kwargs):
+        calls["n"] += 1
+        if job.field == "title":
+            raise RuntimeError("connection reset")
+        return await real_commit(session, job, **kwargs)
+
+    translator_module.commit_translation = exploding_commit
+    try:
+        counts = await drain(factory, lambda **kw: _echo(**kw), limit=10)
+    finally:
+        translator_module.commit_translation = real_commit
+
+    assert counts["published"] == 3
+    assert counts["retrying"] == 1
+    # The failed one is back in the queue with its lease released, not stranded.
+    title_jobs = await _jobs(factory, field="title", locale="vi")
+    assert title_jobs[0].status == "queued"
+    assert title_jobs[0].lease_token is None
+
+
+async def _echo(*, job, glossary):
+    return f"[vi] {job.source_text}"
+
+
+async def test_running_out_of_budget_defers_rather_than_failing(factory):
+    """A spending ceiling must not consume attempts.
+
+    Five deferrals would otherwise mark the field `failed` and require an
+    explicit revival, which turns a routine daily ceiling into an incident.
+    """
+    await _enqueue(factory, locales=["vi"])
+
+    async def broke(*, job, glossary):
+        raise BudgetExceeded("Daily translation budget of $25.00 reached")
+
+    counts = await drain(factory, broke, limit=10)
+    assert counts["deferred"] == 4
+    assert counts["failed"] == 0 and counts["retrying"] == 0
+
+    jobs = await _jobs(factory, locale="vi")
+    assert {job.status for job in jobs} == {"queued"}
+    # The attempt was handed back, so tomorrow's run has all five.
+    assert {job.attempts for job in jobs} == {0}
+
+    async def recovered(*, job, glossary):
+        return f"[vi] {job.source_text}"
+
+    assert (await drain(factory, recovered, limit=10))["published"] == 4

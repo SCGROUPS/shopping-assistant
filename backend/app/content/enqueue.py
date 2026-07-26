@@ -48,7 +48,19 @@ EXPERIENCE_FIELDS: tuple[str, ...] = (
     "meeting_point",
 )
 
+# Fields whose machine translation is held for a human (§6.5). The split is by
+# consequence, not by environment: a wrong adjective costs relevance, a wrong
+# meeting point puts a traveller on the wrong street. Requiring review of
+# everything floods a queue nobody can staff - there is no Korean reviewer -
+# and auto-publishing everything ships a wrong meeting point because nobody
+# reads Korean either.
+REVIEW_REQUIRED_FIELDS: frozenset[str] = frozenset({"meeting_point"})
+
 ENTITY_EXPERIENCE = "experience"
+
+
+def requires_review(field: str) -> bool:
+    return field in REVIEW_REQUIRED_FIELDS
 
 
 async def glossary_revision(session: AsyncSession) -> int:
@@ -100,14 +112,24 @@ async def enqueue_experience_translations(
     recipe = await _recipe(session)
     wanted = tuple(locales) if locales is not None else target_locales(experience.source_language)
 
+    # Locked, and locked in a deterministic order. Two callers - an importer
+    # and a glossary invalidation, say - can otherwise both read generation N
+    # and both write N+1, and whichever commits second silently discards the
+    # other's invalidation. The field then describes itself as current against
+    # a fingerprint that answers only one of the two changes, with no job left
+    # to fix it. Ordering by (field, locale) is what stops two such callers
+    # deadlocking against each other while holding half the rows.
     existing = {
         (row.field, row.locale): row
         for row in (
             await session.scalars(
-                select(TranslationField).where(
+                select(TranslationField)
+                .where(
                     TranslationField.entity_type == ENTITY_EXPERIENCE,
                     TranslationField.entity_id == experience_id,
                 )
+                .order_by(TranslationField.field, TranslationField.locale)
+                .with_for_update()
             )
         ).all()
     }
@@ -129,7 +151,7 @@ async def enqueue_experience_translations(
 
             if row is None:
                 generation = 0
-                await session.execute(
+                inserted = await session.execute(
                     pg_insert(TranslationField)
                     .values(
                         entity_type=ENTITY_EXPERIENCE,
@@ -143,7 +165,33 @@ async def enqueue_experience_translations(
                         generation=generation,
                     )
                     .on_conflict_do_nothing()
+                    .returning(TranslationField.entity_id)
                 )
+                if inserted.scalar_one_or_none() is None:
+                    # Another caller created the row between our locked read and
+                    # this insert, so `DO NOTHING` did exactly that - and taking
+                    # the insert branch anyway would enqueue a job for a
+                    # generation the surviving row does not have. Re-read it
+                    # under the lock and treat it as the update it now is.
+                    row = await session.get(
+                        TranslationField,
+                        (ENTITY_EXPERIENCE, experience_id, field, locale),
+                        with_for_update=True,
+                    )
+                    if row is None:
+                        continue
+                    provenance = row.provenance
+                    desired = desired_fingerprint(
+                        source=source, recipe=recipe, provenance=provenance
+                    )
+                    if row.desired_fingerprint == desired:
+                        continue
+                    generation = row.generation + 1
+                    row.desired_fingerprint = desired
+                    row.generation = generation
+                    row.status = "pending"
+                    row.candidate_value = None
+                    row.candidate_fingerprint = None
             elif row.desired_fingerprint != desired:
                 generation = row.generation + 1
                 row.desired_fingerprint = desired

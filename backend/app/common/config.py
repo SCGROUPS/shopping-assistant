@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     # TRANSLATION_LEASE_SECONDS or a slow call outlives the lease it holds.
     translation_timeout_seconds: float = 90.0
     translation_batch: int = 24
+    # The batch is latency bound, so this is what decides whether a backfill
+    # finishes overnight. Bounded because the provider rate limits, and each
+    # lane holds a database session for the length of a model call.
+    translation_concurrency: int = 8
+    # Translation runs in its own container, so this ceiling is its own and
+    # cannot starve the storefront. Hitting it defers work to the next run
+    # rather than failing it: a backfill that stops early is resumable, and a
+    # backfill that burns its attempts against a spending limit is not.
+    translation_daily_budget: float = 25.0
 
     assistant_max_tool_rounds: int = 3
     assistant_max_session_turns: int = 12

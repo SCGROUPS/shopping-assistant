@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from app.common.config import get_settings
 from app.common.database import session_factory
-from app.common.models import Experience
+from app.common.models import Experience, TranslationJob
 from app.content.enqueue import enqueue_experience_translations
 from app.content.model_translator import make_translator
-from app.content.translator import drain
+from app.content.translator import drain, revive_failed_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +46,22 @@ async def enqueue_all(*, locales: list[str] | None = None) -> dict[str, int]:
 
 
 async def drain_translations(
-    *, limit: int | None = None, requires_review: bool | None = None
+    *,
+    limit: int | None = None,
+    hold_all: bool = False,
+    revive: bool = False,
 ) -> dict[str, int]:
+    """Drain the queue until it stops making progress.
+
+    `hold_all` forces every field into the review queue. It is not the normal
+    path: which fields need a human is a property of the field (§6.5), not of
+    the environment the worker happens to run in.
+    """
     from app.assistant.provider import build_ai_provider
 
     if session_factory is None:
         raise RuntimeError("translation requires a database; DATABASE_URL is unset")
 
-    settings = get_settings()
     provider = build_ai_provider()
     if not hasattr(provider, "client"):
         # The demo provider has no model behind it. Refusing is better than
@@ -62,14 +69,24 @@ async def drain_translations(
         # somebody discover them in production.
         raise RuntimeError("translation requires a configured Azure OpenAI provider")
 
-    review = requires_review if requires_review is not None else settings.app_env != "development"
-    totals = {"leased": 0, "published": 0, "superseded": 0, "failed": 0}
+    totals = {
+        "revived": 0,
+        "leased": 0,
+        "published": 0,
+        "superseded": 0,
+        "retrying": 0,
+        "failed": 0,
+        "deferred": 0,
+    }
     translator = make_translator(provider)
 
+    if revive:
+        async with session_factory() as session:
+            totals["revived"] = await revive_failed_jobs(session)
+            await session.commit()
+
     while True:
-        counts = await drain(
-            session_factory, translator, limit=limit, requires_review=review
-        )
+        counts = await drain(session_factory, translator, limit=limit, hold_all=hold_all)
         for key, value in counts.items():
             totals[key] += value
         if counts["leased"] == 0:
@@ -77,4 +94,33 @@ async def drain_translations(
         if limit is not None:
             # An explicit limit means "do this much work", not "work until done".
             break
+        if counts["deferred"]:
+            # The budget is spent. Stopping here is the whole point of deferring
+            # rather than failing: the next run picks up exactly where this one
+            # left off, with every attempt still available.
+            logger.warning("translation.budget_reached", extra={"counts": counts})
+            break
+        if counts["published"] == 0 and counts["superseded"] == 0:
+            # Nothing moved forward. Draining again would lease the same jobs
+            # back the moment their leases expire and burn the rest of their
+            # attempts against whatever is broken, so stop and report instead.
+            logger.warning("translation.no_progress", extra={"counts": counts})
+            break
     return totals
+
+
+async def backlog(session=None) -> dict[str, int]:
+    """What is left, by status. A job that finishes is not the same as a queue
+    that is empty: another replica may hold the rest.
+    """
+    if session_factory is None:
+        raise RuntimeError("translation requires a database; DATABASE_URL is unset")
+    async with session_factory() as owned:
+        rows = (
+            await owned.execute(
+                select(TranslationJob.status, func.count())
+                .where(TranslationJob.status.notin_(("done", "cancelled", "superseded")))
+                .group_by(TranslationJob.status)
+            )
+        ).all()
+    return {status: count for status, count in rows}

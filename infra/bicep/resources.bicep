@@ -356,7 +356,7 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
             '-c'
           ]
           args: [
-            'uv run --no-sync python -m app.catalog.cli seed-db && uv run --no-sync python -m app.catalog.cli refresh-availability && { uv run --no-sync python -m app.catalog.cli import-trippass || echo "Trippass import skipped: supplier feed unavailable"; } && uv run --no-sync python -m app.catalog.cli reindex'
+            'uv run --no-sync python -m app.catalog.cli seed-db && uv run --no-sync python -m app.catalog.cli refresh-availability && { uv run --no-sync python -m app.catalog.cli import-trippass || echo "Trippass import skipped: supplier feed unavailable"; } && uv run --no-sync python -m app.catalog.cli enqueue-translations && uv run --no-sync python -m app.catalog.cli reindex'
           ]
           env: [
             {
@@ -382,6 +382,106 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               name: 'AZURE_OPENAI_EMBEDDING_DEPLOYMENT'
               value: embeddingDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_API_VERSION'
+              value: '2025-04-01-preview'
+            }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+    }
+    workloadProfileName: 'Consumption'
+  }
+}
+
+// Translation is its own job, and deliberately not part of the deployment's
+// critical path. The first backfill is roughly ten thousand model calls; at
+// any concurrency that finishes, it is still tens of minutes of provider
+// latency that a deployment must not wait on and must not fail for.
+//
+// Scheduled rather than manual so translations actually happen without anybody
+// remembering to trigger them, and safe to overlap: jobs are leased with
+// SKIP LOCKED, so a second replica takes different work rather than the same
+// work twice. `--revive` gives up-to-date failed jobs their attempts back, so
+// a provider outage costs a delay rather than a permanent gap.
+resource translateJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: 'job-${prefix}-translate'
+  location: location
+  properties: {
+    environmentId: environment.id
+    configuration: {
+      triggerType: 'Schedule'
+      scheduleTriggerConfig: {
+        // Every two hours. Each run drains what it can and stops when nothing
+        // moves forward or the budget is spent, so progress is resumable and
+        // an overrun costs a delay rather than a duplicate.
+        cronExpression: '0 */2 * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      replicaTimeout: 3000
+      replicaRetryLimit: 0
+      registries: contains(containerImage, registry.properties.loginServer)
+        ? [
+            {
+              server: registry.properties.loginServer
+              username: registry.listCredentials().username
+              passwordSecretRef: 'registry-password'
+            }
+          ]
+        : []
+      secrets: [
+        {
+          name: 'database-url'
+          value: databaseUrl
+        }
+        {
+          name: 'registry-password'
+          value: registry.listCredentials().passwords[0].value
+        }
+        {
+          name: 'azure-openai-api-key'
+          value: aiApiKey
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'translate'
+          image: containerImage
+          command: [
+            'sh'
+            '-c'
+          ]
+          args: [
+            'uv run --no-sync python -m app.catalog.cli translate --revive'
+          ]
+          env: [
+            {
+              name: 'APP_ENV'
+              value: 'azure'
+            }
+            {
+              name: 'DEMO_MODE'
+              value: 'false'
+            }
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+            {
+              name: 'AZURE_OPENAI_ENDPOINT'
+              value: aiEndpoint
+            }
+            {
+              name: 'AZURE_OPENAI_API_KEY'
+              secretRef: 'azure-openai-api-key'
             }
             {
               name: 'AZURE_OPENAI_API_VERSION'

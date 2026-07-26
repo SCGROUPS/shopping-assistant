@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.catalog.indexing import enqueue_experience_reindex
 from app.common.config import get_settings
+from app.common.llm_cost import BudgetExceeded
 from app.common.models import (
     Experience,
     ExperienceTranslation,
@@ -41,7 +42,13 @@ from app.common.models import (
     TranslationGlossary,
     TranslationJob,
 )
-from app.content.enqueue import ENTITY_EXPERIENCE, EXPERIENCE_FIELDS
+from app.content.enqueue import (
+    ENTITY_EXPERIENCE,
+    EXPERIENCE_FIELDS,
+)
+from app.content.enqueue import (
+    requires_review as field_requires_review,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,20 +167,47 @@ async def load_glossary(session: AsyncSession, locale: str) -> list[TranslationG
     )
 
 
-def verify_glossary(text: str, terms: list[TranslationGlossary]) -> None:
+def verify_glossary(source: str, translated: str, terms: list[TranslationGlossary]) -> None:
     """Check the output for terms the model was told not to translate.
 
-    Instructing a model is a request; checking the output is a guarantee. A
-    missing term fails the job, which retries and eventually parks it for a
-    human — far better than shipping "Ancient Town" where the brand is "Hoi An".
+    Only terms the *source* actually contains are required in the output.
+    Requiring every term in the locale's glossary would fail the translation of
+    "Japanese Bridge" because it does not mention "Hoi An" - a glossary would
+    then get less usable with every term added to it, which is precisely
+    backwards.
+
+    Instructing a model is a request; checking the output is a guarantee. A term
+    that went missing fails the job, which retries and eventually parks it for a
+    human - far better than shipping "Ancient Town" where the brand is "Hoi An".
     """
+    folded_source = source.casefold()
+    folded_output = translated.casefold()
     missing = [
         term.term
         for term in terms
-        if term.do_not_translate and term.term.casefold() not in text.casefold()
+        if term.do_not_translate
+        and term.term.casefold() in folded_source
+        and term.term.casefold() not in folded_output
     ]
     if missing:
         raise GlossaryViolation(f"missing untranslated terms: {', '.join(sorted(missing))}")
+
+
+def _still_ours(job: Leased):
+    """Every job transition names the lease it was made under.
+
+    Matching on `id` alone is not enough. A worker whose lease expired is still
+    running: it finishes late, writes `status='queued', lease_token=NULL`, and
+    silently unlatches the lease a *second* worker is currently holding - which
+    then has its own completion rejected, or worse, has a third worker start the
+    same job while it is still in flight. The token is what makes a late worker
+    harmless instead of destructive.
+    """
+    return and_(
+        TranslationJob.id == job.job_id,
+        TranslationJob.status == "leased",
+        TranslationJob.lease_token == job.lease_token,
+    )
 
 
 async def commit_translation(
@@ -267,25 +301,35 @@ async def commit_translation(
 
     await session.execute(
         update(TranslationJob)
-        .where(TranslationJob.id == job.job_id)
+        .where(_still_ours(job))
         .values(status="done", lease_token=None, leased_until=None, error_detail=None)
     )
     return True
 
 
-async def fail_job(session: AsyncSession, job: Leased, detail: str) -> None:
-    """Release the lease and record why, parking the job at the attempt cap."""
+async def fail_job(session: AsyncSession, job: Leased, detail: str) -> bool:
+    """Release the lease and record why, parking the job at the attempt cap.
+
+    Returns True when this was the last attempt. The field is only marked
+    `failed` if the *job* transition actually bit, so a worker whose lease has
+    already been taken away cannot condemn a field another worker is about to
+    translate successfully.
+    """
     terminal = job.attempts >= MAX_ATTEMPTS
-    await session.execute(
+    fenced = await session.execute(
         update(TranslationJob)
-        .where(TranslationJob.id == job.job_id)
+        .where(_still_ours(job))
         .values(
             status="failed" if terminal else "queued",
             lease_token=None,
             leased_until=None,
             error_detail=detail[:2000],
         )
+        .returning(TranslationJob.id)
     )
+    if fenced.scalar_one_or_none() is None:
+        return False
+
     if terminal:
         await session.execute(
             update(TranslationField)
@@ -298,6 +342,161 @@ async def fail_job(session: AsyncSession, job: Leased, detail: str) -> None:
             )
             .values(status="failed")
         )
+    return terminal
+
+
+async def sweep_stalled_leases(session: AsyncSession) -> int:
+    """Park jobs that died holding their final attempt.
+
+    `lease_jobs` refuses anything at the attempt cap, so a process killed on its
+    fifth attempt leaves a row that is `leased`, expired, and invisible to every
+    query in this module - not reclaimable, not failed, not reported. It waits
+    there forever looking like work in progress.
+    """
+    stalled = await session.execute(
+        update(TranslationJob)
+        .where(
+            TranslationJob.status == "leased",
+            TranslationJob.leased_until < datetime.now(UTC),
+            TranslationJob.attempts >= MAX_ATTEMPTS,
+        )
+        .values(
+            status="failed",
+            lease_token=None,
+            leased_until=None,
+            error_detail="lease expired on the final attempt",
+        )
+        .returning(TranslationJob.id)
+    )
+    return len(stalled.all())
+
+
+async def revive_failed_jobs(session: AsyncSession) -> int:
+    """Give up-to-date failed jobs their attempts back.
+
+    Five failures against a provider outage is not evidence that a field cannot
+    be translated, but it is terminal: the field is `failed`, and re-enqueueing
+    cannot help because the desired fingerprint has not moved and the uniqueness
+    key still holds the dead job. Without an explicit revival the outage parks
+    those translations permanently.
+
+    Only revives jobs that still describe what the field wants. A failed job for
+    a fingerprint the catalogue has moved past is genuinely dead work.
+    """
+    live = (
+        select(TranslationField.entity_id)
+        .where(
+            TranslationField.entity_type == TranslationJob.entity_type,
+            TranslationField.entity_id == TranslationJob.entity_id,
+            TranslationField.field == TranslationJob.field,
+            TranslationField.locale == TranslationJob.locale,
+            TranslationField.desired_fingerprint == TranslationJob.fingerprint,
+            TranslationField.generation == TranslationJob.generation,
+        )
+        .exists()
+    )
+    revived = await session.execute(
+        update(TranslationJob)
+        .where(TranslationJob.status == "failed", live)
+        .values(status="queued", attempts=0, lease_token=None, leased_until=None)
+        .returning(TranslationJob.id, TranslationJob.entity_id)
+    )
+    rows = revived.all()
+    for _, entity_id in rows:
+        await session.execute(
+            update(TranslationField)
+            .where(
+                TranslationField.entity_type == ENTITY_EXPERIENCE,
+                TranslationField.entity_id == entity_id,
+                TranslationField.status == "failed",
+            )
+            .values(status="pending")
+        )
+    return len(rows)
+
+
+async def _run_one(session_factory, translator, job: Leased, *, hold_all: bool) -> str:
+    """Translate and publish one field. Returns the outcome to count it under.
+
+    Every failure path is inside this function, including a failure of the
+    *commit* itself. Letting a database error out of here would abandon the rest
+    of the batch still leased, so the whole batch would go quiet for five
+    minutes and then retry - having consumed an attempt each for a fault that
+    had nothing to do with them.
+    """
+    settings = get_settings()
+    try:
+        async with session_factory() as session:
+            terms = await load_glossary(session, job.locale)
+        translated = await asyncio.wait_for(
+            translator(job=job, glossary=terms),
+            timeout=settings.translation_timeout_seconds,
+        )
+        verify_glossary(job.source_text, translated, terms)
+    except BudgetExceeded as exc:
+        # Not a failure of this job: the work is fine, we simply declined to pay
+        # for it right now. Consuming an attempt would mean a spending ceiling
+        # could permanently park five batches' worth of translations.
+        return await _defer(session_factory, job, str(exc))
+    except Exception as exc:  # noqa: BLE001 - every failure is one retry
+        return await _record_failure(session_factory, job, exc)
+
+    try:
+        async with session_factory() as session:
+            published = await commit_translation(
+                session,
+                job,
+                translated=translated,
+                requires_review=hold_all or field_requires_review(job.field),
+            )
+            if not published:
+                await session.execute(
+                    update(TranslationJob)
+                    .where(_still_ours(job))
+                    .values(status="superseded", lease_token=None, leased_until=None)
+                )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        return await _record_failure(session_factory, job, exc)
+
+    return "published" if published else "superseded"
+
+
+async def _defer(session_factory, job: Leased, detail: str) -> str:
+    """Hand the job back untouched, including its attempt."""
+    async with session_factory() as session:
+        await session.execute(
+            update(TranslationJob)
+            .where(_still_ours(job))
+            .values(
+                status="queued",
+                lease_token=None,
+                leased_until=None,
+                attempts=TranslationJob.attempts - 1,
+                error_detail=detail[:2000],
+            )
+        )
+        await session.commit()
+    return "deferred"
+
+
+async def _record_failure(session_factory, job: Leased, exc: Exception) -> str:
+    detail = f"{type(exc).__name__}: {exc}"
+    try:
+        async with session_factory() as session:
+            terminal = await fail_job(session, job, detail)
+            await session.commit()
+    except Exception:  # noqa: BLE001
+        # Even recording the failure failed. The lease still expires, and
+        # `sweep_stalled_leases` is what stops the job hiding forever if this
+        # was its last attempt.
+        logger.exception("translation.failure_unrecorded", extra={"job_id": str(job.job_id)})
+        return "failed"
+    logger.warning(
+        "translation.failed",
+        extra={"job_id": str(job.job_id), "terminal": terminal, "detail": detail},
+    )
+    return "failed" if terminal else "retrying"
 
 
 async def drain(
@@ -305,49 +504,46 @@ async def drain(
     translator,
     *,
     limit: int | None = None,
-    requires_review: bool = False,
+    hold_all: bool = False,
+    concurrency: int | None = None,
 ) -> dict[str, int]:
     """Work the queue once. Each job commits in its own transaction.
 
     One transaction per job, not one for the batch: a glossary violation on the
     twelfth job must not roll back eleven good translations.
+
+    Jobs run concurrently because the batch is dominated by provider latency,
+    not by database work. Sequentially, a first backfill of ten thousand fields
+    at two seconds each is closer to six hours than to one - which is not a
+    performance complaint, it is the difference between a job that finishes and
+    a job that gets killed by its timeout every night.
     """
     settings = get_settings()
     batch = limit if limit is not None else settings.translation_batch
+    lanes = concurrency if concurrency is not None else settings.translation_concurrency
 
     async with session_factory() as session:
+        await sweep_stalled_leases(session)
         jobs = await lease_jobs(session, limit=batch)
         await session.commit()
 
-    counts = {"leased": len(jobs), "published": 0, "superseded": 0, "failed": 0}
+    counts = {
+        "leased": len(jobs),
+        "published": 0,
+        "superseded": 0,
+        "retrying": 0,
+        "failed": 0,
+        "deferred": 0,
+    }
+    if not jobs:
+        return counts
 
-    for job in jobs:
-        try:
-            async with session_factory() as session:
-                terms = await load_glossary(session, job.locale)
-            translated = await asyncio.wait_for(
-                translator(job=job, glossary=terms),
-                timeout=settings.translation_timeout_seconds,
-            )
-            verify_glossary(translated, terms)
-        except Exception as exc:  # noqa: BLE001 - every failure is one retry
-            async with session_factory() as session:
-                await fail_job(session, job, f"{type(exc).__name__}: {exc}")
-                await session.commit()
-            counts["failed"] += 1
-            continue
+    gate = asyncio.Semaphore(max(1, lanes))
 
-        async with session_factory() as session:
-            published = await commit_translation(
-                session, job, translated=translated, requires_review=requires_review
-            )
-            if not published:
-                await session.execute(
-                    update(TranslationJob)
-                    .where(TranslationJob.id == job.job_id)
-                    .values(status="superseded", lease_token=None, leased_until=None)
-                )
-            await session.commit()
-        counts["published" if published else "superseded"] += 1
+    async def guarded(job: Leased) -> str:
+        async with gate:
+            return await _run_one(session_factory, translator, job, hold_all=hold_all)
 
+    for outcome in await asyncio.gather(*(guarded(job) for job in jobs)):
+        counts[outcome] += 1
     return counts

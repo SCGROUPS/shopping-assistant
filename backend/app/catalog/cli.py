@@ -8,6 +8,7 @@ from app.catalog.importer import import_trippass
 from app.catalog.indexing import run_reindex
 from app.catalog.seed import build_seed_catalog
 from app.common.store import store
+from app.content.jobs import backlog as translation_backlog
 from app.content.jobs import drain_translations, enqueue_all
 
 
@@ -52,9 +53,14 @@ def main() -> None:
         help="Translate at most this many fields, then stop. Omit to drain the queue.",
     )
     parser.add_argument(
-        "--publish",
+        "--revive",
         action="store_true",
-        help="Publish machine output directly instead of holding it for review.",
+        help="Give up-to-date failed jobs their attempts back before draining.",
+    )
+    parser.add_argument(
+        "--hold-for-review",
+        action="store_true",
+        help="Hold every field for review, not just the policy-bearing ones.",
     )
     parser.add_argument(
         "--days",
@@ -112,15 +118,23 @@ def main() -> None:
     if args.command == "translate":
         totals = asyncio.run(
             drain_translations(
-                limit=args.limit, requires_review=False if args.publish else None
+                limit=args.limit,
+                hold_all=args.hold_for_review,
+                revive=args.revive,
             )
         )
         print(
             f"Translated {totals['published']} fields "
-            f"({totals['superseded']} superseded, {totals['failed']} failed)"
+            f"({totals['superseded']} superseded, {totals['retrying']} retrying, "
+            f"{totals['failed']} failed, {totals['revived']} revived)"
         )
-        # A failure here is a field the storefront will keep serving in the
-        # wrong language until somebody looks, so it must not exit zero.
+        remaining = asyncio.run(translation_backlog())
+        if remaining:
+            summary = ", ".join(f"{n} {status}" for status, n in sorted(remaining.items()))
+            print(f"Translation backlog not empty: {summary}")
+        # Only *terminal* failures are an error. A job that failed once and will
+        # be retried is the queue working, and exiting non-zero for it would
+        # make a transient provider blip fail the deployment.
         if totals["failed"]:
             raise SystemExit(1)
         return

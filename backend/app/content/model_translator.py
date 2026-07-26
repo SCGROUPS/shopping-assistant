@@ -13,6 +13,7 @@ import json
 from typing import Any
 
 from app.common.config import get_settings
+from app.common.llm_cost import BudgetExceeded, ledger
 from app.common.locales import LOCALE_NAMES
 from app.common.models import TranslationGlossary
 from app.content.translator import Leased
@@ -68,6 +69,10 @@ def make_translator(provider: Any):
             return ""
 
         settings = get_settings()
+        if ledger.exhausted(settings.translation_daily_budget):
+            raise BudgetExceeded(
+                f"Daily translation budget of ${settings.translation_daily_budget:.2f} reached"
+            )
         target = LOCALE_NAMES.get(job.locale, job.locale)
         system = _SYSTEM.format(target=target)
         instruction = build_glossary_instruction(glossary)
