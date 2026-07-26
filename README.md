@@ -1,9 +1,15 @@
-# Vietra
+# Intelligent Travel Commerce Assistant
 
-Vietra is an intelligent Vietnam tourism e-ticket marketplace proof of concept.
-It combines traditional filters, PostgreSQL full-text and vector search,
-explainable recommendations, voice interaction, and an Azure OpenAI shopping
-assistant that can guide a user through a simulated purchase.
+An intelligent e-ticket and experience marketplace proof of concept for the
+travel and tourism industry. It combines traditional filters, PostgreSQL
+full-text and vector search, explainable recommendations, voice interaction,
+and an Azure OpenAI shopping assistant that can guide a user through a
+simulated purchase.
+
+The retrieval, ranking, assistant, and commerce layers are destination
+agnostic. The reference implementation and its demo catalog are codenamed
+**Vietra** and are populated with a Vietnam tourism dataset, which is what the
+source code, deployment scripts, and seed data refer to throughout.
 
 ## Documentation
 
@@ -31,9 +37,9 @@ assistant that can guide a user through a simulated purchase.
 - Browser speech recognition for search and assistant prompts, plus
   speech-synthesis playback for assistant responses.
 
-The seed contains 360 deterministic products across Hanoi, Ha Long, Ninh Binh,
-Sapa, Hue, Da Nang, Hoi An, Quy Nhon, Nha Trang, Da Lat, Ho Chi Minh City,
-the Mekong Delta, Can Tho, Phu Quoc, Mui Ne, and Con Dao.
+The demo seed contains 360 deterministic products across Hanoi, Ha Long, Ninh
+Binh, Sapa, Hue, Da Nang, Hoi An, Quy Nhon, Nha Trang, Da Lat, Ho Chi Minh
+City, the Mekong Delta, Can Tho, Phu Quoc, Mui Ne, and Con Dao.
 The wider catalog also includes Vung Tau and Buon Ma Thuot.
 
 ## Local demo
@@ -124,3 +130,7 @@ idempotency state are PostgreSQL-backed outside explicit demo mode.
   Azure with GitHub OIDC, wait for catalog seeding and readiness, then execute
   the desktop and mobile Playwright journeys against the live application.
 - Documentation-only and demo-data-only changes do not trigger deployment.
+
+## License
+
+Released under the [MIT License](LICENSE).

@@ -3,6 +3,7 @@ name = "tourism-shopping-assistant-backend"
 version = "0.1.0"
 description = "Intelligent Tourism E-Ticket Shopping Assistant POC backend"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11,<3.15"
 dependencies = [
   "alembic>=1.14,<2",
