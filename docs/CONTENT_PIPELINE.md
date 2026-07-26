@@ -1878,6 +1878,12 @@ first, then revision 2's.
 | Rate limiting can be deferred | Auth runs scrypt on unknown prefixes, so unthrottled requests are a CPU-cost amplifier |
 | Adding eval cases proves the languages work | The tokenizer emitted nothing for CJK; cases would have passed vacuously |
 | **The importer rewrites all fields** | It rewrites an explicit supplier-owned subset (`IMPORTED_FIELDS`) and skips protected ones |
+| A queued `IndexWorkItem` means the listing is findable | The outbox guarantees the *intent* to index was committed, not that indexing succeeded; the publish gate now requires a finished rebuild |
+| Telling the model which values are permitted is enough | Prose listing the vocabulary failed on both nano and mini; only a `strict` schema enum stopped invented categories |
+| Destination could stay free text | The model answers in the shopper's script — `Hội An`, `会安` — which are correct and unmatchable; it must be an enum of real places so the model does the resolving |
+| `casefold()` compares two spellings of a Vietnamese place | It does not fold diacritics, so the shopper who spelled the city properly was the one who got nothing |
+| The seed corpus and the importer share a vocabulary | They never did. `Food experience` vs `Food` reached production, and the model preferred the spelling with one listing nationwide |
+| A search returning zero items is a bug | Not when the date is nineteen months out with no availability; returning the relaxation candidates is the shopper's decision to make (§2 directive) |
 | **The storefront assumes a supplier exists** | `common/persistence.py` never references `Supplier`; only the admin console joins it |
 | **Booking rendering reads current names** | `BookingView` carries no listing names at all — worse than assumed |
 | **A single fingerprint makes CAS safe** | It conflates published-from with should-be; needs `published`/`desired` plus a `generation` counter |

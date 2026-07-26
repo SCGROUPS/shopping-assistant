@@ -176,3 +176,22 @@ az postgres flexible-server firewall-rule create \
 The model is non-deterministic, so each query runs five times and the invariant
 has to hold on every one. A single green pass proves nothing about a failure
 that shows up half the time.
+
+### Comparing intent models
+
+`scripts/compare_intent_models.py` runs two Azure OpenAI deployments end-to-end
+against the live catalogue and scores them on stated-correct answers rather than
+on whether the models agree with each other. Agreement proves nothing: both were
+wrong about the same things before the destination enum landed.
+
+```bash
+export DEMO_MODE=false                     # before import: the engine is built at module load
+export DATABASE_URL="postgresql+psycopg://..."
+export AZURE_OPENAI_ENDPOINT="https://<account>.openai.azure.com/"
+export AZURE_OPENAI_API_KEY="$(az cognitiveservices account keys list -g <rg> -n <account> --query key1 -o tsv)"
+.venv/bin/python scripts/compare_intent_models.py
+```
+
+It aborts if fewer than 100 products load. An empty catalogue scores 100% on
+every axis because nothing it reports can be contradicted, and the first run of
+this harness did exactly that and looked like a pass.
