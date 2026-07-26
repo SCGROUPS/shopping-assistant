@@ -729,7 +729,15 @@ class AzureOpenAIProvider:
                     "schema": schema,
                 }
             },
-            reasoning={"effort": "minimal"},
+            # "minimal" is not a value any deployment we run still accepts.
+            # It was valid on gpt-5-nano; that deployment was retired, and both
+            # gpt-5.4-nano and gpt-5.4-mini reject it with a 400. Extraction
+            # then fell back to deterministic parsing on every single request -
+            # a total, permanent failure of the intent layer that returned HTTP
+            # 200 with a full page of unfiltered results, so nothing looked
+            # wrong from outside. "none" is accepted by both and is the right
+            # setting for extraction that a strict schema already constrains.
+            reasoning={"effort": "none"},
             max_output_tokens=800,
         )
         self._record(response, self.settings.azure_openai_intent_deployment, "intent")
