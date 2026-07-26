@@ -1512,6 +1512,62 @@ anything, which costs nothing and removes the cycle by construction.
 
 ---
 
+### 9.5 A deployment pays for round trips, not for work
+
+The first full multilingual deployment took thirty-four minutes and the
+catalogue job took seventeen and a half of them. Almost none of that was
+computation. `refresh_availability` reconciles 22,680 seed slots, and it did so
+with 22,680 separate `UPDATE ... WHERE id = ?` statements. Against a managed
+Postgres in another datacentre each one costs about 29ms of network latency, so
+the statement that touches one row for microseconds waits four orders of
+magnitude longer to be told it happened. Eleven minutes, for a few megabytes.
+
+The refresh now sends the slots as chunked `INSERT ... ON CONFLICT (id) DO
+UPDATE` statements — twelve of them instead of 22,680 — with the chunk sized
+against Postgres' 65535 bind-parameter limit rather than against anything about
+our data, because that is the constraint that actually exists.
+
+Two things about the upsert are load-bearing and easy to lose:
+
+**The seed owns capacity and nothing else.** `DO UPDATE SET` lists exactly
+`capacity_total` and `capacity_remaining`. Times, `status` and `price_override`
+on a row we already have are operational state that an operator or a booking put
+there, and an upsert that wrote every column would silently make a withdrawn
+slot sellable again on the next deployment. The narrow `SET` is the whole
+difference, so a test asserts it directly.
+
+**Chunking fails quietly.** A boundary bug does not raise; it just stops writing
+part-way through and reports success for the rows it did write. `_UPSERT_CHUNK`
+is therefore read inside the function body rather than bound as a default
+argument, so a test can shrink it and drive the real loop across several
+boundaries with a handful of slots.
+
+**The speed bought a correctness fix.** The refresh reads how much has been
+booked, then writes seed capacity minus that total. Checkout locks the slot row
+and decrements it. A checkout committing between those two steps was invisible
+to the total and then overwritten by it, putting capacity that had genuinely
+been sold back on sale — the exact dishonesty the function's own docstring
+promises to avoid. The refresh now takes `LOCK TABLE availability_slots IN
+EXCLUSIVE MODE` before reading, so the read and the write are atomic with
+respect to checkout.
+
+That lock was unaffordable at eleven minutes and is unremarkable at a few
+seconds; the performance work is what made the correctness work possible.
+
+The mode matters and the obvious choice is wrong. `SHARE ROW EXCLUSIVE` looks
+sufficient because it conflicts with the `ROW EXCLUSIVE` that checkout's UPDATE
+takes — but checkout *starts* with `SELECT ... FOR UPDATE`, which takes only
+`ROW SHARE`. That slips past the lock, takes the row, and then blocks on the
+`ROW EXCLUSIVE` it needs next, while the refresh blocks on the row it is
+holding: a deadlock, which the concurrency test found on its first run.
+`EXCLUSIVE` conflicts with `ROW SHARE` as well, so checkout waits at the table
+before it holds anything and the refresh can never wait on a row while holding
+the table. Plain reads take `ACCESS SHARE` and are unaffected, so the storefront
+keeps serving availability throughout.
+
+The same reasoning applies wherever a deployment step looks slow. Before
+optimising the work, count the round trips.
+
 ## 10. Evaluation, and why it comes first
 
 §1.3 establishes that the harness could not fail on this defect. Two fixes:
@@ -1796,6 +1852,9 @@ first, then revision 2's.
 | **A failed batch should be retried document by document** | For a rate limit or timeout that turns one refused request into 64 more and spends an attempt on each. Transient failures hand the batch back untouched; only non-transient ones fan out, because only they might be one bad document (§9.4) |
 | **The embedding client's default timeout is good enough** | It has none. A worker holds a lease while it waits, so an unbounded request can outlive the lease it is holding — work reassigned, attempt spent, nothing reported (§9.4) |
 | **`replicaRetryLimit: 1` is harmless caution** | It lets one execution outlive the deployment script's wait by a whole replica timeout while still looking like it might succeed, so the deployment fails for a job that is running perfectly well (§9.4) |
+| **The slow part of a deployment is the work it does** | The availability refresh did almost no work and took eleven of thirty-four minutes, because it spent them on 22,680 sequential round trips to a database in another datacentre. Latency, not computation, is what a deployment pays for (§9.5) |
+| **A table lock is too blunt for a maintenance job** | It is priced in the duration of the transaction that holds it, and that is a number you control. Eleven minutes of blocked checkout is intolerable; two seconds is cheaper than the oversell it prevents (§9.5) |
+| **`SHARE ROW EXCLUSIVE` excludes writers** | It does not exclude `SELECT ... FOR UPDATE`, which takes only `ROW SHARE`. A writer can take the row lock, then block on the table lock, while the holder of the table lock blocks on the row - a deadlock that reads like mutual exclusion (§9.5) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,
 migration entirely, the `language`/`locale` collision, audit attribution for

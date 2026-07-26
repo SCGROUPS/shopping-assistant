@@ -5,7 +5,8 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.assistant.provider import AIProvider, build_ai_provider
 from app.catalog.seed import build_seed_catalog, stable_id
@@ -215,6 +216,10 @@ async def seed_database(
     return len(catalog)
 
 
+# Eight columns a row, against Postgres' limit of 65535 bind parameters.
+_UPSERT_CHUNK = 2000
+
+
 async def refresh_availability() -> dict[str, int]:
     """Reconcile seeded availability without destroying anything.
 
@@ -247,6 +252,27 @@ async def refresh_availability() -> dict[str, int]:
     }
 
     async with session_factory() as session:
+        # Subtracting sold capacity is only honest if nothing is sold between
+        # reading the total and writing it back. Checkout locks the slot row and
+        # decrements it, so a booking that commits in that gap gets overwritten
+        # by a total computed before it existed - capacity that was sold, resold.
+        #
+        # SHARE ROW EXCLUSIVE is not enough: checkout begins with SELECT ... FOR
+        # UPDATE, which takes only ROW SHARE at table level and so slips past
+        # it, takes the row, and then blocks on the ROW EXCLUSIVE its UPDATE
+        # needs - while we block on the row it is holding. That is a deadlock,
+        # and a test found it. EXCLUSIVE conflicts with ROW SHARE too, so
+        # checkout waits at the table before it holds anything, and we can never
+        # wait on a row while holding the table. Plain reads take ACCESS SHARE
+        # and are unaffected, so the storefront keeps serving availability.
+        #
+        # This is only affordable because the write below is now twelve
+        # statements: the transaction lasts seconds, and holding checkout for
+        # seconds during a deployment is a fair price for never overselling. At
+        # 22,680 round trips it would have been eleven minutes, which is why the
+        # lock could not have been taken before.
+        await session.execute(text("LOCK TABLE availability_slots IN EXCLUSIVE MODE"))
+
         booked_rows = (
             await session.execute(
                 select(
@@ -274,35 +300,46 @@ async def refresh_availability() -> dict[str, int]:
             ).all()
         )
 
-        created = 0
-        updated = 0
-        for slot_id, (option_id, slot) in seeded.items():
-            consumed = booked.get(slot_id, 0)
-            remaining = max(0, slot["capacity_remaining"] - consumed)
-            if slot_id in existing:
-                await session.execute(
-                    update(AvailabilitySlot)
-                    .where(AvailabilitySlot.id == slot_id)
-                    .values(
-                        capacity_total=slot["capacity_total"],
-                        capacity_remaining=remaining,
-                    )
+        rows = [
+            {
+                "id": slot_id,
+                "option_id": option_id,
+                "starts_at": slot["starts_at"],
+                "ends_at": slot["ends_at"],
+                "capacity_total": slot["capacity_total"],
+                "capacity_remaining": max(
+                    0, slot["capacity_remaining"] - booked.get(slot_id, 0)
+                ),
+                "status": slot["status"],
+                "price_override": None,
+            }
+            for slot_id, (option_id, slot) in seeded.items()
+        ]
+
+        # One statement per chunk rather than one per slot. A round trip to a
+        # managed database is around 30ms, so 22,680 of them is eleven minutes
+        # of a deployment spent waiting on the network - which is what it cost
+        # before this, and most of the reason a deploy took half an hour.
+        #
+        # Chunked because Postgres accepts 65535 bind parameters per statement
+        # and each row carries eight.
+        for start in range(0, len(rows), _UPSERT_CHUNK):
+            chunk = rows[start : start + _UPSERT_CHUNK]
+            statement = pg_insert(AvailabilitySlot).values(chunk)
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[AvailabilitySlot.id],
+                    # Deliberately only the capacity columns. A slot that already
+                    # exists keeps its own times, status and price override -
+                    # those are operational state, not seed data, and the seed
+                    # has no business reverting them.
+                    set_={
+                        "capacity_total": statement.excluded.capacity_total,
+                        "capacity_remaining": statement.excluded.capacity_remaining,
+                    },
                 )
-                updated += 1
-            else:
-                session.add(
-                    AvailabilitySlot(
-                        id=slot_id,
-                        option_id=option_id,
-                        starts_at=slot["starts_at"],
-                        ends_at=slot["ends_at"],
-                        capacity_total=slot["capacity_total"],
-                        capacity_remaining=remaining,
-                        status=slot["status"],
-                        price_override=None,
-                    )
-                )
-                created += 1
+            )
         await session.commit()
 
-    return {"created": created, "updated": updated}
+    updated = len(existing)
+    return {"created": len(rows) - updated, "updated": updated}
