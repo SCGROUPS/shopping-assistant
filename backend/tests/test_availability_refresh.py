@@ -281,3 +281,83 @@ async def test_refresh_never_reports_negative_capacity(factory, monkeypatch):
     await refresh_availability()
 
     assert await _capacity(factory, slot_id) == 0
+
+
+async def test_refresh_leaves_operational_state_on_a_slot_it_already_has(factory, monkeypatch):
+    """The seed owns capacity. It does not own what has happened to a slot since.
+
+    A slot's times, its status and any price override are operational state that
+    an operator or a booking flow put there. The refresh exists to push a changed
+    supply profile into a database that has already been seeded, and an upsert
+    that wrote every column would quietly revert all of it - turning a
+    WITHDRAWN slot back into a sellable one on the next deployment.
+    """
+    slot_id = uuid4()
+    starts = datetime.now(UTC) + timedelta(days=2)
+    async with factory() as db, db.begin():
+        db.add(
+            AvailabilitySlot(
+                id=slot_id,
+                option_id=OPTION_ID,
+                starts_at=starts,
+                ends_at=starts + timedelta(hours=2),
+                capacity_total=18,
+                capacity_remaining=15,
+                status="WITHDRAWN",
+                price_override={"adult": "123.45"},
+            )
+        )
+    monkeypatch.setattr(
+        db_seed, "build_seed_catalog", lambda: _mini_catalog(slot_id, starts, 12, 2)
+    )
+
+    await refresh_availability()
+
+    async with factory() as db:
+        slot = await db.get(AvailabilitySlot, slot_id)
+    assert slot is not None
+    assert slot.capacity_total == 12
+    assert slot.capacity_remaining == 2
+    assert slot.status == "WITHDRAWN"
+    assert slot.price_override == {"adult": "123.45"}
+
+
+async def test_refresh_covers_every_slot_when_it_has_to_chunk(factory, monkeypatch):
+    """Postgres takes 65535 bind parameters, and the real seed is 22,680 slots.
+
+    Sending them as one statement is the difference between a deployment that
+    waits eleven minutes on round trips and one that does not, but it only works
+    in chunks - and a chunking bug loses whichever slots fall past the first
+    boundary without failing anything.
+    """
+    starts = datetime.now(UTC) + timedelta(days=2)
+    slot_ids = [uuid4() for _ in range(7)]
+    catalog = [
+        {
+            "id": EXPERIENCE_ID,
+            "options": [
+                {
+                    "id": OPTION_ID,
+                    "slots": [
+                        {
+                            "id": slot_id,
+                            "starts_at": starts + timedelta(hours=n),
+                            "ends_at": starts + timedelta(hours=n + 2),
+                            "capacity_total": 10,
+                            "capacity_remaining": n,
+                            "status": "AVAILABLE",
+                        }
+                        for n, slot_id in enumerate(slot_ids)
+                    ],
+                }
+            ],
+        }
+    ]
+    monkeypatch.setattr(db_seed, "build_seed_catalog", lambda: catalog)
+    monkeypatch.setattr(db_seed, "_UPSERT_CHUNK", 2)
+
+    result = await refresh_availability()
+
+    assert result == {"created": 7, "updated": 0}
+    for n, slot_id in enumerate(slot_ids):
+        assert await _capacity(factory, slot_id) == n

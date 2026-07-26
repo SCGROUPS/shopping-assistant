@@ -1512,6 +1512,39 @@ anything, which costs nothing and removes the cycle by construction.
 
 ---
 
+### 9.5 A deployment pays for round trips, not for work
+
+The first full multilingual deployment took thirty-four minutes and the
+catalogue job took seventeen and a half of them. Almost none of that was
+computation. `refresh_availability` reconciles 22,680 seed slots, and it did so
+with 22,680 separate `UPDATE ... WHERE id = ?` statements. Against a managed
+Postgres in another datacentre each one costs about 29ms of network latency, so
+the statement that touches one row for microseconds waits four orders of
+magnitude longer to be told it happened. Eleven minutes, for a few megabytes.
+
+The refresh now sends the slots as chunked `INSERT ... ON CONFLICT (id) DO
+UPDATE` statements — twelve of them instead of 22,680 — with the chunk sized
+against Postgres' 65535 bind-parameter limit rather than against anything about
+our data, because that is the constraint that actually exists.
+
+Two things about the upsert are load-bearing and easy to lose:
+
+**The seed owns capacity and nothing else.** `DO UPDATE SET` lists exactly
+`capacity_total` and `capacity_remaining`. Times, `status` and `price_override`
+on a row we already have are operational state that an operator or a booking put
+there, and an upsert that wrote every column would silently make a withdrawn
+slot sellable again on the next deployment. The narrow `SET` is the whole
+difference, so a test asserts it directly.
+
+**Chunking fails quietly.** A boundary bug does not raise; it just stops writing
+part-way through and reports success for the rows it did write. `_UPSERT_CHUNK`
+is therefore read inside the function body rather than bound as a default
+argument, so a test can shrink it and drive the real loop across several
+boundaries with a handful of slots.
+
+The same reasoning applies wherever a deployment step looks slow. Before
+optimising the work, count the round trips.
+
 ## 10. Evaluation, and why it comes first
 
 §1.3 establishes that the harness could not fail on this defect. Two fixes:
@@ -1796,6 +1829,7 @@ first, then revision 2's.
 | **A failed batch should be retried document by document** | For a rate limit or timeout that turns one refused request into 64 more and spends an attempt on each. Transient failures hand the batch back untouched; only non-transient ones fan out, because only they might be one bad document (§9.4) |
 | **The embedding client's default timeout is good enough** | It has none. A worker holds a lease while it waits, so an unbounded request can outlive the lease it is holding — work reassigned, attempt spent, nothing reported (§9.4) |
 | **`replicaRetryLimit: 1` is harmless caution** | It lets one execution outlive the deployment script's wait by a whole replica timeout while still looking like it might succeed, so the deployment fails for a job that is running perfectly well (§9.4) |
+| **The slow part of a deployment is the work it does** | The availability refresh did almost no work and took eleven of thirty-four minutes, because it spent them on 22,680 sequential round trips to a database in another datacentre. Latency, not computation, is what a deployment pays for (§9.5) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,
 migration entirely, the `language`/`locale` collision, audit attribution for
