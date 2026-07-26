@@ -638,10 +638,17 @@ ContainerAppConsoleLogs_CL
 // "gave up" is deliberately not here - it is logged on the ok=True unverified
 // path where the revision serves normally, and paging sev-0 for that teaches
 // people to ignore the rule that means the storefront is dark.
+//
+// Matched on the composed phrase rather than the bare word "rejected". An
+// inconclusive probe quotes its upstream error verbatim, and a Network
+// Security Perimeter, WAF or APIM 403 reads "request was rejected by ..." -
+// a survivable failure the probe itself labels "not a rejection". Unlike the
+// deploy gate, nothing here gates on readiness first, so the bare word would
+// page at severity 0 on a revision that is serving correctly.
 var kqlProbeFilter = '''
 ContainerAppConsoleLogs_CL
 | where ContainerAppName_s == '__APP__'
-| where Log_s has 'Intent probe' and (Log_s has 'rejected' or Log_s has 'skipped')
+| where Log_s has 'Intent probe' and (Log_s contains 'deployment rejected our request' or Log_s has 'skipped')
 | summarize RejectedProbes = count()
 '''
 

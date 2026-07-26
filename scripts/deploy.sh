@@ -390,12 +390,17 @@ while (( SECONDS < deadline )); do
 
   # Only once readiness has had a fair chance, because this call is expensive.
   if (( SECONDS > deadline - 540 )); then
-    # Any rejection at all. The probe returns as soon as two attempts are
-    # rejected, so "rejected and never overturned" is not logged on the real
-    # outage - and needs more attempt-retries than the deadline allows, so it
-    # cannot be logged under the supervisor at any point. Matching only that
-    # line meant matching the one line that never appears.
-    if probe_verdict | grep -q 'rejected'; then
+    # Matched on the phrase the REJECTED branch composes, not on the bare word
+    # "rejected". The probe returns as soon as two attempts are rejected, so
+    # "rejected and never overturned" is not logged on the real outage and
+    # matching only that line matched the one line that never appears - but
+    # widening to the bare word overshot: an *inconclusive* failure quotes the
+    # upstream error verbatim, and a Network Security Perimeter, WAF or APIM
+    # 403 says "request was rejected by ...". That is a survivable error the
+    # probe explicitly labels "not a rejection". This phrase is composed by
+    # intent_probe.py's REJECTED branch alone; the inconclusive detail is
+    # prefixed "probe inconclusive:" and cannot reach this wording.
+    if probe_verdict | grep -q 'deployment rejected our request'; then
       deploy_failure="the intent probe rejected revision ${latest_revision}"
       break
     fi
@@ -414,6 +419,19 @@ fi
 
 if [[ -z "$deploy_failure" ]] && ! echo "$ready_body" | grep -q '"status": *"ready"'; then
   deploy_failure="revision ${latest_revision} never became ready"
+fi
+
+# "unverified" means the probe was cut short - timed out, crashed, or failed
+# for reasons that were not a rejection - and recorded ok=True because the
+# model being unreachable is not evidence that our request is wrong. Serving
+# is the right call, so this does not fail the deploy. But the gate has then
+# proved nothing, and a green deploy that checked nothing should not look
+# identical to a green deploy that checked something.
+if [[ -z "$deploy_failure" ]] && echo "$ready_body" | grep -q 'unverified'; then
+  echo "" >&2
+  echo "Warning: revision ${latest_revision} is serving, but the intent probe" >&2
+  echo "never reached a verdict, so this deploy was not actually verified." >&2
+  echo "  /health/ready said: ${ready_body}" >&2
 fi
 
 if [[ -n "$deploy_failure" ]]; then

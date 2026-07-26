@@ -537,3 +537,20 @@ async def test_the_skip_log_carries_the_word_the_sev_0_alert_matches(monkeypatch
         "the sev-0 rule matches on the word 'skipped' and it is no longer in "
         "the message; the alert would never fire"
     )
+
+    # The log line is one of two readers of this branch. The other is the
+    # deploy gate, which cannot use the log at all: this revision is *ready*,
+    # so the gate breaks out of its wait loop before it ever looks at console
+    # output, and the only evidence left is the detail string in the readiness
+    # body. Rewording it reopens the exact hole the gate was rewritten to
+    # close - a revision with no model configured deploying green - and until
+    # now failed nothing.
+    verdict = intent_health.probe()
+    assert verdict is not None and verdict.ok, (
+        "a model that was never called cannot be judged failed"
+    )
+    assert "no Azure OpenAI endpoint is configured" in verdict.detail, (
+        "scripts/deploy.sh greps /health/ready for this exact phrase; "
+        f"it now reads {verdict.detail!r}, so an unconfigured revision "
+        "would deploy green"
+    )
