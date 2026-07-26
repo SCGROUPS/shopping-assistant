@@ -15,6 +15,23 @@ from app.common.intent_probe import ProbeOutcome, probe_intent
 VOCABULARY = {"categories": ["Food", "Transport"], "destinations": ["Hoi An", "Hanoi"]}
 
 
+@pytest.fixture(autouse=True)
+def _no_rejection_carried_between_tests():
+    """`_pending_rejection` is module state, so it leaks across tests.
+
+    It was leaking usefully - one test's rejection was the only thing making
+    another test exercise the supervisor's reset. That is a coupling, not an
+    assertion: it survives only until someone reorders the file. Cleared here,
+    with the coverage it was accidentally providing written down explicitly in
+    `test_a_supervised_run_starts_from_a_clean_slate`.
+    """
+    import app.main as main
+
+    main._pending_rejection = None
+    yield
+    main._pending_rejection = None
+
+
 class _Rejected(Exception):
     """What the SDK raises when the deployment refuses the request itself."""
 
@@ -451,5 +468,38 @@ async def test_a_new_probe_does_not_inherit_the_previous_one_s_rejection(monkeyp
     assert probe is not None and probe.ok, (
         f"recorded {probe.detail if probe else None!r}; the deployment now accepts our "
         "requests and the revision is still being held down by an older verdict"
+    )
+    intent_health.reset()
+
+
+@pytest.mark.asyncio
+async def test_a_supervised_run_starts_from_a_clean_slate(monkeypatch):
+    """A repaired deployment must not be condemned by an earlier run's verdict.
+
+    `_pending_rejection` outlives the coroutine on purpose - that is what makes
+    a cancelled probe still able to report a rejection. The cost is that it
+    also outlives the *run*, so the supervisor clears it before starting one.
+
+    Without this test that reset is guarded only by another test happening to
+    leave the global dirty first, which stops being true the moment the file is
+    reordered or a cleanup fixture is added - and both have now happened.
+    """
+    import app.main as main
+
+    intent_health.reset()
+    monkeypatch.setattr(main, "_pending_rejection", "stale verdict from an earlier run")
+    monkeypatch.setattr(main, "PROBE_DEADLINE_SECONDS", 0.05)
+
+    async def _hangs() -> None:
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(main, "_run_intent_probe", _hangs)
+    await main._supervise_intent_probe()
+
+    probe = intent_health.probe()
+    assert probe is not None, "readiness would have stayed 503 forever"
+    assert probe.ok, (
+        f"recorded {probe.detail!r}; this deployment was merely slow, and it was held "
+        "down by a rejection that belonged to an earlier run"
     )
     intent_health.reset()

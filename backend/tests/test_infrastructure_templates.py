@@ -21,8 +21,31 @@ import pytest
 BICEP_DIR = Path(__file__).resolve().parents[2] / "infra" / "bicep"
 TEMPLATES = sorted(BICEP_DIR.glob("*.bicep"))
 
-# A ''' ... ''' block is verbatim: no ${...} substitution happens inside it.
-MULTILINE_BLOCK = re.compile(r"'''(.*?)'''", re.DOTALL)
+DELIMITER = "'" * 3
+# A multi-line block is verbatim: no ${...} substitution happens inside it.
+MULTILINE_BLOCK = re.compile(rf"{DELIMITER}(.*?){DELIMITER}", re.DOTALL)
+QUERY_VARIABLE = re.compile(rf"var (\w+) = {DELIMITER}(.*?){DELIMITER}", re.DOTALL)
+QUERY_ASSIGNMENT = re.compile(r"^\s*query: (.+)$", re.M)
+SUBSTITUTED = re.compile(r"replace\(\w+, '__APP__', appName\)")
+
+
+def _without_comments(source: str) -> str:
+    """Strip Bicep comments before any block parsing.
+
+    Learned the hard way, twice. A stray delimiter inside a `//` comment
+    desynchronises the block pairing, and the desync does not merely produce
+    false alarms - review demonstrated that it silently disarms the scan while
+    the real bug sits in the file untouched. A checker that fails open is worse
+    than no checker, because it is credited for the check it stopped doing.
+
+    The lookbehind keeps `https://...` intact, which is otherwise the obvious
+    way to break this file while fixing it.
+    """
+    return re.sub(r"(?<!:)//[^\n]*", "", source)
+
+
+def _blocks(source: str) -> list[str]:
+    return MULTILINE_BLOCK.findall(_without_comments(source))
 
 
 def test_there_are_templates_to_check():
@@ -32,16 +55,24 @@ def test_there_are_templates_to_check():
 
 @pytest.mark.parametrize("template", TEMPLATES, ids=lambda path: path.name)
 def test_no_multi_line_string_pretends_to_interpolate(template: Path):
-    """`${x}` inside a ''' block is six literal characters, not a value.
+    """`${x}` inside a multi-line block is six literal characters, not a value.
 
     Nothing rejects it - not the compiler, not ARM, not the deployment. The
     resource is created with the placeholder still in it and simply never does
     what it was written to do.
     """
-    for block in MULTILINE_BLOCK.findall(template.read_text()):
+    source = _without_comments(template.read_text())
+    # An odd count means the pairing below is nonsense: blocks would be read
+    # from the *gaps* between the real ones, so the scan inspects the wrong text
+    # and reports success.
+    assert source.count(DELIMITER) % 2 == 0, (
+        f"{template.name} has an odd number of multi-line string delimiters, so nothing "
+        "reading this file can tell which text is inside a literal and which is code"
+    )
+    for block in MULTILINE_BLOCK.findall(source):
         assert "${" not in block, (
-            f"{template.name} has a ''' block containing '${{...}}', which Bicep does "
-            "not interpolate - it ships the literal text. Substitute with "
+            f"{template.name} has a multi-line block containing '${{...}}', which Bicep "
+            "does not interpolate - it ships the literal text. Substitute with "
             "replace(body, '__PLACEHOLDER__', value) instead.\n"
             f"block:\n{block.strip()}"
         )
@@ -55,11 +86,7 @@ def test_the_alert_queries_name_the_container_app_they_watch():
     triggered by a component the rule says nothing about.
     """
     resources = (BICEP_DIR / "resources.bicep").read_text()
-    queries = [
-        block
-        for block in MULTILINE_BLOCK.findall(resources)
-        if "ContainerAppConsoleLogs_CL" in block
-    ]
+    queries = [block for block in _blocks(resources) if "ContainerAppConsoleLogs_CL" in block]
     assert queries, "no container-app log queries found; have the alert rules been removed?"
     for query in queries:
         assert "__APP__" in query, (
@@ -78,12 +105,23 @@ def test_every_placeholder_in_a_query_is_actually_substituted():
     the `replace()`, reproduces the original bug exactly - a rule that deploys
     green and matches nothing.
     """
-    resources = (BICEP_DIR / "resources.bicep").read_text()
-    query_vars = re.findall(r"var (\w+) = '''(.*?)'''", resources, re.DOTALL)
-    watching = [name for name, body in query_vars if "__APP__" in body]
+    resources = _without_comments((BICEP_DIR / "resources.bicep").read_text())
+    watching = [name for name, body in QUERY_VARIABLE.findall(resources) if "__APP__" in body]
     assert watching, "no query variables carry the app-name placeholder"
-    for name in watching:
-        assert re.search(rf"replace\({name}, '__APP__', appName\)", resources), (
-            f"{name} contains __APP__ but nothing substitutes it, so the rule using it "
-            "would look for a container app literally named '__APP__' and never fire"
+
+    # Every use site, not merely somewhere in the file. Review broke the first
+    # version of this check by adding a fourth rule that passed the raw variable
+    # while the original rule's correct replace() stayed put to satisfy a
+    # file-wide search - which is exactly the "copy a rule and forget the
+    # replace()" mistake this exists to prevent.
+    uses = [use.strip() for use in QUERY_ASSIGNMENT.findall(resources)]
+    assert len(uses) >= len(watching), (
+        f"found {len(uses)} query assignments for {len(watching)} query variables carrying "
+        "a placeholder; a rule that never uses its query variable is a rule watching nothing"
+    )
+    for use in uses:
+        assert SUBSTITUTED.fullmatch(use), (
+            f"an alert rule is assigned {use!r}. A query has to reach the rule through "
+            "replace(<var>, '__APP__', appName); passing the variable itself ships the "
+            "placeholder, and the rule then looks for a container app named '__APP__'."
         )
