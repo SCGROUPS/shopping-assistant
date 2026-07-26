@@ -451,9 +451,7 @@ def relaxation_candidates(filters: SearchFilters) -> list[str]:
     Nothing here is given up until the shopper names it.
     """
     return [
-        code
-        for field, code, _ in RELAXATION_STEPS
-        if getattr(filters, field) not in (None, [], "")
+        code for field, code, _ in RELAXATION_STEPS if getattr(filters, field) not in (None, [], "")
     ]
 
 
@@ -599,6 +597,34 @@ class SearchService:
                         )
                     }
                 )
+        # The same guard the destination above gets, for the same reason. The
+        # category filter is an exact match against a closed vocabulary, so a
+        # value the catalogue has never heard of does not narrow the results -
+        # it empties them. The model is free to describe a request however it
+        # reads it, and it does: "hoi an lantern" came back as "attractions",
+        # "tourist attraction" and "sightseeing or lantern festival" on
+        # different calls, none of which is a category this catalogue stocks.
+        # Whether a value exists in the data is not a question about language,
+        # so asking it here costs nothing in any of the languages served.
+        known_categories = {product["category"].casefold() for product in available_products}
+        kept: list[dict[str, Any]] = []
+        unmatched: list[str] = []
+        for constraint in intent.hard_constraints:
+            if str(constraint.get("field", "")).casefold() == "category":
+                inferred = str(constraint.get("value", "")).casefold()
+                if inferred and inferred not in known_categories:
+                    unmatched.append("category_unmatched")
+                    continue
+            kept.append(constraint)
+        if unmatched:
+            intent = intent.model_copy(
+                update={
+                    "hard_constraints": kept,
+                    "dropped_constraints": list(
+                        dict.fromkeys([*intent.dropped_constraints, *unmatched])
+                    ),
+                }
+            )
         filters, unresolved = merge_filters(request.filters, intent)
         # Codes, not a sentence. This used to interpolate raw field names into
         # English prose - "Please clarify these required constraints:

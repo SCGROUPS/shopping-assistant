@@ -43,6 +43,38 @@ class HallucinatedCountryProvider:
         return None
 
 
+class InventedCategoryProvider:
+    """A model that answers with a category this catalogue does not stock.
+
+    Not hypothetical. Production served "hoi an lantern" eight times and
+    returned nothing on five of them, because the extractor variously called it
+    "attractions", "tourist attraction", "sightseeing or lantern festival" and
+    "experiences". The destination came back as "Hoi An" every time; only the
+    category moved, and because that filter is an exact match against a closed
+    vocabulary, each invented value matched no product at all.
+    """
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str) -> SearchIntent:
+        return SearchIntent(
+            search_text=text,
+            hard_constraints=[
+                {"field": "category", "operator": "eq", "value": "sightseeing or lantern festival"}
+            ],
+        )
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None
+
+
 class FamilyIndoorIntentProvider:
     """The intent a model would extract for a family indoor request.
 
@@ -95,6 +127,24 @@ async def test_unsupported_inferred_country_does_not_eliminate_results():
     assert result.items
     assert result.intent.destination.name is None
     assert result.effective_filters.destination is None
+
+
+async def test_an_invented_category_does_not_empty_the_results():
+    """The defect that made production search a coin toss.
+
+    A category the catalogue has never stocked cannot narrow a result set, only
+    empty it, so it is not treated as something the shopper asked for. The drop
+    is recorded rather than done quietly - the shopper is owed the knowledge
+    that a constraint was set aside, and the client renders the code in its own
+    language.
+    """
+    result = await SearchService(ai_provider=InventedCategoryProvider()).search(
+        SearchRequest(query="hoi an lantern")
+    )
+
+    assert result.items
+    assert result.effective_filters.category is None
+    assert "category_unmatched" in result.unresolved_constraints
 
 
 def test_intent_constraints_map_without_silent_relaxation():
@@ -461,7 +511,7 @@ def test_take_rates_come_from_configuration():
 
 
 class TestExclusionsMatchWholeWords:
-    """"No spa" must not remove a planetarium.
+    """ "No spa" must not remove a planetarium.
 
     Both search paths tested the shopper's exclusion as a substring - `exclusion
     in searchable` in memory, `ILIKE '%spa%'` in Postgres - so ruling one thing
@@ -562,7 +612,6 @@ class TestExclusionsMatchWholeWords:
             assert in_sql is expected, (haystack, term, "postgres")
 
 
-
 class TestRelaxationIsAuthorisedNotAssumed:
     """Which constraint a shopper can most afford to lose is their judgement.
 
@@ -594,9 +643,7 @@ class TestRelaxationIsAuthorisedNotAssumed:
     def test_only_what_was_authorised_is_given_up(self) -> None:
         from app.search.service import relax_until_results
 
-        _, filters, relaxed, _ = relax_until_results(
-            [], self._filters(), [], order=["budget"]
-        )
+        _, filters, relaxed, _ = relax_until_results([], self._filters(), [], order=["budget"])
         assert relaxed == ["budget"]
         assert filters.max_total_price is None
         assert filters.language == "klingon", "authorising the budget is not authorising the rest"
