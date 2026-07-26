@@ -252,6 +252,27 @@ async def refresh_availability() -> dict[str, int]:
     }
 
     async with session_factory() as session:
+        # Subtracting sold capacity is only honest if nothing is sold between
+        # reading the total and writing it back. Checkout locks the slot row and
+        # decrements it, so a booking that commits in that gap gets overwritten
+        # by a total computed before it existed - capacity that was sold, resold.
+        #
+        # SHARE ROW EXCLUSIVE is not enough: checkout begins with SELECT ... FOR
+        # UPDATE, which takes only ROW SHARE at table level and so slips past
+        # it, takes the row, and then blocks on the ROW EXCLUSIVE its UPDATE
+        # needs - while we block on the row it is holding. That is a deadlock,
+        # and a test found it. EXCLUSIVE conflicts with ROW SHARE too, so
+        # checkout waits at the table before it holds anything, and we can never
+        # wait on a row while holding the table. Plain reads take ACCESS SHARE
+        # and are unaffected, so the storefront keeps serving availability.
+        #
+        # This is only affordable because the write below is now twelve
+        # statements: the transaction lasts seconds, and holding checkout for
+        # seconds during a deployment is a fair price for never overselling. At
+        # 22,680 round trips it would have been eleven minutes, which is why the
+        # lock could not have been taken before.
+        await session.execute(text("LOCK TABLE availability_slots IN EXCLUSIVE MODE"))
+
         booked_rows = (
             await session.execute(
                 select(
