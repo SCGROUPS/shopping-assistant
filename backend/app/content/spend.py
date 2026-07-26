@@ -82,7 +82,7 @@ async def settle(
     back would mean the budget never advances at all on a provider that omits
     usage - a ceiling that silently stops counting.
     """
-    if day is None or day is UNMETERED or actual is None:
+    if day is None or day == UNMETERED or actual is None:
         return
     delta = actual - reserved
     if not delta:

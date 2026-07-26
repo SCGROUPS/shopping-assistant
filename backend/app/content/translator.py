@@ -366,7 +366,17 @@ async def commit_translation(
     await session.execute(
         update(TranslationJob)
         .where(_still_ours(job))
-        .values(status="done", lease_token=None, leased_until=None, error_detail=None)
+        .values(
+            status="done",
+            lease_token=None,
+            leased_until=None,
+            error_detail=None,
+            # A job that recovered is not a job that failed. Leaving the old
+            # classification on it has no effect - revival filters on
+            # status='failed' - but it makes the audit trail say the opposite
+            # of what happened.
+            failure_kind=None,
+        )
     )
     return True
 
