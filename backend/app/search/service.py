@@ -623,7 +623,20 @@ class SearchService:
         # between calls that see the same catalogue.
         categories = sorted({product["category"] for product in available_products})
         destinations = sorted({product["destination"] for product in available_products})
-        intent_degraded = False
+        # Degraded from the outset when the provider in front of us only matches
+        # words. The failure this reports is "nothing interpreted this query",
+        # and that is equally true when the model refuses us and when there is
+        # no model to refuse: both answer the shopper with keyword parsing. Only
+        # the first of them raises, so without this the quietest version of the
+        # outage - endpoint dropped from the container's env, or DEMO_MODE left
+        # on - is the one nothing anywhere reports.
+        #
+        # Asked of the provider rather than of settings, because settings only
+        # describe what was configured, not what is being used: an injected
+        # provider makes `azure_enabled` say nothing at all. Absent attribute
+        # means "interprets", which is the assumption for anything that
+        # implements the protocol without opting out.
+        intent_degraded = not getattr(self.ai, "interprets_language", True)
         if should_extract_intent(request):
             intent_health.record_call()
             try:

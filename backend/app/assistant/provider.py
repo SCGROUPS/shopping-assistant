@@ -254,6 +254,13 @@ class AgentAnswer:
 
 
 class AIProvider(Protocol):
+    # Whether this provider actually reads the shopper's sentence, or only
+    # matches words in it. Declared by the provider rather than inferred from
+    # settings because the caller cannot tell the difference by watching:
+    # a keyword parser returns a well-formed SearchIntent and raises nothing,
+    # so every counter reads healthy while nobody is being understood.
+    interprets_language: bool
+
     async def embed(self, text: str) -> list[float]: ...
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]: ...
@@ -530,6 +537,8 @@ def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer:
 
 
 class DemoAIProvider:
+    interprets_language = False
+
     async def embed(self, text: str) -> list[float]:
         return deterministic_embedding(text)
 
@@ -570,6 +579,8 @@ class DemoAIProvider:
 
 
 class AzureOpenAIProvider:
+    interprets_language = True
+
     def __init__(self, settings: Settings) -> None:
         kwargs: dict[str, Any] = {
             "azure_endpoint": settings.azure_openai_endpoint,

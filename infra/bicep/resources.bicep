@@ -270,8 +270,13 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
                 path: '/health/ready'
                 port: 8000
               }
-              initialDelaySeconds: 5
-              periodSeconds: 10
+              // Readiness now waits on a live model call, and with minReplicas 0
+              // every scale-from-zero pays it. The delay is pure latency on that
+              // path - the endpoint is answerable long before 5s - and at a 10s
+              // period, being two seconds late costs ten.
+              initialDelaySeconds: 2
+              periodSeconds: 5
+              failureThreshold: 3
             }
           ]
           resources: {
@@ -617,9 +622,6 @@ ContainerAppConsoleLogs_CL
 | summarize FailedSearches = count()
 '''
 
-// Only a rejection. "gave up" is logged on the ok=True unverified path, where
-// the revision serves normally - paging sev-0 for that teaches people to
-// ignore the rule that means the storefront is dark.
 // The probe answered "cannot tell" rather than "no". The revision serves, so
 // this is not an outage - but a probe that never manages to ask is how the
 // gate silently stops being a gate, which is worth knowing without paging.
@@ -630,10 +632,16 @@ ContainerAppConsoleLogs_CL
 | summarize UnverifiedProbes = count()
 '''
 
+// The storefront is not being understood: either the deployment rejects our
+// requests, or no model is configured and none is consulted. Both answer every
+// shopper with keyword parsing, which is why they share a severity.
+// "gave up" is deliberately not here - it is logged on the ok=True unverified
+// path where the revision serves normally, and paging sev-0 for that teaches
+// people to ignore the rule that means the storefront is dark.
 var kqlProbeFilter = '''
 ContainerAppConsoleLogs_CL
 | where ContainerAppName_s == '__APP__'
-| where Log_s has 'Intent probe' and Log_s has 'rejected'
+| where Log_s has 'Intent probe' and (Log_s has 'rejected' or Log_s has 'skipped')
 | summarize RejectedProbes = count()
 '''
 

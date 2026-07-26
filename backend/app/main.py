@@ -34,12 +34,19 @@ REJECTIONS_TO_CONFIRM = 2
 # still waking would spend the probe's whole budget before it asked the model
 # anything.
 VOCABULARY_TIMEOUT_SECONDS = 3.0
-# The whole verdict has to land inside the readiness grace period
-# (initialDelaySeconds 5 + a few 10s polls, see infra/bicep/resources.bicep), or
-# a revision that is perfectly healthy would be killed for being slow to prove
-# it. Everything below is bounded so that this deadline is the backstop and not
-# the mechanism.
-PROBE_DEADLINE_SECONDS = 25.0
+# The whole verdict has to land inside the readiness grace period (see
+# infra/bicep/resources.bicep), or a revision that is perfectly healthy would be
+# killed for being slow to prove it. Everything below is bounded so that this
+# deadline is the backstop and not the mechanism.
+#
+# Measured, not guessed: against the live deployment one attempt costs ~2s and
+# loading the vocabulary ~0.3s from inside the region, so a pass lands well
+# under this and a second attempt still fits. Short is affordable now only
+# because a rejection is recorded the moment it is seen - a deadline that lands
+# mid-probe can no longer lose one. All a longer deadline buys is more patience
+# with a model that is slow but eventually fine, and that outcome is recorded
+# as servable anyway, so the wait bought nothing and every cold start paid it.
+PROBE_DEADLINE_SECONDS = 10.0
 
 # Deliberately module scope rather than a local in `_run_intent_probe`.
 # `asyncio.wait_for` *cancels* that coroutine at the deadline, so anything it
@@ -114,6 +121,16 @@ async def _run_intent_probe() -> None:
     # cannot reject anything. Probing it would record a pass for a conversation
     # that never happened.
     if not settings.azure_enabled:
+        # Logged at error, and alerted on, even though it is the normal state
+        # locally. In production it is the outage class this whole gate exists
+        # for, wearing its least visible costume: no model is consulted at all,
+        # so nothing throws, no failure is counted, readiness passes, and every
+        # shopper is answered by keyword parsing. The other variants at least
+        # raise something. This one is silent, which is why it needs a voice.
+        logger.error(
+            "Intent probe skipped: no Azure OpenAI endpoint is configured, so every "
+            "search will be answered by deterministic parsing"
+        )
         intent_health.record_probe(
             ok=True, detail="not applicable: no Azure OpenAI endpoint is configured"
         )
@@ -185,6 +202,16 @@ async def _supervise_intent_probe() -> None:
     # Cleared here rather than only inside the probe, so that one supervised run
     # means one fresh verdict even if the probe is cancelled before it starts.
     _pending_rejection = None
+    # Both handlers below only record when no verdict exists yet, which is
+    # correct while there is one supervised run per process: it stops a
+    # cancellation from overwriting an answer the probe already reached.
+    #
+    # It would be wrong the moment there is more than one run. A second probe
+    # that is rejected after a first one passed would find a verdict already
+    # present and record nothing, leaving the revision marked healthy while the
+    # deployment refuses every request. Anything that re-probes - caching a
+    # verdict per revision, a periodic re-check - has to replace this guard with
+    # one that compares verdicts rather than checking for their absence.
     try:
         await asyncio.wait_for(_run_intent_probe(), timeout=PROBE_DEADLINE_SECONDS)
     except TimeoutError:

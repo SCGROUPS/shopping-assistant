@@ -9,9 +9,13 @@ an alerting contract, and until this file existed no test failed when that
 happened.
 """
 
+import pytest
 from httpx import AsyncClient
 
+from app.api.schemas import SearchRequest
+from app.assistant.provider import DemoAIProvider
 from app.common.degradation import intent_health
+from app.search.service import SearchService
 
 
 async def test_health_reports_how_much_of_the_time_intent_extraction_is_failing(
@@ -82,4 +86,37 @@ async def test_health_reports_a_quiet_service_without_inventing_a_failure(
 
     body = (await client.get("/api/v1/health")).json()
 
-    assert body["intent_extraction"] == {"calls": 0, "failures": 0, "failure_ratio": 0.0}
+    # Compared whole rather than key by key: this is the shape an alert rule
+    # parses, so a key appearing is as much a contract change as one vanishing.
+    # `probe` is None here because no startup probe ran in-process under the
+    # test client - which is itself the honest answer, and distinct from a probe
+    # that ran and failed.
+    assert body["intent_extraction"] == {
+        "calls": 0,
+        "failures": 0,
+        "failure_ratio": 0.0,
+        "probe": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_service_with_no_model_reports_itself_degraded():
+    """The quietest form of the outage: nothing raises, so nothing was reported.
+
+    `DemoAIProvider.extract_intent` returns a well-formed SearchIntent from
+    keyword matching and never raises, so the failure counter stays at zero and
+    the failure ratio stays perfect while every shopper is being keyword-parsed.
+    This is reachable in production two ways - the endpoint dropped from the
+    container's environment, or DEMO_MODE left on - and both were previously
+    invisible on every surface at once.
+    """
+    intent_health.reset()
+    service = SearchService(ai_provider=DemoAIProvider())
+
+    response = await service.search(SearchRequest(query="lantern workshop in hoi an"))
+
+    assert "intent_unavailable" in response.unresolved_constraints, (
+        "a service that cannot interpret anything served a page that claimed "
+        "it had understood the query"
+    )
+    intent_health.reset()

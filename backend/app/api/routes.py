@@ -499,6 +499,16 @@ async def api_health() -> dict[str, Any]:
             "calls": intent.calls,
             "failures": intent.failures,
             "failure_ratio": round(intent.failure_ratio, 4),
+            # The startup verdict, alongside the running counters, because the
+            # two fail differently. A revision with no model configured reports
+            # zero failures out of zero calls forever - perfect health, by never
+            # having tried - and only the probe says so.
+            "probe": None
+            if (probe := intent_health.probe()) is None
+            else {
+                "ok": probe.ok,
+                "detail": probe.detail,
+            },
         },
     }
 
