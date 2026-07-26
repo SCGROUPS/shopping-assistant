@@ -514,6 +514,7 @@ class SearchService:
                 effective_filters=filters,
                 items=[],
                 facets={},
+                locale=locale,
             )
         eligible, filters, relaxed_preferences = relax_until_results(
             available_products, filters, request.party
@@ -663,6 +664,7 @@ class SearchService:
         page = final[: request.page_size]
         facets = _facets(available_products, filters, request.party)
         return SearchResponse(
+            locale=locale,
             query_id=uuid4(),
             intent=intent,
             effective_filters=filters,

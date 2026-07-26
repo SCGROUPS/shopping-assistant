@@ -13,6 +13,7 @@ from app.api.schemas import (
 )
 from app.catalog.service import get_product
 from app.common.errors import ApiError
+from app.common.locales import DEFAULT_LOCALE
 from app.common.models import (
     AvailabilitySlot,
     Cart,
@@ -28,6 +29,7 @@ from app.common.persistence import (
     lock_idempotency,
     require_session_factory,
 )
+from app.common.resolution import resolve_experience_text
 from app.common.store import DemoStore, store
 
 
@@ -35,7 +37,7 @@ class CartService:
     def __init__(self, data: DemoStore = store) -> None:
         self.data = data
 
-    async def get_cart(self, session_id: str) -> CartView:
+    async def get_cart(self, session_id: str, locale: str = DEFAULT_LOCALE) -> CartView:
         if not database_mode():
             return self._demo_get_cart(session_id)
         factory = require_session_factory()
@@ -51,10 +53,14 @@ class CartService:
                 )
                 db.add(cart)
                 await db.flush()
-            return await self._db_view(db, cart)
+            return await self._db_view(db, cart, locale)
 
     async def add_item(
-        self, session_id: str, request: CartItemRequest, idempotency_key: str
+        self,
+        session_id: str,
+        request: CartItemRequest,
+        idempotency_key: str,
+        locale: str = DEFAULT_LOCALE,
     ) -> CartView:
         if not database_mode():
             return self._demo_add_item(session_id, request, idempotency_key)
@@ -202,7 +208,7 @@ class CartService:
             )
             cart.version += 1
             await db.flush()
-            response = await self._db_view(db, cart)
+            response = await self._db_view(db, cart, locale)
             db.add(
                 IdempotencyRecord(
                     session_id=shopping_session.id,
@@ -214,7 +220,11 @@ class CartService:
             return response
 
     async def remove_item(
-        self, session_id: str, item_id: UUID, idempotency_key: str
+        self,
+        session_id: str,
+        item_id: UUID,
+        idempotency_key: str,
+        locale: str = DEFAULT_LOCALE,
     ) -> CartView:
         if not database_mode():
             return self._demo_remove_item(session_id, item_id, idempotency_key)
@@ -252,7 +262,7 @@ class CartService:
             await db.delete(item)
             cart.version += 1
             await db.flush()
-            response = await self._db_view(db, cart)
+            response = await self._db_view(db, cart, locale)
             db.add(
                 IdempotencyRecord(
                     session_id=shopping_session.id,
@@ -343,19 +353,28 @@ class CartService:
         )
         return CartView.model_validate(record.response) if record else None
 
-    async def _db_view(self, db, cart: Cart) -> CartView:
+    async def _db_view(self, db, cart: Cart, locale: str = DEFAULT_LOCALE) -> CartView:
         rows = await db.execute(
-            select(CartItem, Experience.title, ExperienceOption.name)
+            select(CartItem, Experience, ExperienceOption.name)
             .join(Experience, Experience.id == CartItem.experience_id)
             .join(ExperienceOption, ExperienceOption.id == CartItem.option_id)
             .where(CartItem.cart_id == cart.id)
             .order_by(CartItem.created_at)
         )
+        rows_all = rows.all()
+        # Through the shared resolver, not a join on `Experience.title`. A cart
+        # that names products in the source language while the page that filled
+        # it named them in the shopper's own reads as a different product, and
+        # "is this the thing I chose?" is the worst question to raise at the
+        # moment of payment.
+        titles = await resolve_experience_text(
+            db, [experience for _, experience, _ in rows_all], locale
+        )
         items = [
             CartItemView(
                 id=item.id,
                 experience_id=item.experience_id,
-                experience_title=experience_title,
+                experience_title=titles[experience.id]["title"].value,
                 option_id=item.option_id,
                 option_name=option_name,
                 slot_id=item.slot_id,
@@ -378,7 +397,7 @@ class CartService:
                 quantity=item.quantity,
                 quoted_total=float(item.quoted_total),
             )
-            for item, experience_title, option_name in rows.all()
+            for item, experience, option_name in rows_all
         ]
         total = sum(item.quoted_total for item in items)
         return CartView(

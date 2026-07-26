@@ -75,11 +75,21 @@ class LocalePreferenceRequest(BaseModel):
 
 
 class ContentFieldMeta(BaseModel):
-    """Where one displayed string came from."""
+    """Where one displayed string came from, and whether it is current.
+
+    Three independent facts. Collapsing staleness into the same field as
+    fallback loses one of them in the case that needs both: a stale English
+    translation served to a German shopper is both, and reporting only
+    `fallback` hides that the text is also out of date.
+    """
 
     locale: str
-    # source | manual | machine | imported | stale | fallback
+    # source | manual | machine | imported | unknown
     provenance: str
+    # Published, but the source has changed since.
+    stale: bool = False
+    # Not the language the shopper asked for.
+    fallback: bool = False
 
 
 class PriceView(BaseModel):
@@ -171,15 +181,21 @@ class SearchResponse(BaseModel):
     recommendations: list[ExperienceCard] | None = None
     facets: dict[str, dict[str, int]]
     relaxed_preferences: list[str] = Field(default_factory=list)
+    # On the envelope, not only on the cards. Zero results is exactly the case
+    # where a client most needs to know which corpus was searched, and exactly
+    # the case where there is no card to carry it.
+    locale: str = DEFAULT_LOCALE
 
 
 class ExperienceListResponse(BaseModel):
     items: list[ExperienceCard]
     total: int
+    locale: str = DEFAULT_LOCALE
 
 
 class RecommendationResponse(BaseModel):
     items: list[ExperienceCard]
+    locale: str = DEFAULT_LOCALE
 
 
 class EventRequest(BaseModel):

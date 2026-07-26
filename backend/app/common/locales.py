@@ -112,6 +112,23 @@ def parse_accept_language(header: str | None) -> tuple[tuple[str, float], ...]:
     return tuple((token, quality) for _, token, quality in parsed)
 
 
+def canonical_locale(value: str | None) -> str | None:
+    """Reduce a tag to one we serve, or `None` if it is not one of ours.
+
+    The strict counterpart to `normalize_locale`, which answers `en` for
+    anything it does not recognise. That default is right when a value must be
+    produced and wrong when a value must be *judged*: `locale=sv` normalises
+    to `en`, which then looks like a deliberate request for English and
+    outranks the Vietnamese the session already chose. An unknown tag is not a
+    request for English - it is not a request we can honour at all, and the
+    next input in the order should decide.
+    """
+    if not value:
+        return None
+    primary = value.strip().replace("_", "-").split("-")[0].lower()
+    return primary if primary in FALLBACK_CHAINS else None
+
+
 def negotiate_locale(
     *,
     explicit: str | None = None,
@@ -132,18 +149,15 @@ def negotiate_locale(
     locale we can actually serve.
     """
     allowed = [item for item in enabled if item in FALLBACK_CHAINS] or [DEFAULT_LOCALE]
-    for candidate in (explicit, session_preference):
-        if not candidate:
-            continue
-        resolved = normalize_locale(candidate)
-        if resolved in allowed:
+    candidates = [explicit, session_preference]
+    candidates.extend(token for token, _ in parse_accept_language(accept_language))
+    for candidate in candidates:
+        # Strict throughout, including the explicit parameter and the stored
+        # preference. Normalising here would turn every unrecognised tag into
+        # a request for English, so `?locale=sv` would silently override a
+        # session that chose Vietnamese, and `sv,vi;q=0.9` would return before
+        # reaching the Vietnamese the shopper also asked for.
+        resolved = canonical_locale(candidate)
+        if resolved is not None and resolved in allowed:
             return resolved
-    for token, _ in parse_accept_language(accept_language):
-        # Matched strictly, not through `normalize_locale`, which answers `en`
-        # for anything it does not recognise. A header of `sv,vi;q=0.9` would
-        # otherwise resolve Swedish to English and return before reaching the
-        # Vietnamese the shopper also asked for.
-        primary = token.strip().replace("_", "-").split("-")[0].lower()
-        if primary in allowed:
-            return primary
     return DEFAULT_LOCALE if DEFAULT_LOCALE in allowed else allowed[0]

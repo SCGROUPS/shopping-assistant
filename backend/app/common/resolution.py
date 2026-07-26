@@ -19,6 +19,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,30 +37,45 @@ TRANSLATED_FIELDS: tuple[str, ...] = (
     "meeting_point",
 )
 
-# What a reader is entitled to know about a string it was handed.
-#   source   - the record's own authoring language, always current by definition
+# Where a string came from. Origin only - whether it is *current* is a
+# separate fact, and whether it is the shopper's own language is a third.
+#   source   - the record's own authoring language, current by definition
 #   manual   - a human wrote this translation
-#   machine  - a model wrote it and it answers the current source text
-#   imported - it arrived from a partner already translated
-#   stale    - published, but the source has changed since; still served
-#   fallback - no translation exists in the requested locale
+#   machine  - a model wrote it
+#   imported - it arrived already translated, with a field row saying so
+#   unknown  - served text with no workflow row behind it
 PROVENANCE_SOURCE = "source"
-PROVENANCE_STALE = "stale"
-PROVENANCE_FALLBACK = "fallback"
+PROVENANCE_UNKNOWN = "unknown"
+
+# Fields where showing text that describes a previous version of the product is
+# worse than showing the current text in the wrong language. Meeting directions
+# are operational data: a stale one sends a traveller to a place the tour no
+# longer departs from, and "it was in Vietnamese" is not the complaint that
+# generates. Prose can be a day behind; an address cannot.
+CURRENT_ONLY_FIELDS: frozenset[str] = frozenset({"meeting_point"})
 
 
 @dataclass(frozen=True)
 class ResolvedField:
-    """A served string and the honest description of where it came from."""
+    """A served string and the honest description of where it came from.
+
+    Three independent facts, deliberately not collapsed into one label. An
+    earlier revision folded staleness into the same field as fallback, so a
+    German request that resolved to a stale English translation reported
+    `fallback` and the staleness disappeared - the one combination where a
+    reader most needs both.
+    """
 
     value: str
     locale: str
     provenance: str
+    stale: bool = False
+    requested: str = DEFAULT_LOCALE
 
     @property
     def is_fallback(self) -> bool:
-        """True when the shopper is not reading their own language."""
-        return self.provenance == PROVENANCE_FALLBACK
+        """True when the shopper is not reading the language they asked for."""
+        return self.locale != self.requested
 
 
 def source_locale(experience: Experience) -> str:
@@ -89,30 +105,20 @@ def resolution_chain(experience: Experience, locale: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def _provenance(
-    field_state: TranslationField | None,
-    *,
-    requested: str,
-    served: str,
-) -> str:
-    """Describe a served translation, including whether it has gone stale.
+def _describe(field_state: TranslationField | None) -> tuple[str, bool]:
+    """Origin and staleness of a served translation, independently.
 
-    Stale text is still served. Falling back to English the moment an operator
-    fixes a typo would blank an entire locale for every product touched, until
-    the worker catches up - a far larger blast radius than showing a
-    description that is one edit behind. The label is what keeps that honest,
-    and it is why `content_meta` is part of the contract rather than an extra.
+    A missing field row is reported as `unknown`, not as `imported`. The
+    served table and the workflow table were created by the same migration
+    and every current writer populates both, so absence means legacy data or a
+    violated invariant - and naming that `imported` would state a provenance
+    nobody recorded, which is exactly the kind of confident wrong answer this
+    map exists to avoid.
     """
-    if served != requested:
-        return PROVENANCE_FALLBACK
     if field_state is None:
-        # Served text with no workflow row: imported alongside the record, or
-        # written before this table existed. Neither is machine output, and
-        # claiming it is would misattribute a human's work.
-        return "imported"
-    if field_state.published_fingerprint != field_state.desired_fingerprint:
-        return PROVENANCE_STALE
-    return field_state.provenance
+        return PROVENANCE_UNKNOWN, False
+    stale = field_state.published_fingerprint != field_state.desired_fingerprint
+    return field_state.provenance, stale
 
 
 async def resolve_experience_text(
@@ -195,27 +201,29 @@ def _resolve_one(
                 return ResolvedField(
                     value=value,
                     locale=candidate,
-                    provenance=(
-                        PROVENANCE_SOURCE
-                        if candidate == requested
-                        else PROVENANCE_FALLBACK
-                    ),
+                    provenance=PROVENANCE_SOURCE,
+                    requested=requested,
                 )
             continue
         row = translations.get((experience.id, candidate))
         if row is None:
             continue
         value = (getattr(row, field, "") or "").strip()
-        if value:
-            return ResolvedField(
-                value=value,
-                locale=candidate,
-                provenance=_provenance(
-                    states.get((experience.id, field, candidate)),
-                    requested=requested,
-                    served=candidate,
-                ),
-            )
+        if not value:
+            continue
+        provenance, stale = _describe(states.get((experience.id, field, candidate)))
+        if stale and field in CURRENT_ONLY_FIELDS:
+            # Keep walking. The source locale is always current, so this
+            # terminates at text that is right even when it is not the
+            # shopper's language.
+            continue
+        return ResolvedField(
+            value=value,
+            locale=candidate,
+            provenance=provenance,
+            stale=stale,
+            requested=requested,
+        )
     # Every chain ends at the source locale, so arriving here means the source
     # itself is empty. Returning the empty string is right - inventing text
     # would be worse - but the locale is the source's, because that is the
@@ -223,11 +231,12 @@ def _resolve_one(
     return ResolvedField(
         value=(getattr(experience, field, "") or ""),
         locale=source,
-        provenance=PROVENANCE_SOURCE if source == requested else PROVENANCE_FALLBACK,
+        provenance=PROVENANCE_SOURCE,
+        requested=requested,
     )
 
 
-def content_meta(fields: dict[str, ResolvedField]) -> dict[str, dict[str, str]]:
+def content_meta(fields: dict[str, ResolvedField]) -> dict[str, dict[str, Any]]:
     """The additive per-field provenance map promised at the API boundary.
 
     A parallel map rather than a change to the field types, so existing
@@ -235,7 +244,12 @@ def content_meta(fields: dict[str, ResolvedField]) -> dict[str, dict[str, str]]:
     translation is a client that chose not to look (spec 4.3).
     """
     return {
-        name: {"locale": item.locale, "provenance": item.provenance}
+        name: {
+            "locale": item.locale,
+            "provenance": item.provenance,
+            "stale": item.stale,
+            "fallback": item.is_fallback,
+        }
         for name, item in fields.items()
     }
 

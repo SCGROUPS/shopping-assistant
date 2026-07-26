@@ -250,7 +250,7 @@ class RecommendationService:
             )
 
         if not candidates:
-            return RecommendationResponse(items=[])
+            return RecommendationResponse(items=[], locale=locale)
         # A pin lifts a product within the rail's own ordering, bounded the
         # same way search bounds it.
         candidates.sort(
@@ -283,7 +283,7 @@ class RecommendationService:
                     display_currency=display_currency,
                 )
             )
-        return RecommendationResponse(items=items)
+        return RecommendationResponse(items=items, locale=locale)
 
 
 async def session_interest_tags(

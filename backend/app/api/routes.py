@@ -44,7 +44,7 @@ from app.common.config import get_settings
 from app.common.database import database_ready
 from app.common.errors import ApiError
 from app.common.llm_cost import ledger
-from app.common.locales import negotiate_locale, normalize_locale
+from app.common.locales import canonical_locale, negotiate_locale
 from app.common.models import BehaviorEvent
 from app.common.persistence import (
     catalog_products,
@@ -73,16 +73,15 @@ async def search(
     locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
 ) -> SearchResponse:
-    # The body field is an input to negotiation, not a second source of truth.
-    # Un-negotiated it would let a client search a locale the storefront has
-    # not enabled and receive an empty corpus that reads as a catalogue
-    # problem; ignored entirely it would break the documented precedence, in
-    # which an explicit request outranks a session preference.
-    chosen = locale
-    if request.locale:
-        asked = negotiate_locale(explicit=request.locale, enabled=get_settings().enabled_locales)
-        if asked == normalize_locale(request.locale):
-            chosen = asked
+    # The body field outranks the query parameter, because a POST body is the
+    # more specific statement of what this particular search is for. It is an
+    # input to negotiation, not a second source of truth: honoured verbatim it
+    # would let a client search a locale the storefront has not enabled and
+    # receive an empty corpus that reads as a catalogue problem, and ignored
+    # entirely it would break the documented precedence in which an explicit
+    # request outranks a session preference.
+    asked = canonical_locale(request.locale)
+    chosen = asked if asked in get_settings().enabled_locales else locale
     result = await search_service.search(request.model_copy(update={"locale": chosen}))
     await _capture(
         session_id,
@@ -114,6 +113,7 @@ async def list_experiences(
             for product in products[offset : offset + limit]
         ],
         total=len(products),
+        locale=locale,
     )
 
 
@@ -220,6 +220,7 @@ async def conversation_message(
     conversation_id: UUID,
     body: MessageRequest,
     http_request: Request,
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
     stream: bool | None = Query(default=None),
 ) -> Any:
@@ -229,14 +230,18 @@ async def conversation_message(
         else "text/event-stream" in http_request.headers.get("accept", "").casefold()
     )
     if not wants_stream:
-        response = await assistant_service.respond(conversation_id, session_id, body)
+        response = await assistant_service.respond(
+            conversation_id, session_id, body, locale=locale
+        )
         await _capture(session_id, EventRequest(event_type="assistant_message_sent"))
         return JSONResponse(jsonable_encoder(response))
 
     async def events():
         yield _sse("status", {"status": "working"})
         try:
-            response = await assistant_service.respond(conversation_id, session_id, body)
+            response = await assistant_service.respond(
+                conversation_id, session_id, body, locale=locale
+            )
             await _capture(
                 session_id,
                 EventRequest(event_type="assistant_message_sent"),
@@ -269,17 +274,20 @@ async def conversation_message(
 
 
 @router.get("/cart", response_model=CartView)
-async def get_cart(session_id: SessionHeader = "demo-session") -> CartView:
-    return await cart_service.get_cart(session_id)
+async def get_cart(
+    locale: RequestLocale, session_id: SessionHeader = "demo-session"
+) -> CartView:
+    return await cart_service.get_cart(session_id, locale)
 
 
 @router.post("/cart/items", response_model=CartView)
 async def add_cart_item(
     request: CartItemRequest,
     idempotency_key: IdempotencyHeader,
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
 ) -> CartView:
-    result = await cart_service.add_item(session_id, request, idempotency_key)
+    result = await cart_service.add_item(session_id, request, idempotency_key, locale)
     await _capture(
         session_id,
         EventRequest(event_type="cart_item_added", experience_id=request.experience_id),
@@ -291,9 +299,10 @@ async def add_cart_item(
 async def remove_cart_item(
     item_id: UUID,
     idempotency_key: IdempotencyHeader,
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
 ) -> CartView:
-    return await cart_service.remove_item(session_id, item_id, idempotency_key)
+    return await cart_service.remove_item(session_id, item_id, idempotency_key, locale)
 
 
 @router.post("/checkout/prepare", response_model=CheckoutPrepareResponse)

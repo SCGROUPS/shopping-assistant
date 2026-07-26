@@ -30,8 +30,8 @@ from app.common.persistence import load_products
 from app.common.resolution import (
     content_meta,
     fallback_fields,
-    resolve_experience_text,
     resolution_chain,
+    resolve_experience_text,
 )
 from app.content.enqueue import enqueue_experience_translations
 
@@ -162,10 +162,13 @@ async def test_a_translated_field_is_served_and_labelled_as_translated(factory):
     assert fields["title"].value == "Đi bộ đèn lồng Hội An"
     assert fields["title"].locale == "vi"
     assert fields["title"].provenance == "machine"
+    assert not fields["title"].is_fallback
+    assert not fields["title"].stale
     # Untranslated siblings fall back rather than blanking.
     assert fields["description"].value == "A guided evening walk through the old town."
     assert fields["description"].locale == "en"
-    assert fields["description"].provenance == "fallback"
+    assert fields["description"].provenance == "source"
+    assert fields["description"].is_fallback
     assert fallback_fields(fields) == ("short_description", "description", "meeting_point")
 
 
@@ -195,7 +198,8 @@ async def test_an_edited_source_leaves_the_translation_served_but_stale(factory)
         fields = (await resolve_experience_text(session, [experience], "vi"))[EXPERIENCE_ID]
 
     assert fields["title"].value == "Đi bộ đèn lồng Hội An"
-    assert fields["title"].provenance == "stale"
+    assert fields["title"].stale
+    assert fields["title"].provenance == "machine"
     assert not fields["title"].is_fallback
 
 
@@ -222,7 +226,8 @@ async def test_a_candidate_awaiting_review_is_never_served(factory):
         fields = (await resolve_experience_text(session, [experience], "vi"))[EXPERIENCE_ID]
 
     assert fields["meeting_point"].value == "Japanese Bridge"
-    assert fields["meeting_point"].provenance == "fallback"
+    assert fields["meeting_point"].locale == "en"
+    assert fields["meeting_point"].is_fallback
 
 
 async def test_a_vietnamese_record_does_not_resolve_to_a_blank_english_page(factory):
@@ -242,7 +247,8 @@ async def test_a_vietnamese_record_does_not_resolve_to_a_blank_english_page(fact
 
     assert fields["title"].value == "Đi bộ đèn lồng Hội An"
     assert fields["title"].locale == "vi"
-    assert fields["title"].provenance == "fallback"
+    assert fields["title"].provenance == "source"
+    assert fields["title"].is_fallback
 
 
 async def test_resolution_does_not_scale_its_queries_with_the_catalogue(factory):
@@ -318,8 +324,13 @@ async def test_loading_products_serves_the_requested_locale(factory):
     assert products[0]["title"] == "Đi bộ đèn lồng Hội An"
     assert products[0]["meeting_point"] == "Chùa Cầu"
     assert products[0]["locale"] == "vi"
-    assert products[0]["content_meta"]["title"] == {"locale": "vi", "provenance": "machine"}
-    assert products[0]["content_meta"]["description"]["provenance"] == "fallback"
+    assert products[0]["content_meta"]["title"] == {
+        "locale": "vi",
+        "provenance": "machine",
+        "stale": False,
+        "fallback": False,
+    }
+    assert products[0]["content_meta"]["description"]["fallback"] is True
 
 
 async def test_content_meta_describes_every_translated_field(factory):
@@ -330,6 +341,8 @@ async def test_content_meta_describes_every_translated_field(factory):
     meta = content_meta(fields)
     assert set(meta) == {"title", "short_description", "description", "meeting_point"}
     assert all(item["provenance"] == "source" for item in meta.values())
+    assert all(item["stale"] is False for item in meta.values())
+    assert all(item["fallback"] is False for item in meta.values())
 
 
 # --- negotiation, which needs no database ---------------------------------
@@ -449,3 +462,202 @@ async def test_an_experience_card_carries_its_provenance(api_client):
     # Demo mode has no translation tables; the contract still has to hold, or
     # the frontend cannot rely on the map being present.
     assert isinstance(card["content_meta"], dict)
+
+
+# --- the four cases round 21 caught, each of which had no test -------------
+
+
+async def test_a_stale_fallback_reports_both_facts_not_one(factory):
+    """Fallback and staleness are independent, and this is the case needing both.
+
+    An earlier revision returned `fallback` before it looked at staleness, so
+    a German request that resolved to a stale English translation reported
+    only that it was English - and a reader had no way to learn the text was
+    also out of date. Collapsing three facts into one label loses whichever
+    the label checked second.
+    """
+    async with factory() as session:
+        await session.execute(
+            update(Experience)
+            .where(Experience.id == EXPERIENCE_ID)
+            .values(source_language="vi", title="Đi bộ đèn lồng Hội An")
+        )
+        await session.commit()
+    await _publish(factory, "en", title="Hoi An lantern walk")
+    async with factory() as session:
+        await session.execute(
+            update(Experience)
+            .where(Experience.id == EXPERIENCE_ID)
+            .values(title="Đi thuyền đèn lồng Hội An")
+        )
+        await session.commit()
+    async with factory() as session:
+        await enqueue_experience_translations(session, EXPERIENCE_ID, locales=["en"])
+        await session.commit()
+
+    experience = await _experience(factory)
+    async with factory() as session:
+        fields = (await resolve_experience_text(session, [experience], "de"))[EXPERIENCE_ID]
+
+    title = fields["title"]
+    assert title.value == "Hoi An lantern walk"
+    assert title.locale == "en"
+    assert title.is_fallback, "German was requested and English was served"
+    assert title.stale, "the source moved after this translation was published"
+
+
+async def test_a_stale_meeting_point_is_not_served(factory):
+    """Directions are operational data, not prose.
+
+    A description one edit behind is a cosmetic problem. A meeting point one
+    edit behind sends a traveller to a place the tour no longer departs from,
+    and the complaint that generates is not "it was in the wrong language".
+    So this field alone keeps walking the chain until it finds something
+    current - which the source locale always is.
+    """
+    await _publish(factory, "vi", title="Đi bộ đèn lồng Hội An", meeting_point="Chùa Cầu")
+
+    async with factory() as session:
+        await session.execute(
+            update(Experience)
+            .where(Experience.id == EXPERIENCE_ID)
+            .values(meeting_point="Cua Dai Beach gate", title="Hoi An lantern cruise")
+        )
+        await session.commit()
+    async with factory() as session:
+        await enqueue_experience_translations(session, EXPERIENCE_ID, locales=["vi"])
+        await session.commit()
+
+    experience = await _experience(factory)
+    async with factory() as session:
+        fields = (await resolve_experience_text(session, [experience], "vi"))[EXPERIENCE_ID]
+
+    assert fields["meeting_point"].value == "Cua Dai Beach gate"
+    assert fields["meeting_point"].locale == "en"
+    assert not fields["meeting_point"].stale
+    # Prose in the same record is still served stale, or the policy would be
+    # "fall back on any edit" wearing a different name.
+    assert fields["title"].value == "Đi bộ đèn lồng Hội An"
+    assert fields["title"].stale
+
+
+async def test_served_text_without_workflow_state_is_unknown_not_imported(factory):
+    """`imported` would state a provenance nobody recorded.
+
+    The served table and the workflow table are created by the same migration
+    and every current writer populates both, so a missing row means legacy
+    data or a violated invariant. Naming that `imported` is a confident wrong
+    answer, which is the failure this map exists to prevent.
+    """
+    async with factory() as session:
+        session.add(
+            ExperienceTranslation(
+                experience_id=EXPERIENCE_ID, locale="vi", title="Đi bộ đèn lồng Hội An"
+            )
+        )
+        await session.commit()
+
+    experience = await _experience(factory)
+    async with factory() as session:
+        fields = (await resolve_experience_text(session, [experience], "vi"))[EXPERIENCE_ID]
+
+    assert fields["title"].value == "Đi bộ đèn lồng Hội An"
+    assert fields["title"].provenance == "unknown"
+
+
+def test_an_unknown_explicit_locale_does_not_override_a_valid_session_choice():
+    """`?locale=sv` is not a request for English.
+
+    `normalize_locale` answers `en` for anything unrecognised, which is right
+    when a value must be produced and wrong when one must be judged: it turns
+    an unserviceable tag into a deliberate-looking request for English that
+    then outranks the Vietnamese the session already chose.
+    """
+    assert (
+        negotiate_locale(
+            explicit="sv", session_preference="vi", enabled=["en", "vi"]
+        )
+        == "vi"
+    )
+    assert (
+        negotiate_locale(
+            explicit="klingon",
+            session_preference="vi",
+            accept_language="fr",
+            enabled=["en", "vi", "fr"],
+        )
+        == "vi"
+    )
+    assert (
+        negotiate_locale(
+            session_preference="sv", accept_language="fr", enabled=["en", "fr"]
+        )
+        == "fr"
+    )
+
+
+async def test_an_empty_result_still_says_which_corpus_was_searched(api_client):
+    """Zero results is exactly when a client needs the locale and has no card.
+
+    An operator debugging "the Vietnamese storefront returns nothing" cannot
+    distinguish an empty corpus from a bad query if the only place the locale
+    appears is on results that do not exist.
+    """
+    response = await api_client.post(
+        "/api/v1/search", json={"query": "zzzzz no such thing anywhere", "page_size": 1}
+    )
+    assert response.status_code == 200
+    assert response.json()["locale"] == "en"
+
+    listing = await api_client.get("/api/v1/experiences?limit=1&offset=9999")
+    assert listing.json()["items"] == []
+    assert listing.json()["locale"] == "en"
+
+    rail = await api_client.get("/api/v1/recommendations?limit=1")
+    assert rail.json()["locale"] == "en"
+
+
+async def test_the_assistant_searches_the_locale_the_request_resolved(api_client):
+    """The guided path is the primary path, and it was the one still English.
+
+    The assistant fans out through tools, streaming and rendering, so a locale
+    that the storefront resolves correctly is worth nothing if the conversation
+    beside it searches a different corpus.
+    """
+    headers = {"X-Session-ID": "assistant-locale", "Accept-Language": "vi"}
+    # Asserting `en` would prove nothing: English is what a hardcoded default
+    # returns too. The locale has to be one only negotiation could have chosen.
+    settings = get_settings()
+    settings.enabled_locales = ["en", "vi"]
+    try:
+        created = await api_client.post(
+            "/api/v1/conversations", json={}, headers=headers
+        )
+        conversation_id = created.json()["id"]
+
+        seen: list[str | None] = []
+        from app.api.routes import assistant_service
+
+        original = assistant_service.search.search
+
+        async def recording(request):
+            seen.append(request.locale)
+            return await original(request)
+
+        assistant_service.search.search = recording
+        try:
+            response = await api_client.post(
+                f"/api/v1/conversations/{conversation_id}/messages",
+                json={"message": "show me a boat trip"},
+                headers=headers,
+            )
+        finally:
+            assistant_service.search.search = original
+    finally:
+        settings.enabled_locales = ["en"]
+
+    assert response.status_code == 200, response.text
+    assert seen, "the assistant did not search at all; this test proves nothing"
+    assert all(item == "vi" for item in seen), (
+        f"the assistant searched {seen}, not the locale the request resolved"
+    )
