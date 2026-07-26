@@ -13,7 +13,11 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import type { Experience } from '../types'
-import { NEW_LISTING_LABEL, hasReviews } from '../lib/rating'
+import { NEW_LISTING_KEY, hasReviews } from '../lib/rating'
+import { useLocale } from '../lib/useLocale'
+import type { Translator } from '../lib/useLocale'
+import { badgeLabels } from '../lib/badges'
+import { formatCount, formatMoney } from '../lib/format'
 
 type ProductCardProps = {
   product: Experience
@@ -23,19 +27,14 @@ type ProductCardProps = {
   onAsk?: (product: Experience) => void
 }
 
-const durationLabel = (minutes: number) => {
-  if (minutes < 60) return `${minutes} min`
+const durationLabel = (minutes: number, t: Translator) => {
+  if (minutes < 60) return t('product.duration.minutes', { minutes })
   const hours = Math.floor(minutes / 60)
   const remainder = minutes % 60
-  return remainder ? `${hours}h ${remainder}m` : `${hours} hours`
+  return remainder
+    ? t('product.duration.hoursMinutes', { hours, minutes: remainder })
+    : t.plural('product.duration.hours', hours, { hours })
 }
-
-const money = (currency: string, amount: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: currency === 'VND' ? 0 : 2,
-  }).format(amount)
 
 export function ProductCard({
   product,
@@ -44,6 +43,11 @@ export function ProductCard({
   onAdd,
   onAsk,
 }: ProductCardProps) {
+  // Formatting locale comes from the provider, not a module constant, so
+  // prices re-render when the shopper switches language.
+  const { locale, t } = useLocale()
+  const money = (currency: string, amount: number) =>
+    formatMoney(locale, currency, amount)
   const [saved, setSaved] = useState(false)
 
   return (
@@ -51,7 +55,7 @@ export function ProductCard({
       <button
         className="product-image-button"
         onClick={() => onView(product)}
-        aria-label={`View ${product.title}`}
+        aria-label={t('card.a11y.view', { title: product.title })}
       >
         <img
           className="product-image"
@@ -73,23 +77,21 @@ export function ProductCard({
       <button
         className={`save-button ${saved ? 'saved' : ''}`}
         onClick={() => setSaved((value) => !value)}
-        aria-label={saved ? 'Remove from saved' : 'Save experience'}
+        aria-label={saved ? t('product.unsave') : t('product.save')}
       >
         <Heart size={18} fill={saved ? 'currentColor' : 'none'} />
       </button>
 
       <div className="product-body">
         <div className="badge-row">
-          {product.badges.slice(0, 2).map((badge) => (
-            <span className="mini-badge" key={badge}>
-              {badge === 'Top pick' || badge === 'Guest favourite' ? (
-                <Sparkles size={11} />
-              ) : (
+          {badgeLabels(product, t)
+            .slice(0, 2)
+            .map((label) => (
+              <span className="mini-badge" key={label}>
                 <Check size={11} />
-              )}
-              {badge}
-            </span>
-          ))}
+                {label}
+              </span>
+            ))}
         </div>
         <button
           className="product-title-button"
@@ -125,19 +127,19 @@ export function ProductCard({
             <span className="rating">
               <Star size={14} fill="currentColor" />
               <strong>{product.rating.toFixed(1)}</strong>
-              <span>({product.review_count.toLocaleString()})</span>
+              <span>({formatCount(locale, product.review_count)})</span>
             </span>
           ) : (
-            <span className="rating new-listing">{NEW_LISTING_LABEL}</span>
+            <span className="rating new-listing">{t(NEW_LISTING_KEY)}</span>
           )}
           <span>
             <Clock3 size={14} />
-            {durationLabel(product.duration_minutes)}
+            {durationLabel(product.duration_minutes, t)}
           </span>
         </div>
         <div className="product-footer">
           <div className="price">
-            <span>From</span>
+            <span>{t('card.from')}</span>
             <strong>
               {product.display_price != null && product.display_currency
                 ? money(product.display_currency, product.display_price)
@@ -145,8 +147,10 @@ export function ProductCard({
             </strong>
             <span>
               {product.display_price != null && product.display_currency
-                ? `per guest · ${money(product.currency, product.price)}`
-                : 'per guest'}
+                ? t('card.perGuestWith', {
+                    price: money(product.currency, product.price),
+                  })
+                : t('card.perGuest')}
             </span>
           </div>
           <div className="product-actions">
@@ -154,8 +158,8 @@ export function ProductCard({
               <button
                 className="icon-action"
                 onClick={() => onAsk(product)}
-                aria-label={`Ask Mai about ${product.title}`}
-                title="Ask about this"
+                aria-label={t('card.askAbout', { title: product.title })}
+                title={t('card.ask')}
               >
                 <MessageCircle size={18} />
               </button>
@@ -163,13 +167,13 @@ export function ProductCard({
             <button
               className="icon-action"
               onClick={() => onView(product)}
-              aria-label="View details"
+              aria-label={t('card.viewDetails')}
             >
               <ArrowUpRight size={18} />
             </button>
             <button className="add-button" onClick={() => onAdd(product)}>
               <ShoppingBag size={16} />
-              Add
+              {t('card.add')}
             </button>
           </div>
         </div>

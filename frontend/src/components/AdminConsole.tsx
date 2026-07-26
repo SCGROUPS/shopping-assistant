@@ -12,14 +12,19 @@ import {
   changeMerchandising,
   changeStatus,
   clearOverride,
+  approveTranslation,
+  editTranslation,
   fetchAudit,
   fetchCatalog,
   fetchExperience,
   fetchFunnel,
   fetchOverview,
   fetchSettings,
+  fetchTranslationCoverage,
+  fetchTranslationQueue,
   getApiKey,
   patchExperience,
+  rejectTranslation,
   resetSetting,
   saveSetting,
   setApiKey,
@@ -35,13 +40,18 @@ import type {
   Principal,
   ReviewSummary,
   SettingView,
+  TranslationCandidate,
+  TranslationReviewQueue,
+  LocaleCoverage,
+  ReviewState,
 } from '../lib/adminApi'
 
-type Tab = 'review' | 'catalog' | 'settings' | 'audit' | 'insight'
+type Tab = 'review' | 'catalog' | 'translations' | 'settings' | 'audit' | 'insight'
 
 const TABS: Array<{ id: Tab; label: string; needs?: Capability }> = [
   { id: 'review', label: 'Review queue' },
   { id: 'catalog', label: 'Catalogue' },
+  { id: 'translations', label: 'Languages' },
   { id: 'settings', label: 'Configuration', needs: 'configure' },
   { id: 'audit', label: 'Audit' },
   { id: 'insight', label: 'Performance' },
@@ -564,6 +574,258 @@ function Audit() {
   )
 }
 
+const LOCALE_NAMES: Record<string, string> = {
+  vi: 'Tiếng Việt',
+  zh: '中文',
+  ja: '日本語',
+  ko: '한국어',
+  fr: 'Français',
+  de: 'Deutsch',
+  es: 'Español',
+  en: 'English',
+}
+
+/**
+ * Machine translations held back from the storefront, and the only way to
+ * release one.
+ *
+ * `meeting_point` is held for review because a mistranslated set of directions
+ * sends a traveller to the wrong place. The pipeline implemented the holding
+ * and nothing implemented the release, so every locale sat permanently at one
+ * unpublished field per experience while the coverage report called it a
+ * backlog.
+ *
+ * There is deliberately no "approve all". A single click over hundreds of
+ * distinct sets of directions is not review - it is the automatic publication
+ * this field is specifically excluded from, with an operator's name attached.
+ */
+function Translations({ can }: { can: (capability: Capability) => boolean }) {
+  const [queue, setQueue] = useState<TranslationReviewQueue | null>(null)
+  const [coverage, setCoverage] = useState<LocaleCoverage[]>([])
+  const [locale, setLocale] = useState<string>('')
+  const [state, setState] = useState<ReviewState>('needs_review')
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [editing, setEditing] = useState<string | null>(null)
+  const [draft, setDraft] = useState('')
+
+  const mayPublish = can('catalog:publish')
+  const keyOf = (item: TranslationCandidate) =>
+    `${item.experience_id}:${item.field}:${item.locale}`
+
+  const load = useCallback(async () => {
+    setError(null)
+    try {
+      const [next, cover] = await Promise.all([
+        fetchTranslationQueue(locale || undefined, state),
+        fetchTranslationCoverage(),
+      ])
+      setQueue(next)
+      setCoverage(cover.locales)
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : 'Could not load the queue')
+    }
+  }, [locale, state])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const act = async (item: TranslationCandidate, what: 'approve' | 'reject') => {
+    setBusy(keyOf(item))
+    setError(null)
+    try {
+      await (what === 'approve' ? approveTranslation(item) : rejectTranslation(item))
+      await load()
+    } catch (problem) {
+      // A 409 means the text moved after it was rendered. Reloading is the
+      // whole remedy: the reviewer needs to read the new version, not retry.
+      setError(problem instanceof Error ? problem.message : 'The decision did not apply')
+      await load()
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const saveEdit = async (item: TranslationCandidate) => {
+    setBusy(keyOf(item))
+    setError(null)
+    try {
+      await editTranslation(item, draft)
+      setEditing(null)
+      setDraft('')
+      await load()
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : 'Could not save')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <div className="ops-translations">
+      <table className="ops-table ops-coverage">
+        <thead>
+          <tr>
+            <th>Language</th>
+            <th>Live</th>
+            <th>Translated</th>
+            <th>Awaiting review</th>
+            <th>Showing English</th>
+          </tr>
+        </thead>
+        <tbody>
+          {coverage.map((row) => (
+            <tr key={row.locale}>
+              <td>
+                {LOCALE_NAMES[row.locale] ?? row.locale}{' '}
+                <span className="ops-sub">{row.locale}</span>
+              </td>
+              <td>{row.enabled ? 'Yes' : 'No'}</td>
+              <td>{row.percent.toFixed(1)}%</td>
+              <td>{row.needs_review}</td>
+              <td>{row.fallback}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <div className="ops-filters">
+        {/* Rejected fields must be reachable. Rejecting deliberately does not
+            re-enqueue, so a console that lists only `needs_review` strands
+            every rejection on English permanently - which is the defect this
+            whole screen exists to fix, one layer up. */}
+        <select
+          value={state}
+          onChange={(event) => setState(event.target.value as ReviewState)}
+        >
+          <option value="needs_review">Awaiting a decision</option>
+          <option value="rejected">Rejected, needs writing</option>
+        </select>
+        <select value={locale} onChange={(event) => setLocale(event.target.value)}>
+          <option value="">Every language</option>
+          {Object.entries(queue?.by_locale ?? {}).map(([code, count]) => (
+            <option key={code} value={code}>
+              {LOCALE_NAMES[code] ?? code} ({count})
+            </option>
+          ))}
+        </select>
+        <span className="ops-sub">
+          {queue ? `${queue.total} awaiting a decision` : 'Loading…'}
+        </span>
+      </div>
+
+      {error ? <p className="ops-error">{error}</p> : null}
+      {!mayPublish ? (
+        <p className="ops-sub">
+          You can read this queue but not decide on it. Publishing a translation
+          needs the catalogue publishing capability.
+        </p>
+      ) : null}
+
+      {queue?.items.map((item) => {
+        const key = keyOf(item)
+        return (
+          <article key={key} className="ops-candidate">
+            <header>
+              <strong>{item.title}</strong>
+              <span className="ops-sub">
+                {item.field} · {LOCALE_NAMES[item.locale] ?? item.locale}
+              </span>
+            </header>
+            <div className="ops-candidate-pair">
+              <div>
+                <span className="ops-sub">Source ({item.source_language})</span>
+                <p>{item.source_text}</p>
+              </div>
+              <div>
+                <span className="ops-sub">
+                  {item.status === 'rejected'
+                    ? `Rejected by ${item.reviewed_by || 'an operator'}`
+                    : `Proposed (${item.locale})`}
+                </span>
+                <p lang={item.locale}>
+                  {item.candidate_value || (
+                    <em>
+                      Nothing is published in this language. Write the
+                      translation, or shoppers keep seeing the English.
+                    </em>
+                  )}
+                </p>
+              </div>
+            </div>
+            {!item.answers_current_source ? (
+              <p className="ops-warning">
+                The source text changed after this was translated. It cannot be
+                approved — reject it, or write the translation yourself.
+              </p>
+            ) : null}
+            {editing === key ? (
+              <div className="ops-candidate-edit">
+                <textarea
+                  value={draft}
+                  lang={item.locale}
+                  onChange={(event) => setDraft(event.target.value)}
+                  rows={3}
+                />
+                <button
+                  type="button"
+                  disabled={busy === key || !draft.trim()}
+                  onClick={() => void saveEdit(item)}
+                >
+                  Publish my version
+                </button>
+                <button type="button" onClick={() => setEditing(null)}>
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div className="ops-candidate-actions">
+                {item.status === 'needs_review' ? (
+                  <>
+                    <button
+                      type="button"
+                      disabled={!mayPublish || busy === key || !item.answers_current_source}
+                      onClick={() => void act(item, 'approve')}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!mayPublish || busy === key}
+                      onClick={() => void act(item, 'reject')}
+                    >
+                      Reject
+                    </button>
+                  </>
+                ) : null}
+                <button
+                  type="button"
+                  disabled={!mayPublish || busy === key}
+                  onClick={() => {
+                    setEditing(key)
+                    setDraft(item.candidate_value)
+                  }}
+                >
+                  {item.status === 'rejected' ? 'Write the translation' : 'Edit'}
+                </button>
+              </div>
+            )}
+          </article>
+        )
+      })}
+
+      {queue && queue.items.length === 0 ? (
+        <p className="ops-sub">
+          {state === 'rejected'
+            ? 'Nothing has been rejected.'
+            : 'Nothing is waiting for a decision.'}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
 function Insight() {
   const [funnel, setFunnel] = useState<FunnelView | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -790,6 +1052,7 @@ export default function AdminConsole() {
       </nav>
 
       <main className="ops-main">
+        {tab === 'translations' ? <Translations can={can} /> : null}
         {tab === 'settings' ? <Settings can={can} /> : null}
         {tab === 'audit' ? <Audit /> : null}
         {tab === 'insight' ? <Insight /> : null}

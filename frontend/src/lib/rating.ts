@@ -1,4 +1,5 @@
 import type { Experience } from '../types'
+import type { MessageKey } from './i18n'
 
 /**
  * Imported supplier inventory arrives with no review history. Rendering that as
@@ -8,4 +9,4 @@ import type { Experience } from '../types'
 export const hasReviews = (product: Pick<Experience, 'review_count'>) =>
   product.review_count > 0
 
-export const NEW_LISTING_LABEL = 'Newly listed'
+export const NEW_LISTING_KEY: MessageKey = 'product.newListing'

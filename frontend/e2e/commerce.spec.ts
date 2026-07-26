@@ -6,7 +6,7 @@ import { expect, test } from '@playwright/test'
 // are absent unless the inventory earns them.
 
 async function searchFor(page: import('@playwright/test').Page, query: string) {
-  const search = page.getByLabel('What would make this trip memorable?')
+  const search = page.getByTestId('trip-search')
   await search.fill(query)
   await search.press('Enter')
   await expect(page.locator('.product-grid .product-card').first()).toBeVisible({

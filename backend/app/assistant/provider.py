@@ -6,10 +6,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
+import idna
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AsyncAzureOpenAI
 
-from app.api.schemas import IntentValue, SearchIntent
+from app.api.schemas import SearchIntent
+from app.assistant.tlds import TOP_LEVEL_DOMAINS
 from app.common.config import Settings, get_settings
 from app.common.llm_cost import BudgetExceeded, ledger
 from app.common.ranking import deterministic_embedding
@@ -27,6 +29,10 @@ class ToolPlan:
     def text(self, key: str) -> str | None:
         value = self.arguments.get(key)
         return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def flag(self, key: str) -> bool:
+        """A boolean the agent set. Anything else is not an attestation."""
+        return self.arguments.get(key) is True
 
     def strings(self, key: str) -> list[str]:
         value = self.arguments.get(key)
@@ -90,6 +96,23 @@ SHOPPING_TOOLS: list[dict[str, Any]] = [
                 "type": ["number", "null"],
                 "description": "Budget ceiling for the whole party, in VND.",
             },
+            "relax_order": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Constraints the shopper has agreed you may give up if nothing "
+                    "matches, most expendable first, from: max_duration, rating, "
+                    "instant_confirmation, free_cancellation, category, "
+                    "indoor_outdoor, language, family_friendly, dates, budget, "
+                    "destination. Fill this only from what the shopper has actually "
+                    "said - 'I can be flexible on dates but not on price' is "
+                    "['dates']. Leave it empty when they have not said: nothing is "
+                    "then relaxed, and the result reports relaxation_candidates so "
+                    "you can ask them which to give up before searching again. "
+                    "Accessibility needs and exclusions are never relaxed and cannot "
+                    "be listed here."
+                ),
+            },
             "limit": {
                 "type": ["integer", "null"],
                 "description": "How many offerings to retrieve. Defaults to 8.",
@@ -121,8 +144,20 @@ SHOPPING_TOOLS: list[dict[str, Any]] = [
     ),
     function_tool(
         "confirm_simulated_checkout",
-        "Complete the booking. Only after the shopper explicitly confirms.",
-        {},
+        "Complete the booking, charging the shopper. Only call this after they "
+        "have been shown the checkout summary and have unambiguously agreed to "
+        "it in their own words, in any language.",
+        {
+            "shopper_confirmed": {
+                "type": "boolean",
+                "description": (
+                    "True only when the shopper's latest message is an "
+                    "unambiguous yes to the booking summary they were shown. "
+                    "A question about the total, a hedge, or a request to "
+                    "change something is not a confirmation."
+                ),
+            },
+        },
     ),
 ]
 
@@ -190,6 +225,11 @@ class AgentAnswer:
     message: str
     selections: list[Selection] = field(default_factory=list)
     clarification: str | None = None
+    # The agent finished, and what it produced could not be shown. Distinct from
+    # returning nothing at all: by the time the final answer is refused its tool
+    # calls have already run, so the caller must not start over and add the same
+    # experience to the cart a second time. It has to report, not retry.
+    declined: bool = False
 
 
 class AIProvider(Protocol):
@@ -219,106 +259,27 @@ class AIProvider(Protocol):
 
 
 def deterministic_intent(text: str) -> SearchIntent:
-    lowered = text.casefold()
-    destination = next(
-        (
-            name
-            for name in ("Hoi An", "Da Nang", "Hue", "Ba Na Hills")
-            if name.casefold() in lowered
-        ),
-        None,
-    )
-    hard: list[dict[str, Any]] = []
-    soft: list[dict[str, Any]] = []
-    if "indoor" in lowered or "rain" in lowered:
-        hard.append({"field": "indoor_outdoor", "operator": "in", "value": ["indoor", "mixed"]})
-    if any(word in lowered for word in ("wheelchair", "accessible", "mobility")):
-        hard.append({"field": "accessibility", "operator": "contains", "value": "wheelchair"})
-    if any(word in lowered for word in ("family", "child", "children", "kids")):
-        soft.append({"field": "family_friendly", "value": True, "weight": 0.9})
-    if "free cancellation" in lowered:
-        hard.append(
-            {
-                "field": "free_cancellation",
-                "operator": "eq",
-                "value": True,
-            }
-        )
-    if "instant confirmation" in lowered:
-        hard.append(
-            {
-                "field": "instant_confirmation",
-                "operator": "eq",
-                "value": True,
-            }
-        )
-    language = next(
-        (
-            language
-            for language in ("English", "Vietnamese", "French", "Korean", "Japanese")
-            if re.search(rf"\b{language.casefold()}\b", lowered)
-        ),
-        None,
-    )
-    if language:
-        hard.append({"field": "language", "operator": "eq", "value": language})
-    budget_match = re.search(
-        r"\b(?:under|below|max(?:imum)?|up to)\s*"
-        r"(?:(vnd|usd|\$|₫)\s*)?([0-9][0-9,]*(?:\.[0-9]+)?)",
-        lowered,
-    )
-    if budget_match:
-        currency_token, amount = budget_match.groups()
-        hard.append(
-            {
-                "field": "max_total_price",
-                "operator": "lte",
-                "value": float(amount.replace(",", "")),
-            }
-        )
-        if currency_token:
-            hard.append(
-                {
-                    "field": "currency",
-                    "operator": "eq",
-                    "value": "USD" if currency_token in {"usd", "$"} else "VND",
-                }
-            )
-    date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", lowered)
-    if date_match:
-        hard.append(
-            {
-                "field": "visit_start",
-                "operator": "eq",
-                "value": date_match.group(1),
-            }
-        )
-    duration_match = re.search(
-        r"\b(?:under|below|max(?:imum)?|up to)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\b",
-        lowered,
-    )
-    if duration_match:
-        amount = float(duration_match.group(1))
-        unit = duration_match.group(2)
-        hard.append(
-            {
-                "field": "max_duration_minutes",
-                "operator": "lte",
-                "value": int(amount * 60 if unit.startswith(("h", "hr")) else amount),
-            }
-        )
-    exclusions = re.findall(r"\bno\s+([a-z-]+)", lowered)
-    search_text = re.sub(
-        r"\b(hoi an|da nang|hue|under|below|family-friendly|family|indoor|outdoor)\b",
-        " ",
-        lowered,
-    )
+    """What can be honestly said about a request without interpreting it.
+
+    Almost nothing, which is why this function now says almost nothing.
+
+    It used to be a hundred lines of English pattern-matching, and it ran
+    whenever the model was unreachable or over budget. It read destinations
+    from four English names, accessibility from `wheelchair`, budgets from
+    `under`, exclusions from `no <word>`, and then deleted English words from
+    the search text - so a shopper writing Vietnamese had every constraint
+    ignored and their text left intact, while a shopper writing English had
+    constraints invented and their text cut apart. Two different products,
+    selected by language, with no signal anywhere that either had happened.
+
+    Guessing is worse than declining. A request that reaches this path is
+    answered as plain text search, in whatever language it was written, with
+    `undetermined` routing so the storefront knows the judgement was never
+    made rather than believing it was made and came back `grid`.
+    """
     return SearchIntent(
-        search_text=" ".join(search_text.split()) or text,
-        destination=IntentValue(name=destination, confidence=0.99 if destination else 0.0),
-        hard_constraints=hard,
-        soft_preferences=soft,
-        exclusions=exclusions,
+        search_text=text.strip(),
+        interaction_mode="undetermined",
     )
 
 
@@ -362,7 +323,141 @@ def _offered_ids(result: dict[str, Any]) -> set[str]:
     return found
 
 
+# A label of a hostname: alphanumeric, hyphens inside. `[^\W_]` rather than
+# `[a-z0-9]` because an internationalised domain is written in its own script,
+# and a guard that only understands ASCII is a guard an attacker writes around
+# by typing the same host in Cyrillic.
+_LABEL = r"[^\W_](?:[^\W_]|-)*"
+
+# The characters UTS-46 maps to a full stop, which is to say: the characters a
+# browser treats as a label separator. `pay。example。com` is not a lookalike of
+# `pay.example.com` - it *is* that host, and typing it resolves. Matching only
+# ASCII `.` meant no host candidate was found at all, so the careful suffix
+# normalisation underneath was never even reached.
+_DOT = r"[.\u3002\uff0e\uff61]"
+_DOTS = "\u3002\uff0e\uff61"
+
+# A last label containing at least one letter. Without it a price written
+# `1.500.000/khach` and a time written `16.30/person` both read as links.
+_ALPHA_LAST_LABEL = rf"(?=(?:[^\W_]|-)*[^\W\d_]){_LABEL}"
+
+# A link, an address or a phone number in the assistant's prose did not come
+# from a tool: no tool returns any of these. It came from the model, and the
+# most likely author is catalogue text written by whoever wanted the shopper to
+# leave the site and pay somewhere unprotected. Prose is the one part of the
+# answer we cannot verify by id, so it is checked for the things that are never
+# legitimate in it.
+_INJECTED_CHANNEL = re.compile(
+    rf"""(?xi)
+    https?://
+  | www{_DOT}{_LABEL}{_DOT}{_ALPHA_LAST_LABEL}
+  | [^\W_][\w.%+-]*@{_LABEL}(?:{_DOT}{_LABEL})*{_DOT}{_ALPHA_LAST_LABEL}
+    # A host followed by a path is link-shaped whatever its suffix is. This is
+    # what catches `.example`, which is reserved by RFC 2606 and therefore
+    # absent from IANA's list of delegated domains.
+  | \b{_LABEL}(?:{_DOT}{_LABEL})*{_DOT}{_ALPHA_LAST_LABEL}/\S
+    """
+)
+
+# Every dotted token that could be a host. Whether it *is* one is decided by
+# its suffix, against IANA's list of delegated top-level domains.
+#
+# Two earlier attempts got this wrong in opposite directions. A hand-picked
+# list of thirty suffixes missed `pay.example.travel`. Replacing it with "any
+# dotted lower-case token" was worse: it made capitalisation a security
+# boundary, which DNS does not honour - `pay.Example.travel` resolves - while
+# refusing ordinary prose that had lost the space after a full stop, in
+# languages whose sentences are not reliably capitalised at all. The suffix is
+# the only part of a host that is defined rather than guessed.
+_HOST_CANDIDATE = re.compile(rf"\b{_LABEL}(?:{_DOT}{_LABEL})+", re.I)
+
+
+_DOT_TO_STOP = str.maketrans({character: "." for character in _DOTS})
+
+
+def _suffix_is_delegated(host: str) -> bool:
+    """Whether the last label of `host` is a top-level domain IANA delegates.
+
+    The lookup is done on the A-label, because that is the form IANA publishes
+    and the form that reaches DNS. A shopper-facing string carrying
+    `pay.example.рф` and one carrying `pay.example.xn--p1ai` name the same
+    server, and only one of them looks like a domain to a naive reader.
+
+    UTS-46 mapping is what a browser applies to a typed host, so it is what
+    decides whether this text would reach that server if somebody pasted it.
+    """
+    # Fold the separators a browser folds, so the last label is the last label.
+    suffix = host.translate(_DOT_TO_STOP).rsplit(".", 1)[-1].lower()
+    if suffix in TOP_LEVEL_DOMAINS:
+        return True
+    if suffix.isascii():
+        return False
+    try:
+        return idna.encode(suffix, uts46=True).decode("ascii") in TOP_LEVEL_DOMAINS
+    except (idna.IDNAError, UnicodeError):
+        # Not encodable as a hostname, so not reachable as one.
+        return False
+
+
+# Nine digits is where telephone numbers start, and no attempt is made to tell
+# them from money - three tries all failed, because `912 345 678` and
+# `100 000 000` are the same nine digits in the same three groups, and a
+# currency token merely *near* a run says nothing about the run ("Price: 100
+# VND. Call 912 345 678").
+#
+# It does not need telling. Amounts reach the shopper as structured data - the
+# `price` and `currency` on the card, and `message_vars` for the sentence - so
+# the client formats them in the shopper's own locale and the model has no
+# reason to write one out. Refusing here costs a blander sentence beside the
+# same cards and the same prices; letting one through costs a shopper who
+# paid a stranger.
+_LONG_DIGIT_RUN = re.compile(r"(?<![\d\w])\d[\d\s.,()-]{6,}")
+
+
+def carries_injected_channel(text: str) -> bool:
+    """True if the prose contains a way to reach someone off-platform.
+
+    No tool returns a link, an address or a phone number, so their presence in
+    model prose means the model wrote them - and the likeliest author is
+    catalogue text from whoever wanted the shopper to leave the site and pay
+    somewhere unprotected.
+    """
+    if _INJECTED_CHANNEL.search(text):
+        return True
+    if any(_suffix_is_delegated(match.group()) for match in _HOST_CANDIDATE.finditer(text)):
+        return True
+    return any(
+        sum(character.isdigit() for character in match.group()) >= 9
+        for match in _LONG_DIGIT_RUN.finditer(text)
+    )
+
+
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def names_unoffered_id(text: str, offered: set[str]) -> bool:
+    """True if the prose names an experience that is not among `offered`."""
+    allowed = {item.lower() for item in offered}
+    return any(mentioned.lower() not in allowed for mentioned in _UUID.findall(text))
+
+
 def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer:
+    """Turn the model's final answer into one the storefront may render.
+
+    Filtering the selections was not enough. The ids were checked and the prose
+    was not, so an answer could name four experiences, have three of them
+    removed for not existing, and still tell the shopper about all four beside a
+    single card. The message is the part they actually read.
+
+    Nothing here reads the language - it cannot, the shopper may be writing in
+    any of eight. It checks two things that hold whatever the language is: that
+    the model was not trying to present offerings we refused, and that the prose
+    does not carry a channel no tool could have produced. Failing either, the
+    whole answer is declined, because a partly-trustworthy answer is not a thing
+    we can hand to a shopper. It is declined rather than dropped: the tool calls
+    behind it have already run, so the caller has to say so and stop, not start
+    the turn again and book the same thing twice.
+    """
     selections: list[Selection] = []
     for raw in arguments.get("selections", []) or []:
         if not isinstance(raw, dict):
@@ -372,22 +467,42 @@ def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer:
             # The grounding contract: an id no tool returned cannot be rendered,
             # and presenting it would be an unverifiable claim.
             logger.warning("Agent selected an offering no tool returned: %s", experience_id)
-            continue
+            return AgentAnswer(message="", declined=True)
         selections.append(
             Selection(
                 experience_id=experience_id,
                 reason=str(raw.get("reason", "")).strip(),
             )
         )
+
+    message = str(arguments.get("message", "")).strip()
     clarification = arguments.get("clarification")
+    clarification_text = (
+        clarification.strip()
+        if isinstance(clarification, str) and clarification.strip()
+        else None
+    )
+    # Every field the shopper reads, not just the ones that look like prose.
+    # `reason` is free-form model text rendered beside the card, so checking the
+    # message alone left the easiest surface open: a real, bookable experience
+    # with "pay at ..." printed underneath it.
+    prose = "\n".join(
+        [message, clarification_text or "", *(item.reason for item in selections)]
+    )
+
+    if carries_injected_channel(prose):
+        logger.warning("Agent prose carried a contact channel no tool returned; declining")
+        return AgentAnswer(message="", declined=True)
+
+    selected = {selection.experience_id for selection in selections}
+    if names_unoffered_id(prose, selected):
+        logger.warning("Agent prose named an offering it did not select; declining")
+        return AgentAnswer(message="", declined=True)
+
     return AgentAnswer(
-        message=str(arguments.get("message", "")).strip(),
+        message=message,
         selections=selections,
-        clarification=(
-            clarification.strip()
-            if isinstance(clarification, str) and clarification.strip()
-            else None
-        ),
+        clarification=clarification_text,
     )
 
 
@@ -553,6 +668,8 @@ class AzureOpenAIProvider:
                 },
                 "needs_clarification": {"type": "boolean"},
                 "clarification_question": {"type": ["string", "null"]},
+                "interaction_mode": {"type": "string", "enum": ["assistant", "grid"]},
+                "date_phrase": {"type": ["string", "null"]},
             },
             "required": [
                 "search_text",
@@ -562,6 +679,8 @@ class AzureOpenAIProvider:
                 "exclusions",
                 "needs_clarification",
                 "clarification_question",
+                "interaction_mode",
+                "date_phrase",
             ],
             "additionalProperties": False,
         }
@@ -572,14 +691,21 @@ class AzureOpenAIProvider:
                     "role": "system",
                     "content": (
                         "Extract tourism search intent. Never invent unknown values. "
+                        "Set interaction_mode to 'assistant' when the request describes a "
+                        "trip in prose, asks a question, or states preferences that need to "
+                        "be traded off against each other, and 'grid' when it names a "
+                        "specific thing to look up. Judge this from what the shopper means, "
+                        "in whatever language they wrote it - not from the words used. "
                         f"Today is {datetime.now(UTC):%Y-%m-%d}. "
                         "Only emit visit_start or visit_end when the user explicitly states a "
-                        "calendar date or relative date phrase such as today, tomorrow, next "
-                        "week, or this weekend. The current date is provided only to resolve "
-                        "those explicit relative phrases; never infer a visit date from the "
-                        "destination, interests, party, or general request. If there is no date "
-                        "phrase, omit both date constraints. For one date, emit visit_start only, "
-                        "and never emit visit_end earlier than visit_start. "
+                        "calendar date or a relative date phrase, in any language. The current "
+                        "date is provided only to resolve those explicit relative phrases; never "
+                        "infer a visit date from the destination, interests, party, or general "
+                        "request. If there is no date phrase, omit both date constraints. For one "
+                        "date, emit visit_start only, and never emit visit_end earlier than "
+                        "visit_start. Set date_phrase to the exact words from the user's message "
+                        "that state the date, copied character for character, and null when they "
+                        "state no date. "
                         "Treat explicit indoor/outdoor, accessibility, date, budget, language, "
                         "and exclusion statements as hard constraints. Categories, interests, "
                         "and general family suitability are soft preferences unless the user says "

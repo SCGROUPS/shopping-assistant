@@ -14,13 +14,10 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import type { CartItem, Voucher } from '../types'
-
-const money = (currency: string, amount: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: currency === 'VND' ? 0 : 2,
-  }).format(amount)
+import { useLocale, useT } from '../lib/useLocale'
+import { formatMoney } from '../lib/format'
+import { api } from '../lib/api'
+import { demoCustomer } from '../data/demo'
 
 type CheckoutModalProps = {
   open: boolean
@@ -37,8 +34,18 @@ export function CheckoutModal({
   onClose,
   onConfirm,
 }: CheckoutModalProps) {
-  const [name, setName] = useState('Alex Traveller')
-  const [email, setEmail] = useState('alex@example.com')
+  // Formatting locale comes from the provider, not a module constant, so
+  // prices re-render when the shopper switches language.
+  const { locale } = useLocale()
+  const t = useT()
+  const money = (currency: string, amount: number) =>
+    formatMoney(locale, currency, amount)
+  const [name, setName] = useState(
+    api.demoFallbackEnabled ? demoCustomer.name : '',
+  )
+  const [email, setEmail] = useState(
+    api.demoFallbackEnabled ? demoCustomer.email : '',
+  )
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const total = items.reduce((sum, item) => sum + item.total, 0)
@@ -52,9 +59,7 @@ export function CheckoutModal({
     try {
       await onConfirm({ name, email })
     } catch {
-      setError(
-        'We could not complete the simulated booking. Recheck the cart and try again.',
-      )
+      setError(t('checkout.error'))
     } finally {
       setBusy(false)
     }
@@ -62,14 +67,16 @@ export function CheckoutModal({
 
   return (
     <div className="modal-shell" role="dialog" aria-modal="true">
-      <button className="modal-backdrop" onClick={onClose} aria-label="Close" />
+      <button className="modal-backdrop" onClick={onClose} aria-label={t('checkout.a11y.backdrop')} />
       <section className="checkout-modal">
         <header>
           <div>
-            <span className="eyebrow">{voucher ? 'Booking confirmed' : 'Secure demo checkout'}</span>
-            <h2>{voucher ? 'Your Vietnam moments are booked' : 'One last check'}</h2>
+            <span className="eyebrow">{voucher ? t('checkout.eyebrow.confirmed') : t('checkout.eyebrow.secure')}</span>
+            <h2>{voucher
+                ? t('checkout.heading.confirmed')
+                : t('checkout.heading.review')}</h2>
           </div>
-          <button className="plain-icon" onClick={onClose} aria-label="Close checkout">
+          <button className="plain-icon" onClick={onClose} aria-label={t('checkout.close')}>
             <X size={20} />
           </button>
         </header>
@@ -79,31 +86,28 @@ export function CheckoutModal({
             <div className="success-orbit">
               <PartyPopper size={34} />
             </div>
-            <p>
-              Everything is ready. Your mobile vouchers are grouped under one
-              easy booking reference.
-            </p>
+            <p>{t('checkout.ready')}</p>
             <div className="voucher-card">
               <div className="voucher-brand">
                 <span className="brand-mark">V</span>
                 <strong>VIETRA</strong>
-                <small>Central Vietnam collection</small>
+                <small>{t('checkout.collection')}</small>
               </div>
               {voucher.qr_image_data_url ? (
                 <img
                   className="voucher-qr-image"
                   src={voucher.qr_image_data_url}
-                  alt="Booking voucher QR code"
+                  alt={t('checkout.a11y.qr')}
                 />
               ) : (
-                <div className="fake-qr" aria-label="Demo QR code">
+                <div className="fake-qr" aria-label={t('checkout.a11y.qrDemo')}>
                   {Array.from({ length: 64 }, (_, index) => (
                     <i key={index} className={(index * 7 + index % 5) % 3 === 0 ? 'on' : ''} />
                   ))}
                 </div>
               )}
               <div className="voucher-details">
-                <span>Booking reference</span>
+                <span>{t('checkout.reference')}</span>
                 <strong>{voucher.booking_reference}</strong>
                 <small>{voucher.voucher_reference}</small>
               </div>
@@ -111,10 +115,10 @@ export function CheckoutModal({
             <div className="confirmation-actions">
               <button className="checkout-button" onClick={() => window.print()}>
                 <Download size={18} />
-                Save voucher
+                {t('checkout.saveVoucher')}
               </button>
               <button className="secondary-button" onClick={onClose}>
-                Keep exploring
+                {t('checkout.keepExploring')}
               </button>
             </div>
           </div>
@@ -125,21 +129,26 @@ export function CheckoutModal({
                 <div className="section-heading">
                   <span>1</span>
                   <div>
-                    <h3>Lead traveller</h3>
-                    <p>Your vouchers will be sent here.</p>
+                    <h3>{t('checkout.leadTraveller')}</h3>
+                    <p>{t('checkout.emailNote')}</p>
                   </div>
                 </div>
                 <label>
                   <span>
-                    <User size={15} /> Full name
+                    <User size={15} /> {t('checkout.fullName')}
                   </span>
-                  <input value={name} onChange={(event) => setName(event.target.value)} />
+                  <input
+                    data-testid="checkout-name"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                  />
                 </label>
                 <label>
                   <span>
-                    <Mail size={15} /> Email
+                    <Mail size={15} /> {t('checkout.email')}
                   </span>
                   <input
+                    data-testid="checkout-email"
                     type="email"
                     value={email}
                     onChange={(event) => setEmail(event.target.value)}
@@ -151,15 +160,15 @@ export function CheckoutModal({
                 <div className="section-heading">
                   <span>2</span>
                   <div>
-                    <h3>Demo payment</h3>
-                    <p>No card details or real money are used.</p>
+                    <h3>{t('checkout.demoPayment')}</h3>
+                    <p>{t('checkout.demoNote')}</p>
                   </div>
                 </div>
                 <div className="demo-payment-card">
                   <CreditCard size={24} />
                   <span>
-                    <strong>Vietra test wallet</strong>
-                    <small>•••• 4242 · Always approved</small>
+                    <strong>{t('checkout.wallet')}</strong>
+                    <small>{t('checkout.cardLine')}</small>
                   </span>
                   <Check size={18} />
                 </div>
@@ -167,12 +176,12 @@ export function CheckoutModal({
 
               <div className="secure-note">
                 <Lock size={16} />
-                This is a simulated purchase for the proof of concept.
+                {t('checkout.secureNote')}
               </div>
             </div>
 
             <aside className="order-summary">
-              <h3>Your booking</h3>
+              <h3>{t('checkout.title')}</h3>
               {items.map((item) => (
                 <div className="summary-item" key={item.id}>
                   <img
@@ -201,7 +210,7 @@ export function CheckoutModal({
                 </div>
               ))}
               <div className="summary-total">
-                <span>Total</span>
+                <span>{t('checkout.total')}</span>
                 <strong>
                   {money(currency, total)}
                 </strong>
@@ -217,12 +226,9 @@ export function CheckoutModal({
                 disabled={busy || !name || !email}
               >
                 {busy ? <LoaderCircle size={18} className="spin" /> : <ShieldCheck size={18} />}
-                {busy ? 'Confirming…' : 'Confirm demo purchase'}
+                {busy ? t('checkout.confirming') : t('checkout.confirm')}
               </button>
-              <p className="fine-print">
-                By confirming, you accept the mock supplier terms and
-                cancellation policies shown for each experience.
-              </p>
+              <p className="fine-print">{t('checkout.terms')}</p>
             </aside>
           </div>
         )}

@@ -238,6 +238,14 @@ class ExperienceSearchDocument(Base):
     # text happens to be identical, so a version bump would leave the whole
     # catalogue stale with nothing marked stale.
     index_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The construction recipe alone - version, model, embedding version,
+    # dimensions - with no document text in it. `index_fingerprint` moves every
+    # time a translation lands, so a release cannot wait on it; this does not,
+    # which is what lets a deploy ask "was everything built by my image?"
+    # without also waiting on unrelated content work that will never finish.
+    index_recipe: Mapped[str] = mapped_column(
+        String(64), default="", server_default="", index=True
+    )
     embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

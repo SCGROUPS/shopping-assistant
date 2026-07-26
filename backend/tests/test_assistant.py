@@ -1,13 +1,56 @@
+from collections.abc import Callable
+from typing import Any
+
+import pytest
 from httpx import AsyncClient
 
+from app.api import routes
 from app.api.schemas import ConversationCreate, MessageRequest
-from app.assistant.provider import ToolPlan, deterministic_intent
+from app.assistant.provider import DemoAIProvider, ToolPlan, deterministic_intent
 from app.assistant.service import AssistantService
 from app.common.ranking import deterministic_embedding
 from app.common.store import store
 
 
-async def test_assistant_requires_explicit_confirmation(client: AsyncClient):
+class ScriptedPlanner(DemoAIProvider):
+    """Stands in for the model's tool planning.
+
+    The service no longer chooses a tool from the shopper's words - the agent
+    does - so a test that wants a tool run has to say which one, the same way
+    the model would. The script is keyed on the exact message the test sends,
+    so nothing here interprets language.
+    """
+
+    def __init__(self, script: dict[str, Callable[[dict[str, Any]], ToolPlan | None]]) -> None:
+        self.script = script
+
+    async def plan_action(self, text: str, state: dict[str, Any]) -> ToolPlan | None:
+        build = self.script.get(text)
+        return build(state) if build else None
+
+
+@pytest.fixture
+def planner():
+    """Give the HTTP-level assistant a scripted planner for one test."""
+
+    def install(script: dict[str, Callable[[dict[str, Any]], ToolPlan | None]]) -> None:
+        routes.assistant_service.ai = ScriptedPlanner(script)
+
+    original = routes.assistant_service.ai
+    yield install
+    routes.assistant_service.ai = original
+
+
+async def test_assistant_requires_explicit_confirmation(client: AsyncClient, planner):
+    planner(
+        {
+            "Add the first one to cart": lambda state: ToolPlan("add_to_cart"),
+            "prepare checkout": lambda state: ToolPlan("prepare_checkout"),
+            "confirm": lambda state: ToolPlan(
+                "confirm_simulated_checkout", {"shopper_confirmed": True}
+            ),
+        }
+    )
     created = await client.post("/api/v1/conversations", json={})
     conversation_id = created.json()["id"]
 
@@ -41,7 +84,10 @@ async def test_assistant_requires_explicit_confirmation(client: AsyncClient):
         json={"message": "Add the first one to cart"},
     )
     assert added.status_code == 200
-    assert "Added" in added.json()["message"]
+    # Assert on the code, not the English. A test that reads the prose is a test
+    # that has to be rewritten the day the sentence is translated, and it proves
+    # nothing about what a Vietnamese shopper is shown.
+    assert added.json()["message_code"] == "assistant.msg.added"
 
     premature_conversation = await client.post("/api/v1/conversations", json={})
     premature_id = premature_conversation.json()["id"]
@@ -49,18 +95,20 @@ async def test_assistant_requires_explicit_confirmation(client: AsyncClient):
         f"/api/v1/conversations/{premature_id}/messages?stream=false",
         json={"message": "confirm"},
     )
-    assert "cannot book yet" in premature.json()["message"]
+    assert premature.json()["message_code"] == "assistant.msg.cannotBookYet"
 
     prepared = await client.post(
         f"/api/v1/conversations/{conversation_id}/messages?stream=false",
         json={"message": "prepare checkout"},
     )
-    assert "Reply exactly" in prepared.json()["message"]
+    assert prepared.json()["message_code"] == "assistant.msg.checkoutTotal"
+    assert prepared.json()["message_vars"]["count"] >= 1
     confirmed = await client.post(
         f"/api/v1/conversations/{conversation_id}/messages?stream=false",
         json={"message": "confirm"},
     )
-    assert "is confirmed" in confirmed.json()["message"]
+    assert confirmed.json()["message_code"] == "assistant.msg.booked"
+    assert confirmed.json()["message_vars"]["voucher"]
     assert confirmed.json()["state_patch"]["booking_id"]
 
 
@@ -92,7 +140,8 @@ async def test_assistant_defaults_to_json_contract(client: AsyncClient):
     assert {"message", "products", "actions", "citations"}.issubset(response.json())
 
 
-async def test_assistant_adds_the_persisted_party(client: AsyncClient):
+async def test_assistant_adds_the_persisted_party(client: AsyncClient, planner):
+    planner({"Add the first one to cart": lambda state: ToolPlan("add_to_cart")})
     created = await client.post(
         "/api/v1/conversations",
         json={"party": [{"type": "adult", "count": 3}]},
@@ -144,12 +193,8 @@ async def test_azure_enhancement_path_keeps_structured_commerce_payload():
     }
 
 
-async def test_planner_decision_wins_over_keyword_match(client: AsyncClient):
+async def test_the_plan_decides_the_tool(client: AsyncClient):
     from app.api.schemas import AssistantContext
-    from app.assistant.service import keyword_tool
-
-    # "compare" appears in the sentence but the shopper is asking to search.
-    assert keyword_tool("compare") == "compare_experiences"
 
     class PlannerProvider:
         async def plan_action(self, text, state):
@@ -224,7 +269,13 @@ async def test_context_carries_storefront_filters(client: AsyncClient):
     assert all(product["destination"] == "Hoi An" for product in products)
 
 
-async def test_referent_resolution_picks_the_named_experience(client: AsyncClient):
+async def test_referent_resolution_uses_the_id_the_agent_named(client: AsyncClient, planner):
+    """The agent names an offering by id, so any second result can be reached.
+
+    Reading an ordinal or a title out of the message only ever worked in
+    English, and fell back to the first result - reporting success - whenever
+    it did not.
+    """
     created = await client.post("/api/v1/conversations", json={})
     conversation_id = created.json()["id"]
     search = await client.post(
@@ -234,9 +285,62 @@ async def test_referent_resolution_picks_the_named_experience(client: AsyncClien
     products = search.json()["products"]
     assert len(products) >= 2
     second = products[1]
+    planner(
+        {
+            "them cai nay vao gio hang": lambda state: ToolPlan(
+                "add_to_cart", {"experience_id": second["experience_id"]}
+            ),
+        }
+    )
     added = await client.post(
         f"/api/v1/conversations/{conversation_id}/messages?stream=false",
-        json={"message": f"add {second['title']} to my cart"},
+        json={"message": "them cai nay vao gio hang"},
     )
     assert added.status_code == 200
     assert second["title"] in added.json()["message"]
+
+
+async def test_an_offering_outside_the_results_is_refused(client: AsyncClient, planner):
+    """A reference we cannot place is an error, never the first result."""
+    from uuid import uuid4
+
+    created = await client.post("/api/v1/conversations", json={})
+    conversation_id = created.json()["id"]
+    await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages?stream=false",
+        json={"message": "Find a family friendly indoor activity in Hoi An"},
+    )
+    planner(
+        {
+            "add that one": lambda state: ToolPlan("add_to_cart", {"experience_id": str(uuid4())}),
+        }
+    )
+    added = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages?stream=false",
+        json={"message": "add that one"},
+    )
+    assert added.status_code == 409
+
+
+async def test_the_shopper_is_told_when_the_assistant_cannot_act(client: AsyncClient):
+    """An outage must not look like an answer.
+
+    With no model there is no plan, and the only thing the assistant can do is
+    search for the text as written. It used to do exactly that and say nothing:
+    a shopper asking to add something to their cart got a list of search
+    results, phrased as though it were the reply to their request, with the cart
+    untouched. The results are still worth showing - but the client has to be
+    able to tell the shopper that the thing they asked for did not happen.
+    """
+    conversation = await client.post("/api/v1/conversations", json={})
+    conversation_id = conversation.json()["id"]
+    reply = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages?stream=false",
+        json={"message": "add the sunrise cruise to my cart"},
+    )
+    body = reply.json()
+    assert body["degraded"] is True
+    # And the sentence it did produce is a code, not English prose, because the
+    # shopper this protects is the one who is not reading English.
+    assert body["message_code"] == "assistant.msg.searchResults"
+    assert body["message_vars"]["count"] == len(body["products"])

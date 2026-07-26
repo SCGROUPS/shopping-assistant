@@ -33,13 +33,31 @@ async def reset_postgres(engine, keep: tuple[str, ...] = ()) -> None:
         )
 
 
+# Which databases this process has already built the schema in.
+#
+# Every PostgreSQL suite has a function-scoped fixture that called
+# `create_postgres_schema`, so the whole schema - drop, extensions, ~30 tables,
+# then the raw-SQL triggers and indexes - was torn down and rebuilt before each
+# individual test. That was around 0.4s a test and roughly three quarters of the
+# suite's total runtime, spent proving over and over that `create_all` works.
+#
+# The schema is now built once per database per process and `reset_postgres`
+# truncates between tests, which is what actually isolates them. `test_migrations`
+# is unaffected: it runs against its own throwaway database and manages its own
+# schema, so nothing here can be poisoned by the DDL it performs.
+_BUILT_SCHEMAS: set[str] = set()
+
+
 # `create_all` alone yields a schema that accepts catalogue rows and then
 # rejects the first search document, because the tsvector trigger is raw SQL the
 # metadata cannot describe. Build the same schema the migration does.
-async def create_postgres_schema(engine) -> None:
+async def create_postgres_schema(engine, *, force: bool = False) -> None:
     from app.common.models import Base
     from app.common.schema import EXTENSIONS, POST_CREATE
 
+    key = str(engine.url)
+    if not force and key in _BUILT_SCHEMAS:
+        return
     async with engine.begin() as connection:
         # Drop first, because `create_all` skips tables that already exist and
         # therefore never adds a column to one. A scratch database left over
@@ -60,3 +78,4 @@ async def create_postgres_schema(engine) -> None:
         await connection.run_sync(Base.metadata.create_all)
         for statement in POST_CREATE:
             await connection.exec_driver_sql(statement)
+    _BUILT_SCHEMAS.add(key)

@@ -30,6 +30,7 @@ from sqlalchemy import case, func, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.common.config import get_settings
 from app.common.locales import SUPPORTED_LOCALES
 from app.common.models import (
     Destination,
@@ -108,6 +109,38 @@ def index_fingerprint(document_text: str, locale: str, model: str = EMBEDDING_MO
     embedding, with reconciliation reporting the catalogue perfectly healthy.
     """
     payload = "\x1f".join([DOCUMENT_VERSION, model, EMBEDDING_VERSION, locale, document_text])
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def index_recipe_id(model: str = EMBEDDING_MODEL) -> str:
+    """How a document was *built*, with nothing about what it says.
+
+    `index_fingerprint` mixes the document text in, which makes it useless as a
+    release barrier: it changes every time a translation lands, so a deploy
+    waiting on it is waiting on a value that moves for reasons that have
+    nothing to do with the release. This is the release-relevant half alone, so
+    "was every published document built by this image" has a stable answer that
+    ordinary content work cannot disturb.
+
+    The embedding dimension count is in here and deliberately absent from the
+    fingerprint. It is a *setting*: changing 512 to 1024 rewrites every vector
+    in the catalogue, while a fingerprint that never saw it goes on reporting
+    the whole index current.
+
+    `model` is a parameter for the same reason it is one on the fingerprint. A
+    document embedded with the deterministic fallback records the fallback's
+    recipe, so it can never satisfy a gate asking for the real one - a
+    provider outage during a release must delay the release, not silently
+    certify placeholder vectors as a finished index.
+    """
+    payload = "\x1f".join(
+        [
+            DOCUMENT_VERSION,
+            model,
+            EMBEDDING_VERSION,
+            str(get_settings().openai_embedding_dimensions),
+        ]
+    )
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -384,6 +417,7 @@ async def upsert_search_document(
         embedding_version=EMBEDDING_VERSION,
         content_hash=hashlib.sha256(document_text.encode()).hexdigest(),
         index_fingerprint=index_fingerprint(document_text, locale, embedding_model),
+        index_recipe=index_recipe_id(embedding_model),
         embedded_at=now,
     )
     await session.execute(
@@ -399,6 +433,7 @@ async def upsert_search_document(
                 "embedding_version": statement.excluded.embedding_version,
                 "content_hash": statement.excluded.content_hash,
                 "index_fingerprint": statement.excluded.index_fingerprint,
+                "index_recipe": statement.excluded.index_recipe,
                 "embedded_at": statement.excluded.embedded_at,
             },
         )

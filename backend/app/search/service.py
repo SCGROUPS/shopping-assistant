@@ -1,8 +1,9 @@
 import logging
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -47,15 +48,9 @@ from app.search.postgres import hybrid_search
 
 DATE_WIDEN_DAYS = 3
 
-SYNONYMS = {
-    "kids": "family",
-    "children": "family",
-    "rainy": "indoor",
-    "boat": "cruise river",
-    "massage": "spa wellness",
-    "temple": "heritage history",
-    "ticket": "admission",
-}
+# How far ahead a shopper can plausibly be booking. Generous on purpose: the
+# bound exists to catch a model that misread a date, not to police itinerary.
+MAX_VISIT_HORIZON_DAYS = 550
 
 logger = logging.getLogger(__name__)
 
@@ -94,48 +89,91 @@ DATE_CONSTRAINT_FIELDS = {
 
 
 def should_extract_intent(request: SearchRequest) -> bool:
-    query = request.query.strip()
-    if not query:
+    """Whether there is anything here for the model to interpret.
+
+    This used to be a judgement about *shape* - English function words, then
+    word and character counts - and it doubled as the routing decision. Both
+    versions were proxies for meaning that behaved as proxies for language, so
+    whether a shopper could reach the assistant depended on which language they
+    wrote in. The only thing left that can be decided without reading the
+    request is whether there is a request at all.
+    """
+    return bool(request.query.strip())
+
+
+def _plausible_visit_date(value: Any) -> bool:
+    """Reject a date nobody could be shopping for.
+
+    Quoting the shopper's words proves they mentioned a date; it does not prove
+    the model's arithmetic. `tomorrow or Friday?` quotes `tomorrow` and can
+    still emit any ISO date at all. We cannot re-derive the date without
+    re-reading the language, but a visit in the past or years away is wrong
+    whatever the words were, and dropping it costs the shopper only the filter.
+    """
+    if not isinstance(value, str):
         return False
-    conversational = re.search(
-        r"\b(for|with|under|below|next|tomorrow|family|wheelchair|indoor|outdoor|prefer|quiet)\b",
-        query,
-        re.I,
-    )
-    return bool(conversational or len(query.split()) > 5)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    except ValueError:
+        return False
+    today = datetime.now(UTC).date()
+    return today - timedelta(days=1) <= parsed <= today + timedelta(days=MAX_VISIT_HORIZON_DAYS)
+
+
+def _comparable(text: str) -> str:
+    """Fold text so two spellings of the same word compare equal.
+
+    Vietnamese arrives both composed and decomposed - `ngay mai` with a single
+    precomposed vowel, or the same vowel followed by a combining mark - and the
+    two are different strings to Python. Case-folding alone left the model's
+    quoted phrase failing to match the shopper's own query, which silently
+    dropped a date they really had typed.
+    """
+    return unicodedata.normalize("NFC", text).strip().casefold()
 
 
 def sanitize_intent(query: str, intent: SearchIntent) -> SearchIntent:
-    mentions_date = bool(
-        re.search(
-            r"\b("
-            r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}|"
-            r"\d{1,2}[/-]\d{1,2}[/-](?:20)?\d{2}|"
-            r"january|february|march|april|may|june|july|august|"
-            r"september|october|november|december|"
-            r"today|tomorrow|tonight|"
-            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
-            r"next week|this week|weekend"
-            r")\b",
-            query,
-            re.I,
-        )
-    )
+    """Drop constraints the shopper did not actually ask for.
+
+    The date guard here used to be a regex of English month names, weekdays and
+    words like `tomorrow`. It ran against the shopper's raw text, so a request
+    written in Vietnamese or Japanese never matched, and any date the model had
+    correctly understood was thrown away - the shopper typed a date, saw it
+    ignored, and nothing anywhere reported a problem.
+
+    The model now quotes the words it read the date from, and the only thing
+    checked here is that those words really occur in the request. That still
+    stops an invented date, because an invented one has no source text to
+    quote, and it does so without the guard needing to know the language.
+    """
+    quoted = _comparable(intent.date_phrase or "")
+    mentions_date = bool(quoted) and quoted in _comparable(query)
     constraints: list[dict[str, Any]] = []
+    dropped: list[str] = []
     for constraint in intent.hard_constraints:
         field = str(constraint.get("field", "")).casefold()
         operator = str(constraint.get("operator", "")).casefold()
         value = constraint.get("value")
         if value in (None, "", []) or operator in {"unspecified", "unknown"}:
             continue
-        if field in DATE_CONSTRAINT_FIELDS and not mentions_date:
-            continue
+        if field in DATE_CONSTRAINT_FIELDS:
+            # Refusing a date is defensible. Refusing it in silence is not: the
+            # shopper sees results for dates they never asked about and has no
+            # way to tell that the one thing they were most specific about was
+            # thrown away. Each refusal is recorded so it can be shown.
+            if not mentions_date:
+                dropped.append("date_unverified")
+                continue
+            if not _plausible_visit_date(value):
+                dropped.append("date_implausible")
+                continue
         if field == "category" and isinstance(value, list):
             continue
         constraints.append(constraint)
     return intent.model_copy(
         update={
             "hard_constraints": constraints,
+            "dropped_constraints": list(dict.fromkeys(dropped)),
             "needs_clarification": False,
             "clarification_question": None,
         }
@@ -175,9 +213,7 @@ def _constraint_value(field: str, value: Any) -> Any:
     return str(value)
 
 
-def merge_filters(
-    explicit: SearchFilters, intent: SearchIntent
-) -> tuple[SearchFilters, list[str]]:
+def merge_filters(explicit: SearchFilters, intent: SearchIntent) -> tuple[SearchFilters, list[str]]:
     values = explicit.model_dump()
     unresolved: list[str] = []
     if not values["destination"] and intent.destination.name:
@@ -198,9 +234,7 @@ def merge_filters(
     for preference in intent.soft_preferences:
         if preference.get("field") == "family_friendly" and values["family_friendly"] is None:
             values["family_friendly"] = bool(preference.get("value"))
-    values["exclusions"] = list(
-        dict.fromkeys([*values["exclusions"], *intent.exclusions])
-    )
+    values["exclusions"] = list(dict.fromkeys([*values["exclusions"], *intent.exclusions]))
     if values["visit_start"] and not values["visit_end"]:
         values["visit_end"] = values["visit_start"]
     if (
@@ -214,9 +248,38 @@ def merge_filters(
     return SearchFilters.model_validate(values), unresolved
 
 
-def _expanded_tokens(query: str) -> list[str]:
-    tokens = tokenize(query)
-    return tokens + [synonym for token in tokens for synonym in tokenize(SYNONYMS.get(token, ""))]
+def excluded_by(text: str, exclusions: Sequence[str]) -> bool:
+    """Whether the shopper ruled this out, matching whole words rather than
+    substrings.
+
+    This was `exclusion in searchable`, which is not what anyone means by
+    excluding something. "spa" removed every experience mentioning a *space*,
+    "art" removed anything that *starts* somewhere, and "bar" removed the
+    barbecue. A shopper ruling one thing out silently lost a category they had
+    never mentioned, and nothing in the response said why.
+
+    Matching is on tokens, so accents and case fold away and Vietnamese - which
+    does not inflect - compares exactly. English plurals are the one allowance:
+    "mountain" still has to rule out `Marble Mountains`, which was the reason
+    the substring test was there in the first place.
+    """
+    haystack = tokenize(text)
+    if not haystack:
+        return False
+    # Padded so a phrase can only ever match on token boundaries.
+    window = f" {' '.join(haystack)} "
+    for exclusion in exclusions:
+        terms = tokenize(exclusion)
+        if not terms:
+            continue
+        head = " ".join(terms[:-1])
+        # Plural on the final word only: "water sport" must rule out "water
+        # sports", not "waters sport".
+        for suffix in ("", "s", "es"):
+            phrase = f"{head} {terms[-1]}{suffix}".strip()
+            if f" {phrase} " in window:
+                return True
+    return False
 
 
 def is_eligible(
@@ -289,17 +352,13 @@ def is_eligible(
         _, currency = starting_price(product)
         if currency != filters.currency:
             return False
-    if filters.exclusions:
-        searchable = product["search_document"].casefold()
-        if any(exclusion.casefold() in searchable for exclusion in filters.exclusions):
-            return False
+    if filters.exclusions and excluded_by(product["search_document"], filters.exclusions):
+        return False
     if filters.visit_start:
         party_size = sum(person.count for person in party) or 1
         visit_end = filters.visit_end or filters.visit_start
         if not any(
-            filters.visit_start.date()
-            <= slot["starts_at"].date()
-            <= visit_end.date()
+            filters.visit_start.date() <= slot["starts_at"].date() <= visit_end.date()
             and slot["capacity_remaining"] >= party_size
             and slot["status"] == "AVAILABLE"
             for option in product["options"]
@@ -354,51 +413,94 @@ def _widen_dates(filters: SearchFilters) -> None:
     filters.visit_end = end + timedelta(days=DATE_WIDEN_DAYS)
 
 
-# Ordered least-costly first. Accessibility requirements and explicit exclusions are
-# never relaxed: showing a wheelchair user an inaccessible tour is worse than showing
-# nothing at all.
+# The constraints that can be given up at all, and how. Accessibility
+# requirements and explicit exclusions are absent by design: showing a
+# wheelchair user an inaccessible tour is worse than showing nothing at all, and
+# an exclusion is the one thing the shopper stated negatively.
+#
+# The order of this tuple is not a policy. It is only the order in which
+# candidates are listed to whoever is going to ask the shopper; what actually
+# gets relaxed is whatever they authorise, in the order they authorise it.
+#
+# The second element is a *code*, not a label. These are shown to the shopper -
+# "no exact match, so I relaxed your budget" - and they used to be English prose
+# assembled here, which meant a Vietnamese storefront explained itself in
+# English. The client renders the code from its own dictionary.
 RELAXATION_STEPS: tuple[tuple[str, str, Any], ...] = (
-    ("max_duration_minutes", "maximum duration", _drop("max_duration_minutes")),
-    ("rating", "minimum rating", _drop("rating")),
-    ("instant_confirmation", "instant confirmation", _drop("instant_confirmation")),
-    ("free_cancellation", "free cancellation", _drop("free_cancellation")),
+    ("max_duration_minutes", "max_duration", _drop("max_duration_minutes")),
+    ("rating", "rating", _drop("rating")),
+    ("instant_confirmation", "instant_confirmation", _drop("instant_confirmation")),
+    ("free_cancellation", "free_cancellation", _drop("free_cancellation")),
     ("category", "category", _drop("category")),
-    ("indoor_outdoor", "indoor or outdoor preference", _drop("indoor_outdoor")),
+    ("indoor_outdoor", "indoor_outdoor", _drop("indoor_outdoor")),
     ("language", "language", _drop("language")),
-    ("family_friendly", "family-friendly filter", _drop("family_friendly")),
-    ("visit_start", f"exact date (searched ±{DATE_WIDEN_DAYS} days)", _widen_dates),
+    ("family_friendly", "family_friendly", _drop("family_friendly")),
+    ("visit_start", "dates", _widen_dates),
     ("max_total_price", "budget", _drop("max_total_price")),
     ("destination", "destination", _drop("destination")),
 )
+
+
+def relaxation_candidates(filters: SearchFilters) -> list[str]:
+    """Which of the shopper's constraints could still be given up, as codes.
+
+    Reported so the decision does not have to be ours. Which constraint is
+    cheapest to lose is the shopper's judgement, not a fact about the
+    catalogue - a family may give up their budget before their dates, and a
+    business traveller the reverse - so this only says what is on the table.
+    Nothing here is given up until the shopper names it.
+    """
+    return [
+        code
+        for field, code, _ in RELAXATION_STEPS
+        if getattr(filters, field) not in (None, [], "")
+    ]
 
 
 def relax_until_results(
     products: list[dict[str, Any]],
     filters: SearchFilters,
     party: Sequence[Participant],
-) -> tuple[list[dict[str, Any]], SearchFilters, list[str]]:
-    """Find results by progressively relaxing the least valuable constraints.
+    order: Sequence[str] | None = None,
+) -> tuple[list[dict[str, Any]], SearchFilters, list[str], list[str]]:
+    """Give up only the constraints the caller was authorised to give up.
 
-    A zero-result page is the most common exit point in tourism shopping, so the
-    engine trades an exact match for a bookable one and reports what it changed.
+    A zero-result page is the most common exit point in tourism shopping, and
+    this module used to answer it by relaxing constraints on its own initiative
+    until something was bookable. That was a business judgement made here: a
+    shopper who said "under 2,000,000 VND" could be shown a 5,000,000 VND tour,
+    or one who asked for a Korean-speaking guide could be handed an English one,
+    without ever agreeing to it. Reordering that sequence did not fix it - the
+    service was still the one deciding.
+
+    So nothing is relaxed unless `order` names it. `order` is an authorisation,
+    not a preference: each code in it is a constraint the shopper has agreed to
+    lose, tried in the order given. With no authorisation the exact-match result
+    is returned unchanged, together with the candidates a caller may ask about.
     """
     eligible = [product for product in products if is_eligible(product, filters, party)]
     if eligible:
-        return eligible, filters, []
+        return eligible, filters, [], []
+
+    candidates = relaxation_candidates(filters)
+    if not order:
+        # Nothing was authorised, so nothing is given up. The caller - the agent,
+        # or the storefront asking the shopper directly - decides what to offer.
+        return [], filters, [], candidates
+
+    authorised = [step for code in order for step in RELAXATION_STEPS if step[1] == code]
 
     working = filters.model_copy(deep=True)
     relaxed: list[str] = []
-    for field, label, mutate in RELAXATION_STEPS:
+    for field, label, mutate in authorised:
         if getattr(working, field) in (None, [], ""):
             continue
         mutate(working)
         relaxed.append(label)
-        eligible = [
-            product for product in products if is_eligible(product, working, party)
-        ]
+        eligible = [product for product in products if is_eligible(product, working, party)]
         if eligible:
-            return eligible, working, relaxed
-    return [], working, relaxed
+            return eligible, working, relaxed, relaxation_candidates(working)
+    return [], working, relaxed, relaxation_candidates(working)
 
 
 FACET_FIELDS: tuple[tuple[str, str], ...] = (
@@ -423,11 +525,7 @@ def _facets(
         scoped = filters.model_copy(deep=True)
         setattr(scoped, field, None)
         facets[facet_name] = dict(
-            Counter(
-                product[field]
-                for product in products
-                if is_eligible(product, scoped, party)
-            )
+            Counter(product[field] for product in products if is_eligible(product, scoped, party))
         )
     return facets
 
@@ -475,13 +573,20 @@ class SearchService:
                 logger.exception("Intent extraction failed; using deterministic parsing")
                 intent = deterministic_intent(request.query)
         else:
-            intent = SearchIntent(search_text=request.query)
+            # No model ran, so nothing judged this query. A terminal question
+            # mark is the one signal available that means the same thing in
+            # every language this catalogue serves.
+            intent = SearchIntent(
+                search_text=request.query,
+                # Nothing here read the request, so nothing here may claim to
+                # know how it should be answered.
+                interaction_mode="undetermined",
+            )
         intent = sanitize_intent(request.query, intent)
         if intent.destination.name:
             inferred = intent.destination.name.casefold()
             known_destinations = {
-                product["destination"].casefold()
-                for product in available_products
+                product["destination"].casefold() for product in available_products
             }
             if not any(
                 inferred in destination or destination in inferred
@@ -495,19 +600,15 @@ class SearchService:
                     }
                 )
         filters, unresolved = merge_filters(request.filters, intent)
+        # Codes, not a sentence. This used to interpolate raw field names into
+        # English prose - "Please clarify these required constraints:
+        # max_total_price." - which was neither the shopper's language nor
+        # anything they had written. The client owns the wording.
+        unresolved_codes = list(
+            dict.fromkeys([*intent.dropped_constraints, *(f"field.{f}" for f in unresolved)])
+        )
         if unresolved or intent.needs_clarification:
-            intent = intent.model_copy(
-                update={
-                    "needs_clarification": True,
-                    "clarification_question": intent.clarification_question
-                    or (
-                        "Please clarify these required constraints: "
-                        f"{', '.join(sorted(set(unresolved)))}."
-                        if unresolved
-                        else "Please clarify the required date, budget, or accessibility details."
-                    ),
-                }
-            )
+            intent = intent.model_copy(update={"needs_clarification": True})
             return SearchResponse(
                 query_id=uuid4(),
                 intent=intent,
@@ -515,12 +616,18 @@ class SearchService:
                 items=[],
                 facets={},
                 locale=locale,
+                unresolved_constraints=unresolved_codes,
+                interaction_mode=intent.interaction_mode,
             )
-        eligible, filters, relaxed_preferences = relax_until_results(
-            available_products, filters, request.party
+        eligible, filters, relaxed_preferences, still_relaxable = relax_until_results(
+            available_products, filters, request.party, order=request.relax_order
         )
 
-        tokens = _expanded_tokens(intent.search_text or request.query)
+        # The shopper's own words, not a rewrite of them. A hand-written English
+        # synonym map added "cruise river" to anyone who typed "boat" and did
+        # nothing at all for "thuyen" - it made the lexical leg both wrong in
+        # English and absent everywhere else. Meaning is the embedding's job.
+        tokens = tokenize(intent.search_text or request.query)
         lexical_scored: list[tuple[str, float]] = []
         for product in eligible:
             title = tokenize(product["title"])
@@ -570,13 +677,8 @@ class SearchService:
                         visit_start=(
                             filters.visit_start.isoformat() if filters.visit_start else None
                         ),
-                        visit_end=(
-                            filters.visit_end.isoformat() if filters.visit_end else None
-                        ),
-                        party=[
-                            person.model_dump(mode="json")
-                            for person in request.party
-                        ],
+                        visit_end=(filters.visit_end.isoformat() if filters.visit_end else None),
+                        party=[person.model_dump(mode="json") for person in request.party],
                         party_size=sum(person.count for person in request.party) or 1,
                         lexical_limit=self.settings.search_lexical_candidates,
                         semantic_limit=self.settings.search_semantic_candidates,
@@ -590,10 +692,7 @@ class SearchService:
 
         if postgres_rows:
             ordered = [str(row["id"]) for row in postgres_rows]
-            fused = {
-                str(row["id"]): float(row["rrf_score"])
-                for row in postgres_rows
-            }
+            fused = {str(row["id"]): float(row["rrf_score"]) for row in postgres_rows}
         else:
             lexical_ids = [
                 item[0] for item in lexical_scored[: self.settings.search_lexical_candidates]
@@ -601,14 +700,10 @@ class SearchService:
             semantic_ids = [
                 item[0] for item in semantic_scored[: self.settings.search_semantic_candidates]
             ]
-            fused = reciprocal_rank_fusion(
-                lexical_ids, semantic_ids, self.settings.search_rrf_k
-            )
+            fused = reciprocal_rank_fusion(lexical_ids, semantic_ids, self.settings.search_rrf_k)
             ordered = [
                 item_id
-                for item_id, _ in sorted(
-                    fused.items(), key=lambda item: item[1], reverse=True
-                )
+                for item_id, _ in sorted(fused.items(), key=lambda item: item[1], reverse=True)
             ]
         products = {str(product["id"]): product for product in eligible}
         ordered = [item_id for item_id in ordered if item_id in products]
@@ -667,6 +762,7 @@ class SearchService:
             locale=locale,
             query_id=uuid4(),
             intent=intent,
+            interaction_mode=intent.interaction_mode,
             effective_filters=filters,
             items=[
                 product_card(
@@ -680,5 +776,7 @@ class SearchService:
                 for product, _ in page
             ],
             facets=facets,
+            relaxation_candidates=still_relaxable,
+            unresolved_constraints=unresolved_codes,
             relaxed_preferences=relaxed_preferences,
         )

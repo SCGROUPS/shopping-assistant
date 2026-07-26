@@ -55,14 +55,19 @@ def product_card(
         for option in product["options"]
         for slot in option["slots"]
     )
+    # Codes, not sentences. These used to be English prose, which made them
+    # the only carrier of four facts the client needed - so the client
+    # recovered them by matching English words, and translating a badge would
+    # have silently turned the fact off. A code says the same thing in every
+    # language and the storefront renders it from its own dictionary.
     badges = []
     if product["instant_confirmation"]:
-        badges.append("Instant confirmation")
+        badges.append("instant_confirmation")
     if product["family_friendly"]:
-        badges.append("Family friendly")
+        badges.append("family_friendly")
     if free_hours:
-        badges.append(f"Free cancellation {free_hours}h")
-    badges.append("Available" if has_capacity else "Sold out")
+        badges.append("free_cancellation")
+    badges.append("available" if has_capacity else "sold_out")
     options = [
         OptionView(
             id=option["id"],
@@ -92,6 +97,10 @@ def product_card(
         currency=currency,
         tags=list(dict.fromkeys(product["interest_tags"] + product["subcategories"])),
         badges=badges,
+        available=has_capacity,
+        instant_confirmation=bool(product["instant_confirmation"]),
+        family_friendly=bool(product["family_friendly"]),
+        free_cancellation_hours=int(free_hours or 0),
         display_price=(
             fx.convert(price, currency, display_currency)
             if display_currency and fx.supported(display_currency)

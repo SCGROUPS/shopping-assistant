@@ -20,6 +20,10 @@ import type {
 } from '../types'
 import { hasReviews } from '../lib/rating'
 import { VoiceInputButton } from './VoiceInputButton'
+import { useLocale, useT } from '../lib/useLocale'
+import { badgeLabels } from '../lib/badges'
+import { bcp47, formatMoney } from '../lib/format'
+import { resolveText } from '../lib/i18n'
 
 type AssistantPanelProps = {
   open: boolean
@@ -32,19 +36,12 @@ type AssistantPanelProps = {
   onView: (product: Experience) => void
 }
 
-const prompts = [
-  'Plan a relaxed half-day',
-  'Best for a family?',
-  'What works if it rains?',
-  'Find accessible options',
-]
-
-const money = (currency: string, amount: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: currency === 'VND' ? 0 : 2,
-  }).format(amount)
+const promptKeys = [
+  'assistant.quick.halfDay',
+  'assistant.quick.family',
+  'assistant.quick.rain',
+  'assistant.quick.accessible',
+] as const
 
 export function AssistantPanel({
   open,
@@ -56,6 +53,12 @@ export function AssistantPanel({
   onAction,
   onView,
 }: AssistantPanelProps) {
+  // Formatting locale comes from the provider, not a module constant, so
+  // prices re-render when the shopper switches language.
+  const { locale } = useLocale()
+  const t = useT()
+  const money = (currency: string, amount: number) =>
+    formatMoney(locale, currency, amount)
   const [value, setValue] = useState('')
   const [speakingMessageId, setSpeakingMessageId] = useState<string>()
   const endRef = useRef<HTMLDivElement>(null)
@@ -98,8 +101,12 @@ export function AssistantPanel({
     }
 
     window.speechSynthesis.cancel()
-    const utterance = new SpeechSynthesisUtterance(message.text)
-    utterance.lang = 'en-US'
+    const utterance = new SpeechSynthesisUtterance(
+      resolveText(locale, message.text),
+    )
+    // Reading Vietnamese text with an en-US voice is unintelligible, so the
+    // voice follows the message, not the build.
+    utterance.lang = bcp47(locale)
     utterance.rate = 0.95
     const clearSpeakingMessage = () =>
       setSpeakingMessageId((current) =>
@@ -116,7 +123,7 @@ export function AssistantPanel({
       className={`assistant-panel ${open ? 'open' : ''}`}
       inert={!open}
       role="dialog"
-      aria-label="Mai shopping assistant"
+      aria-label={t('assistant.a11y.panel')}
     >
       <header className="assistant-header">
         <div className="assistant-identity">
@@ -124,21 +131,21 @@ export function AssistantPanel({
             <Sparkles size={18} />
           </span>
           <div>
-            <strong>Mai, your local trip curator</strong>
+            <strong>{t('assistant.title')}</strong>
             <span>
               <i />
-              Ready to help
+              {t('assistant.ready')}
             </span>
           </div>
         </div>
-        <button className="plain-icon" onClick={onClose} aria-label="Close assistant">
+        <button className="plain-icon" onClick={onClose} aria-label={t('assistant.a11y.close')}>
           <X size={20} />
         </button>
       </header>
 
       <div className="assistant-context">
         <MessageCircle size={15} />
-        Looking at {visibleProducts.length} experiences in Central Vietnam
+        {t('assistant.lookingAt', { count: visibleProducts.length })}
       </div>
 
       <div className="assistant-messages">
@@ -151,20 +158,20 @@ export function AssistantPanel({
             )}
             <div className="message-content">
               <div className="message-copy">
-                <p>{message.text}</p>
+                <p>{resolveText(locale, message.text)}</p>
                 {message.role === 'assistant' && canSpeak && (
                   <button
                     className="message-audio"
                     onClick={() => toggleSpeech(message)}
                     aria-label={
                       speakingMessageId === message.id
-                        ? 'Stop reading this response'
-                        : 'Read this response aloud'
+                        ? t('assistant.speech.stopLong')
+                        : t('assistant.speech.startLong')
                     }
                     title={
                       speakingMessageId === message.id
-                        ? 'Stop reading'
-                        : 'Listen to response'
+                        ? t('assistant.speech.stop')
+                        : t('assistant.speech.start')
                     }
                   >
                     {speakingMessageId === message.id ? (
@@ -175,6 +182,11 @@ export function AssistantPanel({
                   </button>
                 )}
               </div>
+              {message.degraded && (
+                <p className="message-degraded" role="status">
+                  {t('assistant.degraded')}
+                </p>
+              )}
               {message.products && message.products.length > 0 && (
                 <div className="assistant-product-stack">
                   {message.products.slice(0, 3).map((product) => {
@@ -189,7 +201,7 @@ export function AssistantPanel({
                           : [
                               {
                                 type: 'ADD_TO_CART' as const,
-                                label: 'Add to trip',
+                                label: { key: 'assistant.action.addToCart' as const },
                                 experience_id: product.id,
                               },
                             ]
@@ -210,7 +222,7 @@ export function AssistantPanel({
                                 }
                               }}
                             />
-                            {product.badges[0] && <i>{product.badges[0]}</i>}
+                            {badgeLabels(product, t)[0] && <i>{badgeLabels(product, t)[0]}</i>}
                           </span>
                           <span className="assistant-product-copy">
                             <strong>{product.title}</strong>
@@ -220,15 +232,17 @@ export function AssistantPanel({
                               {money(product.currency, product.price)}
                             </small>
                             <em>
-                              {product.reason ?? 'Recommended for this trip'}
+                              {product.reason ?? t('assistant.recommendedReason')}
                             </em>
                           </span>
                           <ArrowRight size={17} />
                         </button>
                         <div className="assistant-product-footer">
-                          <span>
+                          <span className={product.available ? '' : 'sold-out'}>
                             <i />
-                            Available on your date
+                            {product.available
+                              ? t('assistant.availableOnDate')
+                              : t('assistant.soldOut')}
                           </span>
                           <div className="assistant-product-actions">
                             {productActions.slice(0, 3).map((action, index) => (
@@ -240,7 +254,10 @@ export function AssistantPanel({
                                     : 'secondary'
                                 }
                                 data-product-id={product.id}
-                                aria-label={`${action.label} for ${product.title}`}
+                                aria-label={t('card.a11y.action', {
+                                  action: resolveText(locale, action.label),
+                                  title: product.title,
+                                })}
                                 onClick={() => onAction(action, [product])}
                               >
                                 {action.type === 'ADD_TO_CART' ? (
@@ -248,7 +265,7 @@ export function AssistantPanel({
                                 ) : (
                                   <Check size={13} />
                                 )}
-                                {action.label}
+                                {resolveText(locale, action.label)}
                               </button>
                             ))}
                           </div>
@@ -290,7 +307,7 @@ export function AssistantPanel({
                         ) : (
                           <Check size={16} />
                         )}
-                        {action.label}
+                        {resolveText(locale, action.label)}
                       </button>
                     ))}
                 </div>
@@ -305,7 +322,7 @@ export function AssistantPanel({
             </span>
             <div className="assistant-thinking">
               <LoaderCircle size={15} className="spin" />
-              Checking fit, timing, and availability…
+              {t('assistant.thinking')}
             </div>
           </div>
         )}
@@ -313,9 +330,9 @@ export function AssistantPanel({
       </div>
 
       <div className="prompt-row">
-        {prompts.map((prompt) => (
-          <button key={prompt} onClick={() => onSend(prompt)} disabled={busy}>
-            {prompt}
+        {promptKeys.map((key) => (
+          <button key={key} onClick={() => onSend(t(key))} disabled={busy}>
+            {t(key)}
           </button>
         ))}
       </div>
@@ -330,11 +347,12 @@ export function AssistantPanel({
               submit()
             }
           }}
-          placeholder="Ask about timing, access, prices, or build a plan…"
+          placeholder={t('assistant.placeholder')}
           rows={2}
         />
         <VoiceInputButton
-          label="Talk to Mai"
+          label={t('assistant.a11y.voice')}
+          stopLabel={t('app.search.voiceStop')}
           disabled={busy}
           onTranscript={(transcript, final) => {
             setValue(transcript)
@@ -348,13 +366,13 @@ export function AssistantPanel({
           className="assistant-send"
           onClick={submit}
           disabled={!value.trim() || busy}
-          aria-label="Send"
+          aria-label={t('assistant.a11y.send')}
         >
           <Send size={18} />
         </button>
       </div>
       <p className="assistant-disclaimer">
-        Mai checks catalog facts and live demo availability before taking action.
+        {t('assistant.footnote')}
       </p>
     </aside>
   )

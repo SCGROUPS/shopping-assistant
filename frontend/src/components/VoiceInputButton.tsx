@@ -1,5 +1,8 @@
 import { Mic, MicOff } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { bcp47 } from '../lib/format'
+import { useLocale, useT } from '../lib/useLocale'
+import type { Translator } from '../lib/useLocale'
 
 type RecognitionResult = {
   readonly isFinal: boolean
@@ -46,23 +49,27 @@ type VoiceInputButtonProps = {
   onTranscript: (transcript: string, final: boolean) => void
   disabled?: boolean
   label: string
+  stopLabel: string
 }
 
-const recognitionErrorMessage = (error: string) => {
+const recognitionErrorMessage = (error: string, t: Translator) => {
   if (error === 'not-allowed' || error === 'service-not-allowed') {
-    return 'Microphone access is blocked. Allow it in your browser to use voice.'
+    return t('voice.error.blocked')
   }
   if (error === 'no-speech') {
-    return 'No speech was detected. Try again when you are ready.'
+    return t('voice.error.noSpeech')
   }
-  return 'Voice input is temporarily unavailable.'
+  return t('voice.error.unavailable')
 }
 
 export function VoiceInputButton({
   onTranscript,
   disabled = false,
   label,
+  stopLabel,
 }: VoiceInputButtonProps) {
+  const { locale } = useLocale()
+  const t = useT()
   const [listening, setListening] = useState(false)
   const [status, setStatus] = useState('')
   const recognitionRef = useRef<Recognition | null>(null)
@@ -97,10 +104,12 @@ export function VoiceInputButton({
     const recognition = new Constructor()
     recognition.continuous = false
     recognition.interimResults = true
-    recognition.lang = 'en-US'
+    // Transcribing a Vietnamese speaker with an en-US recogniser returns
+    // nonsense, so the recogniser follows the shopper's language.
+    recognition.lang = bcp47(locale)
     recognition.onstart = () => {
       setListening(true)
-      setStatus('Listening. Speak naturally.')
+      setStatus(t('voice.listening'))
     }
     recognition.onresult = (event) => {
       let transcript = ''
@@ -111,10 +120,14 @@ export function VoiceInputButton({
       }
       const normalized = transcript.trim()
       if (normalized) onTranscriptRef.current(normalized, final)
-      setStatus(final ? `Heard: ${normalized}` : `Listening: ${normalized}`)
+      setStatus(
+        final
+          ? t('voice.heard', { transcript: normalized })
+          : t('voice.hearing', { transcript: normalized }),
+      )
     }
     recognition.onerror = (event) => {
-      setStatus(recognitionErrorMessage(event.error))
+      setStatus(recognitionErrorMessage(event.error, t))
     }
     recognition.onend = () => {
       setListening(false)
@@ -126,11 +139,11 @@ export function VoiceInputButton({
       recognition.start()
     } catch {
       setListening(false)
-      setStatus('Voice input is already active.')
+      setStatus(t('voice.alreadyActive'))
     }
   }
 
-  const accessibleLabel = listening ? 'Stop listening' : label
+  const accessibleLabel = listening ? stopLabel : label
 
   return (
     <>

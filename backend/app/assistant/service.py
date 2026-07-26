@@ -1,5 +1,4 @@
 import logging
-import re
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -18,7 +17,13 @@ from app.api.schemas import (
     SearchFilters,
     SearchRequest,
 )
-from app.assistant.provider import AIProvider, ToolPlan, build_ai_provider
+from app.assistant.provider import (
+    AIProvider,
+    ToolPlan,
+    build_ai_provider,
+    carries_injected_channel,
+    names_unoffered_id,
+)
 from app.bookings.service import BookingService
 from app.cart.service import CartService
 from app.catalog.service import get_product_async, product_card, product_detail
@@ -42,44 +47,6 @@ from app.search.service import SearchService
 
 logger = logging.getLogger(__name__)
 
-CONFIRM_PHRASES = {"confirm", "confirm booking", "yes, confirm", "confirm checkout"}
-
-ORDINALS = {
-    "first": 0,
-    "1st": 0,
-    "one": 0,
-    "second": 1,
-    "2nd": 1,
-    "two": 1,
-    "third": 2,
-    "3rd": 2,
-    "three": 2,
-    "fourth": 3,
-    "4th": 3,
-    "four": 3,
-    "fifth": 4,
-    "5th": 4,
-    "five": 4,
-    "last": -1,
-}
-
-
-def keyword_tool(lowered: str) -> str | None:
-    """Deterministic fallback used only when the planner is unavailable."""
-    if lowered in CONFIRM_PHRASES:
-        return "confirm_simulated_checkout"
-    if any(term in lowered for term in ("checkout", "pay", "book now")):
-        return "prepare_checkout"
-    if "add" in lowered and "cart" in lowered:
-        return "add_to_cart"
-    if "availability" in lowered or "available" in lowered:
-        return "check_availability"
-    if "compare" in lowered:
-        return "compare_experiences"
-    if any(term in lowered for term in ("similar", "also like", "complete my day")):
-        return "get_recommendations"
-    return None
-
 
 def _offering(item: Any) -> dict[str, Any]:
     """One catalogue result, described so the agent can judge it and refer back
@@ -99,33 +66,6 @@ def _offering(item: Any) -> dict[str, Any]:
         "availability": getattr(item, "availability", None),
         "why_ranked": item.reason,
     }
-
-
-def _join(labels: list[str]) -> str:
-    if len(labels) == 1:
-        return labels[0]
-    return f"{', '.join(labels[:-1])} and {labels[-1]}"
-
-
-def _resolve_referent(products: list[dict[str, Any]], message: str) -> dict[str, Any]:
-    """Resolve which of the last results the shopper means.
-
-    Falls back to the first result, but honours an explicit title mention or an
-    ordinal reference such as "add the second one to my cart".
-    """
-    if not message:
-        return products[0]
-    lowered = message.casefold()
-    titled = [product for product in products if product["title"].casefold() in lowered]
-    if titled:
-        return titled[0]
-    for word, index in ORDINALS.items():
-        if re.search(rf"\b{re.escape(word)}\b", lowered):
-            try:
-                return products[index]
-            except IndexError:
-                break
-    return products[0]
 
 
 class AssistantService:
@@ -315,6 +255,9 @@ class AssistantService:
         conversation = await self.get(conversation_id, session_id)
         conversation["state"]["locale"] = locale
         message_count = await self._conversation_message_count(conversation_id)
+        # Which turn this is, so a checkout summary and the yes that answers it
+        # can be told apart from both happening inside one agent turn.
+        conversation["state"]["turn_marker"] = message_count
         if message_count // 2 >= self.settings.assistant_max_session_turns:
             raise ApiError(
                 429,
@@ -322,7 +265,6 @@ class AssistantService:
                 "Start a new conversation to continue.",
                 "assistant-turn-limit",
             )
-        lowered = request.message.casefold().strip()
         self._merge_context(conversation, request.context)
         # Let the agent work the request with the tools first. It only falls
         # through to the single-tool path when reasoning is unavailable, which is
@@ -339,25 +281,24 @@ class AssistantService:
             logger.exception("Assistant action planning failed")
             plan = None
 
-        # The agent decides and fills its own arguments; keyword matching is only a
-        # fallback for when planning is unavailable (demo mode) or returns nothing.
-        if plan is None:
-            fallback = keyword_tool(lowered)
-            plan = ToolPlan(tool=fallback) if fallback else None
+        # The agent decides and fills its own arguments. There is no keyword
+        # fallback: choosing the tool from English words meant a shopper writing
+        # in any other language could reach no tool at all, and an English one
+        # could have a checkout started because a word appeared in a sentence
+        # that was never a request to act.
         tool = plan.tool if plan else None
-        # The agent resolves references itself; fall back to the raw message so the
-        # deterministic path can still pick out an ordinal or a title.
-        referent = (plan.text("reference") if plan else None) or request.message
+        # The agent names the offering by an id a tool returned. Empty means
+        # "the one they are looking at", which is the first of the last results.
+        referent = (plan.text("experience_id") if plan else None) or ""
         if tool == "confirm_simulated_checkout" and not self._confirmation_allowed(
-            conversation, lowered
+            conversation, plan
         ):
-            # Re-show the summary if the shopper is mid-checkout, otherwise treat the
-            # planner's guess as noise rather than acting on it.
-            tool = (
-                "prepare_checkout"
-                if conversation["state"].get("pending_action") == "CONFIRM_CHECKOUT"
-                else None
-            )
+            # Mid-checkout without an unambiguous yes: show the summary again
+            # rather than book. Nothing pending: keep the tool so the shopper is
+            # told there is nothing to confirm, instead of quietly searching for
+            # whatever word they used.
+            if conversation["state"].get("pending_action") == "CONFIRM_CHECKOUT":
+                tool = "prepare_checkout"
 
         response: AssistantResponse
         if tool == "confirm_simulated_checkout":
@@ -376,6 +317,13 @@ class AssistantService:
             response = await self._search(
                 conversation, (plan.text("query") if plan else None) or request.message
             )
+            if plan is None:
+                # No plan means no model, and without the model the only thing
+                # left is to search for the text as written. A shopper who asked
+                # to add something to their cart would otherwise be handed
+                # search results as though that were the answer, with nothing
+                # anywhere saying their request had not been carried out. Say so.
+                response.degraded = True
 
         await self._save_turn(
             conversation,
@@ -385,13 +333,33 @@ class AssistantService:
         return response
 
     @staticmethod
-    def _confirmation_allowed(conversation: dict[str, Any], lowered: str) -> bool:
-        """A simulated booking requires an explicit user confirmation and is never
-        triggered by a model decision alone.
+    def _confirmation_allowed(conversation: dict[str, Any], plan: ToolPlan | None) -> bool:
+        """A booking needs the shopper's explicit go-ahead, in their own language.
 
-        `_confirm_checkout` separately enforces that a booking summary is pending.
+        This used to require the message to be one of four English phrases, so a
+        shopper writing `xac nhan` could never complete a booking at all.
+        Whether someone said yes is language understanding, and the agent does
+        that. What is not delegated is the state, and there are three parts to
+        it, because two of them were not enough.
+
+        A summary must be pending. It must have been sent in an *earlier* turn:
+        the agent may call several tools in one turn, so it could call
+        `prepare_checkout` and then confirm it, and the yes it attested to would
+        be a yes to a total the shopper had not been shown yet. Requiring the
+        shopper to have replied since means there is a real message from them
+        that the attestation can be about - which also puts catalogue text,
+        which cannot make the shopper send another message, out of reach.
+
+        And the agent must attest that their latest message was an unambiguous
+        confirmation rather than a question about the price.
         """
-        return lowered in CONFIRM_PHRASES
+        state = conversation["state"]
+        if state.get("pending_action") != "CONFIRM_CHECKOUT":
+            return False
+        shown_at = state.get("checkout_shown_at")
+        if not isinstance(shown_at, int) or state.get("turn_marker", 0) <= shown_at:
+            return False
+        return bool(plan and plan.flag("shopper_confirmed"))
 
     @staticmethod
     def _merge_context(conversation: dict[str, Any], context: AssistantContext | None) -> None:
@@ -444,10 +412,20 @@ class AssistantService:
 
         async def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             try:
-                return await self._execute_tool(conversation, session_id, name, arguments)
+                result = await self._execute_tool(conversation, session_id, name, arguments)
             except ApiError as error:
                 # The agent can recover from a refusal; it should see why.
                 return {"error": error.args[1], "detail": error.args[2]}
+            # Everything a tool has handed the agent is something it may now act
+            # on. Without this the agent could find an offering and then be told
+            # it does not exist when it tried to add it to the cart, because the
+            # only addressable results were the ones a previous turn rendered.
+            offered = conversation["state"].setdefault("offered_ids", [])
+            for item in result.get("items", []) or []:
+                identifier = str(item.get("experience_id", "")) if isinstance(item, dict) else ""
+                if identifier and identifier not in offered:
+                    offered.append(identifier)
+            return result
 
         try:
             answer = await runner(message, conversation["state"], execute)
@@ -459,6 +437,20 @@ class AssistantService:
             return None
         if answer is None:
             return None
+        if answer.declined:
+            # The agent's tools have already run by the time its final answer is
+            # refused. Falling through to the deterministic path would replay
+            # them - the same experience added to the cart twice - so this turn
+            # ends here, saying plainly that the reply could not be shown.
+            logger.warning("Agent answer declined; not retrying the turn")
+            return AssistantResponse(
+                message=(
+                    "I could not put together a reply I can stand behind. "
+                    "Please ask me again."
+                ),
+                message_code="assistant.msg.unavailable",
+                degraded=True,
+            )
 
         products: list[AssistantProduct] = []
         for selection in answer.selections:
@@ -529,10 +521,18 @@ class AssistantService:
                     party=party,
                     page_size=int(limit) if isinstance(limit, int) and limit > 0 else 8,
                     locale=self._locale(conversation),
+                    relax_order=[
+                        str(code).strip()
+                        for code in arguments.get("relax_order", []) or []
+                        if str(code).strip()
+                    ],
                 )
             )
             return {
                 "relaxed_preferences": result.relaxed_preferences,
+                # What could still be given up, so the agent can offer the
+                # shopper the choice instead of the search making it for them.
+                "relaxation_candidates": result.relaxation_candidates,
                 "items": [_offering(item) for item in result.items],
             }
 
@@ -596,11 +596,20 @@ class AssistantService:
             return {"outcome": response.message}
 
         if name == "confirm_simulated_checkout":
-            # A booking is never taken on the agent's say-so alone.
-            return {
-                "error": "confirmation-required",
-                "detail": "Ask the shopper to confirm explicitly before booking.",
-            }
+            # A booking needs a summary the shopper has seen and their own
+            # unambiguous yes. Refusing unconditionally here left the agent no
+            # way to ever complete a booking: it asked the shopper to confirm,
+            # they did, and it was refused again.
+            if not self._confirmation_allowed(conversation, ToolPlan(name, arguments)):
+                return {
+                    "error": "confirmation-required",
+                    "detail": (
+                        "Show the shopper their checkout summary and wait for an "
+                        "unambiguous yes before calling this."
+                    ),
+                }
+            response = await self._confirm_checkout(conversation, session_id)
+            return {"outcome": response.message}
 
         return {"error": "unknown-tool", "detail": name}
 
@@ -638,7 +647,9 @@ class AssistantService:
                     "optional preferences. Only your accessibility needs and exclusions "
                     "were kept. Shall I try a different destination?"
                 ),
+                message_code="assistant.msg.noResults",
                 clarification="Would you like to change destination or travel dates?",
+                clarification_code="assistant.msg.noResults.ask",
             )
         facts = [
             {
@@ -650,24 +661,38 @@ class AssistantService:
             }
             for product in result.items[:4]
         ]
-        if result.relaxed_preferences:
-            message_text = (
-                f"No exact match, so I relaxed {_join(result.relaxed_preferences)} "
-                f"and found {len(products)} bookable options."
-            )
-        else:
-            message_text = (
-                f"I found {len(products)} grounded options. "
-                "The first choices best match your request."
-            )
+        # What was relaxed travels as codes in `relaxed_preferences`, which the
+        # client renders from the shopper's own dictionary. Naming it again here
+        # would put untranslatable English back into the sentence.
+        message_text = (
+            f"I found {len(products)} grounded options. "
+            "The first choices best match your request."
+        )
+        # The model writes in the shopper's language; this sentence cannot. So
+        # the code survives only while the model does not, and the client
+        # renders whichever of the two it was given.
+        message_code: str | None = "assistant.msg.searchResults"
         try:
             enhanced = await self.ai.enhance_assistant(message, facts)
-            if enhanced:
-                message_text = enhanced
+            # This is model prose reaching the shopper, so it answers to the
+            # same rule as the agent's: no channel a tool could not have
+            # produced, and no experience that is not on the page. It used to be
+            # rendered verbatim, which made the "deterministic fallback" a
+            # second, unguarded way for injected catalogue text to get through.
+            if enhanced and not carries_injected_channel(enhanced):
+                if not names_unoffered_id(enhanced, set(ids)):
+                    message_text = enhanced
+                    message_code = None
+                else:
+                    logger.warning("Enhanced prose named an offering not on the page; keeping code")
+            elif enhanced:
+                logger.warning("Enhanced prose carried a contact channel; keeping the coded message")
         except Exception:
             logger.exception("Grounded assistant prose enhancement failed")
         return AssistantResponse(
             message=message_text,
+            message_code=message_code,
+            message_vars={"count": len(products)} if message_code else {},
             state_patch={"filters": conversation["state"]["filters"], "last_result_ids": ids},
             products=products,
             relaxed_preferences=result.relaxed_preferences,
@@ -733,7 +758,8 @@ class AssistantService:
         ]
         if len(products) < 2:
             return AssistantResponse(
-                message="Please search for at least two experiences before asking me to compare."
+                message="Please search for at least two experiences before asking me to compare.",
+                message_code="assistant.msg.compareNeedsTwo",
             )
         rows = [
             {
@@ -751,6 +777,7 @@ class AssistantService:
         ]
         return AssistantResponse(
             message="Here is a fact-based comparison of the leading options.",
+            message_code="assistant.msg.comparison",
             comparison={"columns": list(rows[0]), "rows": rows},
             products=[
                 self._commerce_product(product, "Included in this fact-based comparison.")
@@ -793,7 +820,9 @@ class AssistantService:
                     "I could not find a complementary experience that is still bookable "
                     "for your dates and party. Would you like me to try another day?"
                 ),
+                message_code="assistant.msg.noComplement",
                 clarification="Shall I look at nearby dates?",
+                clarification_code="assistant.msg.noComplement.ask",
             )
         products = [
             self._commerce_product(
@@ -805,6 +834,7 @@ class AssistantService:
         ]
         return AssistantResponse(
             message="These diverse options complement your current choice.",
+            message_code="assistant.msg.complements",
             products=products,
             citations=[
                 {
@@ -854,6 +884,15 @@ class AssistantService:
                 f"Added {product['title']} for {party_label} to the cart. "
                 f"The simulated total is {cart.total:,.0f} {cart.currency}."
             ),
+            message_code="assistant.msg.added",
+            # Raw values, not a formatted sentence. Grouping separators and
+            # currency placement are locale decisions, and the client already
+            # makes them everywhere else on the page.
+            message_vars={
+                "title": product["title"],
+                "total": cart.total,
+                "currency": cart.currency,
+            },
             actions=[AssistantAction(type="PREPARE_CHECKOUT", label="Review checkout")],
             citations=[
                 {
@@ -868,12 +907,22 @@ class AssistantService:
     ) -> AssistantResponse:
         cart = await self.carts.validate(session_id, self._locale(conversation))
         conversation["state"]["pending_action"] = "CONFIRM_CHECKOUT"
+        # The turn the shopper is shown this total. A confirmation arriving in
+        # the same turn cannot be an answer to it, because the summary has not
+        # left the server yet.
+        conversation["state"]["checkout_shown_at"] = conversation["state"].get("turn_marker")
         return AssistantResponse(
             message=(
                 f"Final simulated booking total: {cart.total:,.0f} {cart.currency} "
                 f"for {len(cart.items)} item(s). No real payment will be taken. "
-                "Reply exactly “confirm” to create the booking and QR voucher."
+                "Confirm to create the booking and QR voucher."
             ),
+            message_code="assistant.msg.checkoutTotal",
+            message_vars={
+                "total": cart.total,
+                "currency": cart.currency,
+                "count": len(cart.items),
+            },
             state_patch={"pending_action": "CONFIRM_CHECKOUT"},
             actions=[
                 AssistantAction(
@@ -889,7 +938,11 @@ class AssistantService:
     ) -> AssistantResponse:
         if conversation["state"].get("pending_action") != "CONFIRM_CHECKOUT":
             return AssistantResponse(
-                message="I cannot book yet. Ask me to prepare checkout first so you can review the total."
+                message=(
+                    "I cannot book yet. Ask me to prepare checkout first so you can "
+                    "review the total."
+                ),
+                message_code="assistant.msg.cannotBookYet",
             )
         booking = await self.bookings.confirm(
             session_id,
@@ -902,26 +955,52 @@ class AssistantService:
                 f"Your simulated booking {booking.booking_reference} is confirmed. "
                 f"Voucher {booking.voucher.voucher_reference} is ready."
             ),
+            message_code="assistant.msg.booked",
+            message_vars={
+                "booking": booking.booking_reference,
+                "voucher": booking.voucher.voucher_reference,
+            },
             state_patch={"pending_action": None, "booking_id": str(booking.id)},
             actions=[AssistantAction(type="VIEW_VOUCHER")],
         )
 
     async def _selected_product(
-        self, conversation: dict[str, Any], message: str = ""
+        self, conversation: dict[str, Any], reference: str = ""
     ) -> dict[str, Any]:
-        ids = conversation["state"].get("last_result_ids", [])
-        if not ids:
+        """The offering an action applies to.
+
+        Two different questions share this. With no reference it means "the one
+        they are looking at", which is the first of the results on screen. With
+        a reference it means that specific offering, and the agent may name
+        anything a tool returned in this conversation - it can search and then
+        add to the cart in a single turn, which it could not do while the only
+        addressable offerings were the ones a previous turn had rendered.
+        """
+        state = conversation["state"]
+        shown = [str(item) for item in state.get("last_result_ids", [])]
+        if not reference:
+            if not shown:
+                raise ApiError(
+                    409,
+                    "No selected experience",
+                    "Search for an experience before this action.",
+                    "no-selection",
+                )
+            return await get_product_async(
+                UUID(shown[0]), self.data, locale=self._locale(conversation)
+            )
+        reachable = {*shown, *(str(item) for item in state.get("offered_ids", []))}
+        if reference not in reachable:
             raise ApiError(
                 409,
-                "No selected experience",
-                "Search for an experience before this action.",
-                "no-selection",
+                "Unknown experience",
+                "That offering has not come back from a tool in this conversation. "
+                "Search first, then use the experience_id the search returned.",
+                "unknown-referent",
             )
-        products = [
-            await get_product_async(UUID(item), self.data, locale=self._locale(conversation))
-            for item in ids
-        ]
-        return _resolve_referent(products, message)
+        return await get_product_async(
+            UUID(reference), self.data, locale=self._locale(conversation)
+        )
 
     def _commerce_product(
         self,

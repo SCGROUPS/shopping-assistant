@@ -10,13 +10,8 @@ import {
   X,
 } from 'lucide-react'
 import type { CartItem, Experience } from '../types'
-
-const money = (currency: string, amount: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: currency === 'VND' ? 0 : 2,
-  }).format(amount)
+import { useLocale, useT } from '../lib/useLocale'
+import { formatMoney } from '../lib/format'
 
 type CartDrawerProps = {
   open: boolean
@@ -42,6 +37,12 @@ export function CartDrawer({
   crossSell = [],
   onAddCrossSell,
 }: CartDrawerProps) {
+  // Formatting locale comes from the provider, not a module constant, so
+  // prices re-render when the shopper switches language.
+  const { locale } = useLocale()
+  const t = useT()
+  const money = (currency: string, amount: number) =>
+    formatMoney(locale, currency, amount)
   const total = items.reduce((sum, item) => sum + item.total, 0)
   const currency = items[0]?.experience.currency ?? 'USD'
 
@@ -51,21 +52,21 @@ export function CartDrawer({
         <button
           className="drawer-backdrop visible"
           onClick={onClose}
-          aria-label="Close cart"
+          aria-label={t('cart.close')}
         />
       )}
       <aside
         className={`cart-drawer ${open ? 'open' : ''}`}
         inert={!open}
         role="dialog"
-        aria-label="Experience cart"
+        aria-label={t('cart.title')}
       >
         <header>
           <div>
-            <span className="eyebrow">Your trip</span>
-            <h2>Experience cart</h2>
+            <span className="eyebrow">{t('cart.eyebrow')}</span>
+            <h2>{t('cart.title')}</h2>
           </div>
-          <button className="plain-icon" onClick={onClose} aria-label="Close cart">
+          <button className="plain-icon" onClick={onClose} aria-label={t('cart.close')}>
             <X size={20} />
           </button>
         </header>
@@ -75,8 +76,8 @@ export function CartDrawer({
             <span>
               <ShoppingBag size={28} />
             </span>
-            <h3>Your adventure starts here</h3>
-            <p>Add an experience and Mai can help complete your day.</p>
+            <h3>{t('cart.empty.title')}</h3>
+            <p>{t('cart.empty.body')}</p>
           </div>
         ) : (
           <>
@@ -100,8 +101,10 @@ export function CartDrawer({
                       {item.date} {item.time ? `· ${item.time}` : ''}
                     </span>
                     <span>
-                      {item.adults} adults
-                      {item.children ? ` · ${item.children} children` : ''}
+                      {t.plural('cart.adults', item.adults)}
+                      {item.children
+                        ? ` · ${t.plural('cart.children', item.children)}`
+                        : ''}
                     </span>
                     <b>
                       {money(item.experience.currency, item.total)}
@@ -110,7 +113,7 @@ export function CartDrawer({
                   <button
                     className="remove-item"
                     onClick={() => onRemove(item.id)}
-                    aria-label={`Remove ${item.experience.title}`}
+                    aria-label={t('card.a11y.remove', { title: item.experience.title })}
                   >
                     <Trash2 size={16} />
                   </button>
@@ -120,7 +123,7 @@ export function CartDrawer({
 
             {crossSell.length > 0 && onAddCrossSell && (
               <section className="cart-cross-sell">
-                <h3>Goes well with your day</h3>
+                <h3>{t('cart.crossSell')}</h3>
                 <ul>
                   {crossSell.slice(0, 3).map((product) => (
                     <li key={product.id}>
@@ -140,7 +143,7 @@ export function CartDrawer({
                       </div>
                       <button
                         onClick={() => onAddCrossSell(product)}
-                        aria-label={`Add ${product.title}`}
+                        aria-label={t('card.a11y.add', { title: product.title })}
                       >
                         <Plus size={16} />
                       </button>
@@ -153,36 +156,34 @@ export function CartDrawer({
             {onCheckPlan && (
               <button className="cart-plan-check" onClick={onCheckPlan}>
                 <MessageCircle size={16} />
-                {clashing
-                  ? 'Two items clash — ask Mai to re-time one'
-                  : 'Check my plan with Mai'}
+                {clashing ? t('cart.clash') : t('cart.checkPlan')}
               </button>
             )}
 
             <div className="cart-assurance">
               <ShieldCheck size={20} />
               <span>
-                <strong>Free cancellation on every item</strong>
-                <small>We recheck price and availability before booking.</small>
+                <strong>{t('cart.cancellation')}</strong>
+                <small>{t('cart.assurance.recheck')}</small>
               </span>
             </div>
 
             <footer className="cart-footer">
               <div className="total-line">
                 <span>
-                  Total
-                  <small>Taxes included</small>
+                  {t('cart.total')}
+                  <small>{t('cart.taxes')}</small>
                 </span>
                 <strong>
                   {money(currency, total)}
                 </strong>
               </div>
               <button className="checkout-button" onClick={onCheckout}>
-                Continue to checkout
+                {t('cart.continueCheckout')}
                 <ArrowRight size={18} />
               </button>
               <p>
-                <Minus size={13} /> No real payment will be charged in this demo.
+                <Minus size={13} /> {t('cart.demoNote')}
               </p>
             </footer>
           </>

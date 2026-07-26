@@ -1,9 +1,11 @@
 import { expect, test } from '@playwright/test'
+import { routeSearchAs } from './routing'
 import { installVoiceMock } from './voice-mock'
 
 test('desktop voice discovery completes a real voucher purchase', async ({
   page,
 }) => {
+  await routeSearchAs(page, 'assistant')
   await installVoiceMock(page)
   await page.goto('/')
 
@@ -11,7 +13,7 @@ test('desktop voice discovery completes a real voucher purchase', async ({
     page.getByRole('heading', { name: /Find your own rhythm/i }),
   ).toBeVisible()
   await page.getByRole('button', { name: 'Search by voice' }).click()
-  await expect(page.getByLabel('What would make this trip memorable?')).toHaveValue(
+  await expect(page.getByTestId('trip-search')).toHaveValue(
     'A relaxed family day with food and culture',
   )
 
@@ -68,6 +70,10 @@ test('desktop voice discovery completes a real voucher purchase', async ({
   await expect(
     checkout.getByRole('heading', { name: 'One last check' }),
   ).toBeVisible()
+  // Typed rather than relying on a prefill: a real checkout must not arrive
+  // filled in with somebody else's name, so the fields start empty.
+  await checkout.getByTestId('checkout-name').fill('Alex Traveller')
+  await checkout.getByTestId('checkout-email').fill('alex@example.com')
   await checkout
     .getByRole('button', { name: 'Confirm demo purchase' })
     .click()

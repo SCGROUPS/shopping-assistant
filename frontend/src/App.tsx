@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   ArrowRight,
   Bot,
   CalendarDays,
@@ -8,6 +9,7 @@ import {
   Compass,
   Filter,
   Globe2,
+  Languages,
   Heart,
   MapPin,
   Menu,
@@ -32,21 +34,34 @@ import { CartDrawer } from './components/CartDrawer'
 import { CheckoutModal } from './components/CheckoutModal'
 import { ProductCard } from './components/ProductCard'
 import { VoiceInputButton } from './components/VoiceInputButton'
-import { categories, demoExperiences } from './data/demo'
+import { demoExperiences } from './data/demo'
 import {
   SUPPORTED_CURRENCIES,
+  LOCALE_NAMES,
   api,
   getDisplayCurrency,
+  getPreferredLocale,
   setDisplayCurrency,
+  setPreferredLocale,
 } from './lib/api'
+import { formatCount, formatDate as intlDate, formatMoney } from './lib/format'
+import { LocaleProvider } from './lib/LocaleContext'
+import {
+  relaxationSentence,
+  relaxOfferChoices,
+  unresolvedLabels,
+} from './lib/badges'
+import { buildTranslator } from './lib/useLocale'
+import type { Translator } from './lib/useLocale'
+import { chromeReady, isFallback, resolveText, translate } from './lib/i18n'
+import type { LocalizedText } from './lib/i18n'
 import {
   detectFriction,
   findScheduleClash,
-  isConversationalQuery,
   type FrictionSignal,
   type Nudge,
 } from './lib/presence'
-import { NEW_LISTING_LABEL, hasReviews } from './lib/rating'
+import { NEW_LISTING_KEY, hasReviews } from './lib/rating'
 import type {
   AssistantAction,
   AssistantContext,
@@ -60,34 +75,41 @@ import type {
 const initialMessage: AssistantMessage = {
   id: 'welcome',
   role: 'assistant',
-  text: 'Xin chào! I can turn a few preferences into a thoughtful Central Vietnam plan. I will check timing, travel fit, and availability before you book.',
+  text: { key: 'assistant.welcome' },
   products: [demoExperiences[0], demoExperiences[1], demoExperiences[5]],
   actions: [
     {
       type: 'APPLY_FILTER',
-      label: 'Show family favourites',
+      label: { key: 'assistant.action.familyFavourites' },
       value: 'family',
     },
   ],
   timestamp: new Date(),
 }
 
-const suggestionQueries = [
-  'A magical Hoi An evening',
-  'Family day near Da Nang',
-  'Food, culture, and no rushing',
-  'Rainy-day experiences',
-]
+// Keys, not queries. These are submitted as well as displayed, so a shopper
+// browsing in Vietnamese has to send a Vietnamese query - shipping the English
+// text would have them searching in a language they did not choose.
+const suggestionKeys = [
+  'app.suggestion.evening',
+  'app.suggestion.family',
+  'app.suggestion.unhurried',
+  'app.suggestion.rainy',
+] as const
 
-const formatDate = (date: string) => {
-  if (!date) return 'Choose date'
-  return new Intl.DateTimeFormat('en-US', {
+const formatDate = (locale: string, date: string, t: Translator) => {
+  if (!date) return t('app.date.choose')
+  // Noon, so a timezone west of UTC cannot render the previous day.
+  return intlDate(locale, `${date}T12:00:00`, {
     month: 'short',
     day: 'numeric',
-  }).format(new Date(`${date}T12:00:00`))
+  })
 }
 
-const ANY_DESTINATION = 'Anywhere in Vietnam'
+// A sentinel, not a label. It was both, so the one string had to stay English:
+// translating it would have changed the value the option list is keyed and
+// compared on, and leaving it English put untranslated text in the control.
+const ANY_DESTINATION = '__any__'
 
 const isoDay = (offsetDays: number) =>
   new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10)
@@ -116,26 +138,36 @@ const emptyAdvanced: AdvancedFilters = {
 }
 
 const durationChoices = [
-  { label: 'Up to 2 hours', value: 120 },
-  { label: 'Up to 4 hours', value: 240 },
-  { label: 'Up to a full day', value: 600 },
-]
+  { key: 'filter.duration.120', value: 120 },
+  { key: 'filter.duration.240', value: 240 },
+  { key: 'filter.duration.600', value: 600 },
+] as const
 
 const ratingChoices = [4.0, 4.5, 4.8]
 
+// The value is a filter the backend understands; the label is chrome. Keeping
+// them as one string meant the filter could not be translated without changing
+// what was queried.
 const accessibilityChoices = [
-  'wheelchair',
-  'step-free',
-  'audio guide',
-  'sign language',
-]
+  { value: 'wheelchair', key: 'filter.access.wheelchair' },
+  { value: 'step-free', key: 'filter.access.stepFree' },
+  { value: 'audio guide', key: 'filter.access.audioGuide' },
+  { value: 'sign language', key: 'filter.access.signLanguage' },
+] as const
 
-const money = (currency: string, amount: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: currency === 'VND' ? 0 : 2,
-  }).format(amount)
+// Category tabs when the catalogue has reported no facets yet. Same split: the
+// value is matched against backend facet names, the label is ours to translate.
+const ALL_CATEGORIES = 'All'
+const fallbackCategories = [
+  { value: ALL_CATEGORIES, key: 'filter.category.all' },
+  { value: 'Culture', key: 'filter.category.culture' },
+  { value: 'Day trip', key: 'filter.category.dayTrip' },
+  { value: 'Food', key: 'filter.category.food' },
+  { value: 'Family', key: 'filter.category.family' },
+  { value: 'Water', key: 'filter.category.water' },
+  { value: 'Nature', key: 'filter.category.nature' },
+  { value: 'Wellness', key: 'filter.category.wellness' },
+] as const
 
 function App() {
   const [products, setProducts] = useState<Experience[]>(
@@ -176,6 +208,16 @@ function App() {
   }>({ query: '', filters: {}, resultIds: [] })
   const viewedIds = useRef<string[]>([])
   const [relaxedPreferences, setRelaxedPreferences] = useState<string[]>([])
+  // Constraints the shopper could give up, offered rather than taken. The
+  // search no longer relaxes anything by itself, so this is how a zero-result
+  // page becomes a choice instead of a dead end.
+  const [relaxationCandidates, setRelaxationCandidates] = useState<string[]>([])
+  const [authorisedRelaxations, setAuthorisedRelaxations] = useState<string[]>(
+    [],
+  )
+  const [unresolvedConstraints, setUnresolvedConstraints] = useState<string[]>(
+    [],
+  )
   const [facets, setFacets] = useState<Record<string, Record<string, number>>>(
     {},
   )
@@ -190,6 +232,18 @@ function App() {
   // otherwise, so a telemetry outage never silently removes the assistant.
   const [assistantEnabled, setAssistantEnabled] = useState(true)
   const [currency, setCurrency] = useState(getDisplayCurrency())
+  const money = (code: string, amount: number) =>
+    formatMoney(locale, code, amount)
+  // Seeded from the server's bootstrap, not from localStorage: a stored
+  // preference for a language that has since been disabled would otherwise
+  // show as selected while every string on the page arrived in English.
+  const [locale, setLocale] = useState('en')
+  // App renders the provider, so it sits above the context and cannot consume
+  // it. Same dictionary, same locale, just built directly.
+  const t = buildTranslator(locale)
+  const [switchingLocale, setSwitchingLocale] = useState(false)
+  const localeGeneration = useRef(0)
+  const [enabledLocales, setEnabledLocales] = useState<string[]>(['en'])
   const [crossSell, setCrossSell] = useState<Experience[]>([])
 
   useEffect(() => {
@@ -209,6 +263,96 @@ function App() {
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cartOpen, cartItems, travellers])
+
+  const changeLocale = (next: string) => {
+    if (next === locale || switchingLocale) return
+    const previous = locale
+    const previousPreference = getPreferredLocale()
+    // Every card, description and cart line is resolved server-side, so
+    // nothing on screen changes language until it is refetched. The chrome is
+    // deliberately *not* switched first: doing so produced a page with
+    // Vietnamese buttons around English descriptions for as long as the
+    // network took, which reads as a broken page rather than a loading one.
+    setSwitchingLocale(true)
+    setPreferredLocale(next)
+    api.track('filter_applied', { requested_locale: next })
+
+    // Two quick selections can complete out of order, and the loser would
+    // overwrite the winner - leaving the app displaying a language the
+    // shopper had already moved on from. Only the newest switch may commit.
+    const generation = ++localeGeneration.current
+
+    void (async () => {
+      try {
+        const confirmed = await api.setLocale(next)
+
+        // Everything into locals. Not one setState until the last request has
+        // landed: an `await` between two commits ends React's batch, so a
+        // half-applied switch is not a race that might happen, it is a paint
+        // that will. `runSearch` is deliberately not reused here - it commits
+        // as it goes, and it would report a `search_submitted` the shopper
+        // never performed.
+        const [searched, browsed, recommended, detail] = await Promise.all([
+          hasSearched
+            ? api.search(query, liveFilters(), travellers)
+            : Promise.resolve(null),
+          hasSearched ? Promise.resolve(null) : api.listExperiences(),
+          api.recommendations(),
+          selectedProduct
+            ? api.experience(selectedProduct.id)
+            : Promise.resolve(null),
+        ])
+        const catalogue = searched ? searched.items : (browsed ?? [])
+        // The refreshed list, not the closed-over stale one: passing
+        // `products` here meant the cart resolved its titles against
+        // pre-switch copies of exactly the products the shopper had seen.
+        const cart = await api.getCart([...catalogue, ...recommended])
+
+        if (generation !== localeGeneration.current) return
+
+        // One synchronous block, so the new language arrives in a single
+        // paint. Committed unconditionally: an empty result in the new locale
+        // is a real answer, and keeping the old list because the new one is
+        // short would leave the previous language on screen.
+        setProducts(catalogue)
+        if (searched) {
+          setRelaxedPreferences(searched.relaxedPreferences)
+          setUnresolvedConstraints(searched.unresolvedConstraints)
+          setFacets(searched.facets)
+          setSearchContext({
+            query,
+            filters: searched.effectiveFilters,
+            resultIds: searched.items.map((item) => item.id),
+          })
+        }
+        setRecommendations(recommended)
+        if (detail) setSelectedProduct(detail)
+        setCartItems(cart)
+        setLocale(confirmed)
+      } catch {
+        if (generation !== localeGeneration.current) return
+        // The preference and the server session were changed before the
+        // fetches; leaving them pointing at a language the page is not
+        // showing would make the next request disagree with the screen.
+        setPreferredLocale(previousPreference)
+        try {
+          // Awaited rather than fired and forgotten: `finally` re-enables the
+          // switcher, and re-enabling it while the session is still set to the
+          // language we failed to switch to lets the next attempt start from a
+          // server state nobody has seen.
+          await api.setLocale(previous)
+          setAppError(translate(previous, 'error.localeSwitch'))
+        } catch {
+          // The rollback failed too, so the session's language is now unknown
+          // and the page cannot restore it. Only a reload re-derives it from
+          // the server, so say that rather than inviting another attempt.
+          setAppError(translate(previous, 'error.localeSession'))
+        }
+      } finally {
+        if (generation === localeGeneration.current) setSwitchingLocale(false)
+      }
+    })()
+  }
 
   const changeCurrency = (next: string) => {
     setDisplayCurrency(next)
@@ -270,18 +414,52 @@ function App() {
           api.sessionContext(),
         ])
         setAssistantEnabled(cohort.assistantEnabled)
-        if (experiences.length) setProducts(experiences)
-        if (recommended.length) setRecommendations(recommended)
+
+        // The backend negotiates from the browser's own `Accept-Language`, so
+        // it can land on a locale that has content but no interface - a
+        // Korean speaker would get Korean descriptions wrapped in English
+        // chrome, with Korean filtered out of the switcher and no way back.
+        // Filtering the *menu* is not enough; the resolved session has to be
+        // moved too.
+        let active = cohort.locale
+        let catalogue = experiences
+        let recommendedNow = recommended
+        if (!chromeReady(active)) {
+          active = await api.setLocale('en')
+          setPreferredLocale(active)
+          ;[catalogue, recommendedNow] = await Promise.all([
+            api.listExperiences(),
+            api.recommendations(),
+          ])
+        }
+        setLocale(active)
+        // The backend says which locales have content; `chromeReady` says
+        // which have an interface to show it in. Offering one without the
+        // other produces a page that is half translated, and the shopper
+        // cannot tell that from one that is broken.
+        // Demo mode serves English fixtures for every locale, so a translated
+        // interface would be wrapped around English products - the same
+        // half-translated page the `chromeReady` filter exists to prevent,
+        // arrived at from the catalogue side instead of the chrome side.
+        setEnabledLocales(
+          api.demoFallbackEnabled
+            ? ['en']
+            : cohort.enabledLocales.filter(chromeReady),
+        )
+        if (catalogue.length) setProducts(catalogue)
+        if (recommendedNow.length) setRecommendations(recommendedNow)
         setMessages((current) =>
           current.map((message) =>
             message.id === 'welcome'
-              ? { ...message, products: experiences.slice(0, 3) }
+              ? { ...message, products: catalogue.slice(0, 3) }
               : message,
           ),
         )
-        setCartItems(await api.getCart([...experiences, ...recommended]))
+        setCartItems(await api.getCart([...catalogue, ...recommendedNow]))
       } catch {
-        setAppError('The live Vietra service is unavailable. Please try again shortly.')
+        setAppError(
+          translate(getPreferredLocale() || 'en', 'error.unavailable'),
+        )
       } finally {
         setBootstrapping(false)
       }
@@ -305,7 +483,7 @@ function App() {
   const visibleProducts = useMemo(() => {
     // Once a search has run the backend has already applied the category
     // filter; filtering again client-side would hide relaxed results.
-    if (hasSearched || category === 'All') return products
+    if (hasSearched || category === ALL_CATEGORIES) return products
     return products.filter((product) => product.category === category)
   }, [category, hasSearched, products])
 
@@ -316,14 +494,15 @@ function App() {
     const count = visibleProducts.length
     const parts = [
       count === 0
-        ? 'No exact match'
-        : `${count} ${count === 1 ? 'experience' : 'experiences'}`,
-      destination,
-      formatDate(date),
-      `${travellers} ${travellers === 1 ? 'traveller' : 'travellers'}`,
+        ? t('app.results.noMatch')
+        : t.plural('app.experiences', count),
+      // The sentinel is not a label, so it cannot be shown as one.
+      destination === ANY_DESTINATION ? t('app.destination.any') : destination,
+      formatDate(locale, date, t),
+      t.plural('app.travellers', travellers),
     ]
     return parts.join(' · ')
-  }, [visibleProducts.length, destination, date, travellers])
+  }, [visibleProducts.length, destination, date, travellers, locale, t])
 
   const resultsRef = useRef<HTMLElement>(null)
   const pendingScroll = useRef(false)
@@ -351,16 +530,29 @@ function App() {
 
   // Tabs follow the live catalogue rather than the demo labels, so a tab can
   // never point at a category the backend has nothing to return for.
-  const categoryTabs = useMemo(() => {
+  const categoryTabs = useMemo((): {
+    value: string
+    label: LocalizedText
+  }[] => {
     const counts = facets.category
-    if (!counts || Object.keys(counts).length === 0) return categories
+    if (!counts || Object.keys(counts).length === 0)
+      return fallbackCategories.map(({ value, key }) => ({
+        value,
+        label: { key },
+      }))
     const ranked = Object.entries(counts)
       .filter(([, count]) => count > 0)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 8)
       .map(([name]) => name)
-    if (category !== 'All' && !ranked.includes(category)) ranked.push(category)
-    return ['All', ...ranked]
+    if (category !== ALL_CATEGORIES && !ranked.includes(category))
+      ranked.push(category)
+    // A live facet name is catalogue data the server resolved for this locale,
+    // so it is already in the shopper's language and has no key.
+    return [
+      { value: ALL_CATEGORIES, label: { key: 'filter.category.all' } },
+      ...ranked.map((name) => ({ value: name, label: { raw: name } })),
+    ]
   }, [category, facets])
 
   const cartTotal = cartItems.reduce((sum, item) => sum + item.total, 0)
@@ -431,22 +623,31 @@ function App() {
         timestamp: new Date(),
       },
     ])
-    if (reason.prompt) void sendAssistantMessage(reason.prompt)
+    if (reason.prompt) void sendAssistantMessage(resolveText(locale, reason.prompt))
   }
 
   const runSearch = async (
     searchQuery = query,
     extraFilters: SearchFilters = {},
     announce = true,
+    relaxOrder: string[] = [],
   ) => {
     setSearching(true)
     setHasSearched(true)
     const filters: SearchFilters = { ...liveFilters(), ...extraFilters }
     try {
-      const result = await api.search(searchQuery, filters, travellers)
+      const result = await api.search(
+        searchQuery,
+        filters,
+        travellers,
+        relaxOrder,
+      )
       api.track('search_submitted', {
         result_count: result.items.length,
-        conversational: isConversationalQuery(searchQuery),
+        conversational: result.interactionMode === 'assistant',
+        // Reported so that a spell of unreachable routing is visible in the
+        // funnel rather than looking like shoppers who preferred the grid.
+        routing: result.interactionMode,
       })
       if (result.items.length === 0) api.track('search_zero_results', {})
       if (result.relaxedPreferences.length > 0) {
@@ -454,6 +655,9 @@ function App() {
       }
       setProducts(result.items)
       setRelaxedPreferences(result.relaxedPreferences)
+      setRelaxationCandidates(result.relaxationCandidates)
+      setAuthorisedRelaxations(relaxOrder)
+      setUnresolvedConstraints(result.unresolvedConstraints)
       setFacets(result.facets)
       setSearchContext({
         query: searchQuery,
@@ -467,25 +671,38 @@ function App() {
       // The one sanctioned auto-open: a conversational query is an explicit
       // request for help, not an unprompted interruption. Keyword queries
       // always stay in the grid.
-      if (announce && isConversationalQuery(searchQuery)) {
+      // The server's judgement, not a regex over English function words. The
+      // old test could only ever fire for English queries, so the guided path
+      // was unreachable for everyone else and "the assistant converts better"
+      // was really measuring "English shoppers convert better".
+      if (announce && result.interactionMode === 'assistant') {
         const best = result.items.slice(0, 3)
         const relaxed = result.relaxedPreferences.length
-          ? ` I relaxed ${result.relaxedPreferences.join(', ')} to keep these bookable.`
+          ? t('assistant.relaxedSuffix', {
+              list: relaxationSentence(result.relaxedPreferences, locale, t),
+            })
           : ''
+        const announcement: LocalizedText = best.length
+          ? {
+              key: 'assistant.searchMatched',
+              vars: { query: searchQuery, relaxed },
+            }
+          : { key: 'assistant.searchNoMatch', vars: { query: searchQuery } }
         setMessages((current) => [
           ...current,
           {
             id: crypto.randomUUID(),
             role: 'assistant',
-            text: best.length
-              ? `I translated “${searchQuery}” into a few practical preferences. These have the strongest overall fit; I can compare them or shape them into a half-day plan.${relaxed}`
-              : `I could not find a live match for “${searchQuery}”. Try relaxing the destination, date, or activity preferences and I will search again.`,
+            text: announcement,
             products: best,
             actions: best[0]
               ? [
                   {
                     type: 'ADD_TO_CART',
-                    label: `Reserve ${best[0].title}`,
+                    label: {
+                      key: 'assistant.action.reserveNamed',
+                      vars: { title: best[0].title },
+                    },
                     experience_id: best[0].id,
                   },
                 ]
@@ -496,7 +713,7 @@ function App() {
         openAssistant()
       }
     } catch {
-      setAppError('Search could not reach the live catalog. Your current results are unchanged.')
+      setAppError(t('error.search'))
     } finally {
       setSearching(false)
     }
@@ -565,7 +782,10 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          text: `I could not reserve ${product.title} because its availability changed. Please choose another time or experience.`,
+          text: {
+            key: 'assistant.reserveFailed',
+            vars: { title: product.title },
+          },
           timestamp: new Date(),
         },
       ])
@@ -579,12 +799,15 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          text: `${product.title} is in your trip. I rechecked the selected option and price. You can review the complete booking without leaving our conversation.`,
+          text: {
+            key: 'assistant.addedToTrip',
+            vars: { title: product.title },
+          },
           products: [product],
           actions: [
             {
               type: 'START_CHECKOUT',
-              label: 'Review and purchase',
+              label: { key: 'assistant.action.reviewPurchase' },
             },
           ],
           timestamp: new Date(),
@@ -624,7 +847,8 @@ function App() {
     const userMessage: AssistantMessage = {
       id: crypto.randomUUID(),
       role: 'user',
-      text,
+      // The shopper's own words: already in their language, no key exists.
+      text: { raw: text },
       timestamp: new Date(),
     }
     setMessages((current) => [...current, userMessage])
@@ -659,7 +883,7 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          text: 'I could not reach the live catalog just now. Your cart is unchanged, so please try that request again.',
+          text: { key: 'assistant.catalogUnreachable' },
           timestamp: new Date(),
         },
       ])
@@ -672,15 +896,13 @@ function App() {
   // so the assistant never has to ask "which one?".
   const askAboutProduct = (product: Experience) => {
     openAssistant()
-    void sendAssistantMessage(`Tell me more about ${product.title}.`, product)
+    void sendAssistantMessage(t('assistant.askAbout', { title: product.title }), product)
   }
 
   const checkMyPlan = () => {
     setCartOpen(false)
     openAssistant()
-    void sendAssistantMessage(
-      'Check my plan: does the timing work, and is anything missing?',
-    )
+    void sendAssistantMessage(t('assistant.prompt.checkPlan'))
   }
 
   const handleAssistantAction = async (
@@ -722,7 +944,7 @@ function App() {
     }
     if (action.type === 'APPLY_FILTER' && action.value === 'family') {
       setAssistantOpen(false)
-      void runSearch('family-friendly experiences', {
+      void runSearch(t('assistant.prompt.familyQuery'), {
         family_friendly: true,
       })
       return
@@ -765,7 +987,10 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          text: `I could not remove ${item.experience.title}. Refresh the cart and try again.`,
+          text: {
+            key: 'assistant.removeFailed',
+            vars: { title: item.experience.title },
+          },
           timestamp: new Date(),
         },
       ])
@@ -791,50 +1016,85 @@ function App() {
       {
         id: crypto.randomUUID(),
         role: 'assistant',
-        text: `Booked! Your reference is ${confirmation.booking_reference}. I kept all vouchers together so they are easy to find on the day.`,
+        text: {
+          key: 'assistant.booked',
+          vars: { reference: confirmation.booking_reference },
+        },
         timestamp: new Date(),
       },
     ])
   }
 
   return (
+    <LocaleProvider locale={locale}>
     <div className={`app-shell ${assistantOpen ? 'assistant-docked' : ''}`}>
       {appError && (
         <div className="service-error" role="alert">
           {appError}
-          <button onClick={() => setAppError('')} aria-label="Dismiss service error">
+          <button onClick={() => setAppError('')} aria-label={t('app.a11y.dismissError')}>
             <X size={16} />
           </button>
         </div>
       )}
       <header className="site-header">
-        <a className="brand" href="#top" aria-label="Vietra home">
+        <a className="brand" href="#top" aria-label={t('app.a11y.home')}>
           <span className="brand-mark">V</span>
           <span>
             <strong>VIETRA</strong>
-            <small>Vietnam, beautifully planned</small>
+            <small>{t('app.tagline')}</small>
           </span>
         </a>
 
         <nav className={mobileMenuOpen ? 'mobile-open' : ''}>
-          <a href="#discover">Discover</a>
-          <a href="#recommendations">Curated for you</a>
+          <a href="#discover">{t('app.nav.discover')}</a>
+          <a href="#recommendations">{t('app.nav.curated')}</a>
           {assistantEnabled && (
-            <button onClick={() => openAssistant()}>
+            <button
+              data-testid="assistant-open"
+              onClick={() => openAssistant()}
+            >
               <Sparkles size={15} />
-              Ask Mai
+              {t('app.cta.askMai')}
             </button>
           )}
         </nav>
 
         <div className="header-actions">
+          {enabledLocales.length > 1 && (
+            // Hidden entirely while only one language is enabled. A switcher
+            // offering a single choice is not a control, and one offering
+            // languages the catalogue has not been translated into promises
+            // something every page then fails to deliver.
+            <label className="currency-button">
+              <Languages size={16} />
+              <span className="sr-only">{t('nav.language')}</span>
+              <select
+                value={locale}
+                onChange={(event) => changeLocale(event.target.value)}
+                aria-label={t('nav.language')}
+                // A stable handle for the tests. Querying this control by its
+                // label cannot work: the label is one of the strings the
+                // switch translates, so the selector stops matching the moment
+                // the feature under test succeeds.
+                data-testid="locale-switcher"
+                disabled={switchingLocale}
+              >
+                {enabledLocales.map((code) => (
+                  <option key={code} value={code}>
+                    {LOCALE_NAMES[code] ?? code}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown size={14} />
+            </label>
+          )}
           <label className="currency-button">
             <Globe2 size={16} />
-            <span className="sr-only">Display currency</span>
+            <span className="sr-only">{t('nav.currency')}</span>
             <select
               value={currency}
               onChange={(event) => changeCurrency(event.target.value)}
-              aria-label="Display currency"
+              aria-label={t('nav.currency')}
             >
               {SUPPORTED_CURRENCIES.map((code) => (
                 <option key={code} value={code}>
@@ -847,7 +1107,7 @@ function App() {
           <button
             className="cart-button"
             onClick={() => setCartOpen(true)}
-            aria-label="Open cart"
+            aria-label={t('nav.cart.open')}
           >
             <ShoppingBag size={19} />
             {cartItems.length > 0 && <span>{cartItems.length}</span>}
@@ -855,7 +1115,7 @@ function App() {
           <button
             className="menu-button"
             onClick={() => setMobileMenuOpen((value) => !value)}
-            aria-label="Menu"
+            aria-label={t('app.a11y.menu')}
           >
             <Menu size={21} />
           </button>
@@ -880,33 +1140,32 @@ function App() {
           <div className="hero-content">
             <span className="hero-kicker">
               <WandSparkles size={15} />
-              Thoughtful adventures, matched to you
+              {t('app.hero.title')}
             </span>
             <h1>
-              Find your own rhythm
-              <em> in Vietnam.</em>
+              {t('app.hero.subtitle')}
+              <em> {t('app.hero.suffix')}</em>
             </h1>
-            <p>
-              Search the classic way or describe the day you imagine. Mai will
-              balance place, pace, weather, and the people you travel with.
-            </p>
+            <p>{t('app.hero.lede')}</p>
 
             <form className="discovery-bar" onSubmit={submitSearch}>
               <div className="query-field">
                 <Search size={21} />
                 <span>
                   <small id="trip-search-label">
-                    What would make this trip memorable?
+                    {t('app.search.label')}
                   </small>
                   <input
                     value={query}
                     onChange={(event) => setQuery(event.target.value)}
-                    placeholder="A relaxed family day with food and culture…"
+                    placeholder={t('app.search.placeholder')}
                     aria-labelledby="trip-search-label"
+                    data-testid="trip-search"
                   />
                 </span>
                 <VoiceInputButton
-                  label="Search by voice"
+                  label={t('app.search.voice')}
+                  stopLabel={t('app.search.voiceStop')}
                   disabled={searching}
                   onTranscript={(transcript, final) => {
                     setQuery(transcript)
@@ -917,18 +1176,22 @@ function App() {
               <label className="search-segment destination-segment">
                 <MapPin size={18} />
                 <span>
-                  <small>Destination</small>
+                  <small>{t('app.search.destination')}</small>
                   <strong>{destination}</strong>
                   <select
                     value={destination}
                     onChange={(event) => setDestination(event.target.value)}
-                    aria-label="Destination"
+                    aria-label={t('app.search.destination')}
                   >
                     {destinationOptions.map((name) => {
                       const count = facets.destination?.[name]
+                      const label =
+                        name === ANY_DESTINATION
+                          ? t('app.destination.any')
+                          : name
                       return (
                         <option key={name} value={name}>
-                          {count === undefined ? name : `${name} (${count})`}
+                          {count === undefined ? label : `${label} (${count})`}
                         </option>
                       )
                     })}
@@ -938,30 +1201,30 @@ function App() {
               <label className="search-segment">
                 <CalendarDays size={18} />
                 <span>
-                  <small>Date</small>
-                  <strong>{formatDate(date)}</strong>
+                  <small>{t('app.search.date')}</small>
+                  <strong>{formatDate(locale, date, t)}</strong>
                   <input
                     type="date"
                     value={date}
                     min={isoDay(1)}
                     max={isoDay(30)}
                     onChange={(event) => setDate(event.target.value)}
-                    aria-label="Visit date"
+                    aria-label={t('app.a11y.visitDate')}
                   />
                 </span>
               </label>
               <div className="search-segment guest-segment">
                 <Users size={18} />
                 <span>
-                  <small>Guests</small>
+                  <small>{t('app.search.guests')}</small>
                   <strong>
-                    {travellers} {travellers === 1 ? 'traveller' : 'travellers'}
+                    {t.plural('app.travellers', travellers)}
                   </strong>
                 </span>
                 <div className="guest-stepper">
                   <button
                     type="button"
-                    aria-label="Remove a traveller"
+                    aria-label={t('app.a11y.removeTraveller')}
                     disabled={travellers <= 1}
                     onClick={() =>
                       setTravellers((value) => Math.max(1, value - 1))
@@ -971,7 +1234,7 @@ function App() {
                   </button>
                   <button
                     type="button"
-                    aria-label="Add a traveller"
+                    aria-label={t('app.a11y.addTraveller')}
                     disabled={travellers >= 12}
                     onClick={() =>
                       setTravellers((value) => Math.min(12, value + 1))
@@ -983,18 +1246,15 @@ function App() {
               </div>
               <button className="search-submit" disabled={searching}>
                 {searching ? <span className="search-loader" /> : <Search size={20} />}
-                <span>Explore</span>
+                <span>{t('app.search.explore')}</span>
               </button>
             </form>
 
             <div className="suggestion-row">
-              <span>Try</span>
-              {suggestionQueries.map((suggestion) => (
-                <button
-                  key={suggestion}
-                  onClick={() => chooseSuggestion(suggestion)}
-                >
-                  {suggestion}
+              <span>{t('app.search.try')}</span>
+              {suggestionKeys.map((key) => (
+                <button key={key} onClick={() => chooseSuggestion(t(key))}>
+                  {t(key)}
                 </button>
               ))}
             </div>
@@ -1003,15 +1263,15 @@ function App() {
           <div className="trust-strip">
             <span>
               <TicketCheck size={18} />
-              Instant mobile vouchers
+              {t('app.trust.vouchers')}
             </span>
             <span>
               <ShieldCheck size={18} />
-              Flexible cancellation
+              {t('app.trust.cancellation')}
             </span>
             <span>
               <Sparkles size={18} />
-              Recommendations that explain why
+              {t('app.trust.explain')}
             </span>
           </div>
         </section>
@@ -1024,20 +1284,19 @@ function App() {
           <div className="section-intro">
             <div>
               <span className="eyebrow">
-                {hasSearched ? 'Your search' : 'Discover Central Vietnam'}
+                {hasSearched
+                  ? t('app.results.yourSearch')
+                  : t('app.results.discover')}
               </span>
               <h2>
                 {hasSearched
-                  ? 'Experiences shaped around your request'
-                  : 'Choose the feeling, not just the ticket'}
+                  ? t('app.results.shaped')
+                  : t('app.results.feeling')}
               </h2>
               {hasSearched ? (
                 <p className="result-summary">{resultSummary}</p>
               ) : (
-                <p>
-                  Live availability, practical details, and honest reasons each
-                  experience might fit.
-                </p>
+                <p>{t('app.results.lede')}</p>
               )}
             </div>
             {assistantEnabled && (
@@ -1046,8 +1305,8 @@ function App() {
                   <Sparkles size={18} />
                 </span>
                 <div>
-                  <small>Not sure where to begin?</small>
-                  <strong>Let Mai curate your day</strong>
+                  <small>{t('app.cta.unsure')}</small>
+                  <strong>{t('app.cta.letMai')}</strong>
                 </div>
                 <ArrowRight size={18} />
               </button>
@@ -1058,19 +1317,19 @@ function App() {
             <div className="category-tabs">
               {categoryTabs.map((item) => {
                 const count =
-                  item === 'All'
+                  item.value === ALL_CATEGORIES
                     ? Object.values(facets.category ?? {}).reduce(
                         (sum, value) => sum + value,
                         0,
                       )
-                    : facets.category?.[item]
+                    : facets.category?.[item.value]
                 return (
                   <button
-                    className={category === item ? 'active' : ''}
-                    key={item}
-                    onClick={() => setCategory(item)}
+                    className={category === item.value ? 'active' : ''}
+                    key={item.value}
+                    onClick={() => setCategory(item.value)}
                   >
-                    {item}
+                    {resolveText(locale, item.label)}
                     {hasSearched && count !== undefined && (
                       <em className="facet-count">{count}</em>
                     )}
@@ -1084,7 +1343,7 @@ function App() {
               onClick={() => setFilterPanelOpen((open) => !open)}
             >
               <Filter size={16} />
-              All filters
+              {t('app.filter.all')}
               {activeFilterCount > 0 && <span>{activeFilterCount}</span>}
             </button>
           </div>
@@ -1092,12 +1351,16 @@ function App() {
           {filterPanelOpen && (
             <div className="filter-panel">
               <div className="filter-group">
-                <h4>Budget (total for {travellers})</h4>
+                <h4>
+                  {t('app.filter.budgetFor', {
+                    count: t.plural('app.travellers', travellers),
+                  })}
+                </h4>
                 <input
                   type="number"
                   min={0}
                   step={100000}
-                  placeholder="No limit"
+                  placeholder={t('app.filter.noLimit')}
                   value={advanced.maxTotalPrice ?? ''}
                   onChange={(event) =>
                     setAdvanced((current) => ({
@@ -1107,11 +1370,11 @@ function App() {
                         : undefined,
                     }))
                   }
-                  aria-label="Maximum total price"
+                  aria-label={t('app.a11y.maxPrice')}
                 />
               </div>
               <div className="filter-group">
-                <h4>Minimum rating</h4>
+                <h4>{t('app.filter.minRating')}</h4>
                 <div className="chip-row">
                   {ratingChoices.map((value) => (
                     <button
@@ -1130,7 +1393,7 @@ function App() {
                 </div>
               </div>
               <div className="filter-group">
-                <h4>Duration</h4>
+                <h4>{t('app.filter.duration')}</h4>
                 <div className="chip-row">
                   {durationChoices.map((choice) => (
                     <button
@@ -1150,13 +1413,13 @@ function App() {
                         }))
                       }
                     >
-                      {choice.label}
+                      {t(choice.key)}
                     </button>
                   ))}
                 </div>
               </div>
               <div className="filter-group">
-                <h4>Setting</h4>
+                <h4>{t('app.filter.setting')}</h4>
                 <div className="chip-row">
                   {['indoor', 'outdoor'].map((value) => (
                     <button
@@ -1172,13 +1435,15 @@ function App() {
                         }))
                       }
                     >
-                      {value === 'indoor' ? 'Indoor' : 'Outdoor'}
+                      {value === 'indoor'
+                        ? t('app.filter.indoor')
+                        : t('app.filter.outdoor')}
                     </button>
                   ))}
                 </div>
               </div>
               <div className="filter-group">
-                <h4>Booking terms</h4>
+                <h4>{t('app.filter.terms')}</h4>
                 <div className="chip-row">
                   <button
                     className={advanced.instantConfirmation ? 'active' : ''}
@@ -1189,7 +1454,7 @@ function App() {
                       }))
                     }
                   >
-                    Instant confirmation
+                    {t('app.filter.instant')}
                   </button>
                   <button
                     className={advanced.freeCancellation ? 'active' : ''}
@@ -1200,7 +1465,7 @@ function App() {
                       }))
                     }
                   >
-                    Free cancellation
+                    {t('app.filter.freeCancel')}
                   </button>
                   <button
                     className={advanced.familyFriendly ? 'active' : ''}
@@ -1211,14 +1476,14 @@ function App() {
                       }))
                     }
                   >
-                    Family friendly
+                    {t('app.filter.family')}
                   </button>
                 </div>
               </div>
               <div className="filter-group">
-                <h4>Accessibility</h4>
+                <h4>{t('app.filter.accessibility')}</h4>
                 <div className="chip-row">
-                  {accessibilityChoices.map((value) => (
+                  {accessibilityChoices.map(({ value, key }) => (
                     <button
                       key={value}
                       className={
@@ -1235,19 +1500,26 @@ function App() {
                         }))
                       }
                     >
-                      {value}
+                      {t(key)}
                     </button>
                   ))}
                 </div>
-                <small>Accessibility needs are never relaxed.</small>
+                <small>{t('app.filter.accessibilityNote')}</small>
               </div>
               <button
                 className="filter-reset"
                 onClick={() => setAdvanced(emptyAdvanced)}
                 disabled={activeFilterCount === 0}
               >
-                Clear filters
+                {t('app.filter.clear')}
               </button>
+            </div>
+          )}
+
+          {unresolvedConstraints.length > 0 && (
+            <div className="unresolved-notice" role="status">
+              <AlertTriangle size={16} />
+              <p>{unresolvedLabels(unresolvedConstraints, t).join(' ')}</p>
             </div>
           )}
 
@@ -1255,13 +1527,50 @@ function App() {
             <div className="relaxation-notice" role="status">
               <Sparkles size={16} />
               <p>
-                No exact match, so we relaxed{' '}
-                <strong>{relaxedPreferences.join(', ')}</strong> to keep
-                bookable options on screen. Your accessibility needs were kept
-                intact.
+                {t('app.relaxed.prefix')}{' '}
+                <strong>
+                  {relaxationSentence(relaxedPreferences, locale, t)}
+                </strong>{' '}
+                {t('app.relaxed.suffix')}
               </p>
             </div>
           )}
+
+          {/* The search used to answer an empty page by dropping constraints on
+              the shopper's behalf, so someone who said "under 2,000,000 VND"
+              could be shown a tour at three times that. It now returns nothing
+              and says what is on the table; the choice is made here, by them. */}
+          {!searching &&
+            hasSearched &&
+            products.length === 0 &&
+            relaxationCandidates.length > 0 && (
+              <div className="relaxation-offer" role="group">
+                <p className="relaxation-offer__lead">
+                  {t('app.relaxOffer.lead')}
+                </p>
+                <div className="relaxation-offer__choices">
+                  {relaxOfferChoices(relaxationCandidates, t).map(
+                    ({ code, label }) => (
+                      <button
+                        key={code}
+                        type="button"
+                        className="relaxation-offer__choice"
+                        onClick={() => {
+                          const next = [...authorisedRelaxations, code]
+                          api.track('search_relaxation_authorised', {
+                            code,
+                            authorised: next,
+                          })
+                          void runSearch(query, {}, false, next)
+                        }}
+                      >
+                        {label}
+                      </button>
+                    ),
+                  )}
+                </div>
+              </div>
+            )}
 
           {searching || bootstrapping ? (
             <div className="product-grid skeleton-grid">
@@ -1291,13 +1600,12 @@ function App() {
           {visibleProducts.length === 0 && (
             <div className="empty-results">
               <Compass size={30} />
-              <h3>No exact match yet</h3>
+              <h3>{t('app.empty.noMatch')}</h3>
               <p>
-                Mai can relax a preference while keeping your important
-                constraints intact.
+                {t('app.relaxed.note')}
               </p>
               <button onClick={() => openAssistant(nudge ?? undefined)}>
-                Ask Mai to help
+                {t('app.cta.askHelp')}
               </button>
             </div>
           )}
@@ -1305,40 +1613,38 @@ function App() {
 
         <section className="recommendation-section" id="recommendations">
           <div className="recommendation-copy">
-            <span className="eyebrow">A day that flows</span>
-            <h2>Curated pairings, not random upsells.</h2>
+            <span className="eyebrow">{t('app.promo.flow')}</span>
+            <h2>{t('app.promo.flowBody')}</h2>
             <p>
-              These experiences work together by location, pace, and time of
-              day. Add one and Mai will reshape the rest of your plan.
+              {t('app.plan.lede')}
             </p>
             <div className="plan-story">
               <span>
                 <i>08:30</i>
-                <strong>Cook, taste, connect</strong>
-                <small>Market-to-table class · Hoi An</small>
+                <strong>{t('app.promo.cook')}</strong>
+                <small>{t('app.plan.sample')}</small>
               </span>
               <b />
               <span>
                 <i>16:30</i>
-                <strong>Golden-hour old town</strong>
-                <small>Lanterns & riverside flavours</small>
+                <strong>{t('app.promo.oldTown')}</strong>
+                <small>{t('app.promo.lanterns')}</small>
               </span>
             </div>
             <button
               className="outline-button"
               onClick={() =>
-                sendAssistantMessage('Build this into a relaxed full-day plan')
+                sendAssistantMessage(t('assistant.prompt.fullDay'))
               }
             >
               <Sparkles size={16} />
-              Ask Mai to complete this day
+              {t('app.cta.completeDay')}
             </button>
           </div>
           <div className="recommendation-cards">
             {recommendations.length === 0 && (
               <p className="recommendation-empty">
-                Nothing in this destination is still bookable for your dates and
-                party size. Try another day and I will rebuild the plan.
+                {t('app.empty.body')}
               </p>
             )}
             {recommendations.slice(0, 3).map((product, index) => (
@@ -1357,7 +1663,13 @@ function App() {
                 />
                 <span className="image-shade" />
                 <div>
-                  <small>{index === 0 ? 'Morning anchor' : index === 1 ? 'Golden hour' : 'Easy finish'}</small>
+                  <small>
+                    {index === 0
+                      ? t('app.plan.morning')
+                      : index === 1
+                        ? t('app.plan.golden')
+                        : t('app.plan.finish')}
+                  </small>
                   <strong>{product.title}</strong>
                   <span>
                     {hasReviews(product) ? `${product.rating.toFixed(1)} ★ · ` : ''}
@@ -1381,44 +1693,39 @@ function App() {
                     <Sparkles size={16} />
                   </span>
                   <div>
-                    <strong>Mai</strong>
-                    <small>Your local curator</small>
+                    <strong>{t('app.assistantName')}</strong>
+                    <small>{t('app.mai.role')}</small>
                   </div>
                 </header>
-                <p>
-                  Since you prefer a slower pace, I would keep Ba Na Hills as the
-                  only big outing and pair it with an easy river evening.
-                </p>
+                <p>{t('app.plan.sampleAdvice')}</p>
                 <button>
                   <Check size={14} />
-                  Apply this plan
+                  {t('app.cta.applyPlan')}
                 </button>
               </div>
-              <span className="floating-tag tag-one">Under your budget</span>
-              <span className="floating-tag tag-two">No schedule conflicts</span>
+              <span className="floating-tag tag-one">{t('app.mai.budget')}</span>
+              <span className="floating-tag tag-two">{t('app.mai.noClash')}</span>
             </div>
             <div className="assistant-promo-copy">
-              <span className="eyebrow">More than a chatbot</span>
-              <h2>A local-minded assistant that can actually book.</h2>
+              <span className="eyebrow">{t('app.mai.more')}</span>
+              <h2>{t('app.mai.moreBody')}</h2>
               <p>
-                Mai remembers your filters, explains trade-offs, checks the latest
-                option and price, then turns recommendations into actions you can
-                trust.
+                {t('app.assistant.lede')}
               </p>
               <ul>
                 <li>
-                  <Check size={16} /> Compares the details that matter to you
+                  <Check size={16} /> {t('app.assistant.compare')}
                 </li>
                 <li>
-                  <Check size={16} /> Builds plans without time conflicts
+                  <Check size={16} /> {t('app.assistant.plans')}
                 </li>
                 <li>
-                  <Check size={16} /> Guides you through voucher-ready checkout
+                  <Check size={16} /> {t('app.assistant.checkout')}
                 </li>
               </ul>
               <button className="primary-button" onClick={() => openAssistant()}>
                 <Bot size={18} />
-                Start planning with Mai
+                {t('app.cta.startPlanning')}
               </button>
             </div>
           </section>
@@ -1430,24 +1737,23 @@ function App() {
           <span className="brand-mark">V</span>
           <span>
             <strong>VIETRA</strong>
-            <small>Vietnam, beautifully planned</small>
+            <small>{t('app.tagline')}</small>
           </span>
         </a>
         <p>
-          A proof-of-concept tourism marketplace. Product data, availability,
-          payment, and vouchers are simulated.
+          {t('app.footer.note')}
         </p>
-        <span>Hoi An · Da Nang · Hue</span>
+        <span>{t('app.footer.places')}</span>
       </footer>
 
       {assistantEnabled && !assistantOpen && (
         <div className={`assistant-fab-dock ${nudge ? 'nudged' : ''}`}>
           {nudge && (
             <div className="assistant-nudge" role="status">
-              <p>{nudge.label}</p>
+              <p>{resolveText(locale, nudge.label)}</p>
               <button
                 className="nudge-dismiss"
-                aria-label="Dismiss suggestion"
+                aria-label={t('app.a11y.dismissSuggestion')}
                 onClick={() => {
                   api.track('assistant_nudge_dismissed', {
                     trigger: nudge.signal,
@@ -1469,10 +1775,14 @@ function App() {
             <div>
               <small>
                 {conversationStarted
-                  ? 'Pick up where you left off'
-                  : 'Need a thoughtful recommendation?'}
+                  ? t('app.resume.title')
+                  : t('app.resume.body')}
               </small>
-              <strong>{conversationStarted ? 'Continue with Mai' : 'Ask Mai'}</strong>
+              <strong>
+                {conversationStarted
+                  ? t('app.resume.continue')
+                  : t('app.resume.ask')}
+              </strong>
             </div>
             <ArrowRight size={18} />
           </button>
@@ -1532,13 +1842,13 @@ function App() {
           <button
             className="modal-backdrop"
             onClick={() => setSelectedProduct(null)}
-            aria-label="Close"
+            aria-label={t('app.a11y.closeDetail')}
           />
           <section className="product-modal">
             <button
               className="modal-close"
               onClick={() => setSelectedProduct(null)}
-              aria-label="Close details"
+              aria-label={t('app.a11y.closeDetails')}
             >
               <X size={20} />
             </button>
@@ -1561,7 +1871,7 @@ function App() {
             <div className="product-modal-body">
               <div className="modal-title-row">
                 <div>
-                  <span className="eyebrow">Chosen for your trip</span>
+                  <span className="eyebrow">{t('app.detail.chosen')}</span>
                   <h2>{selectedProduct.title}</h2>
                 </div>
                 <button className="plain-icon">
@@ -1574,36 +1884,70 @@ function App() {
                     <Star size={15} fill="currentColor" />
                     <strong>{selectedProduct.rating.toFixed(1)}</strong>
                     <span>
-                      {selectedProduct.review_count.toLocaleString()} verified guests
+                      {t('app.detail.reviews', {
+                        count: formatCount(locale, selectedProduct.review_count),
+                      })}
                     </span>
                   </>
                 ) : (
-                  <span>{NEW_LISTING_LABEL} · no guest reviews yet</span>
+                  <span>
+                    {t(NEW_LISTING_KEY)} · {t('app.detail.noReviews')}
+                  </span>
                 )}
               </div>
               <p>{selectedProduct.short_description}</p>
+              {(() => {
+                // Said once for the record as a whole rather than per field: a
+                // detail page that repeated "not translated" beside every
+                // paragraph would be noise, and the shopper's question is
+                // whether this page is in their language, not which of its
+                // eight strings are.
+                const meta = selectedProduct.content_meta ?? {}
+                const fields = Object.values(meta)
+                const fallback = fields.some(isFallback)
+                const stale = fields.some((field) => field.stale)
+                if (!fallback && !stale) return null
+                // Both, when both. They are independent facts - some of this
+                // page was never translated, some was translated and has since
+                // gone out of date - and a ternary that reports only the first
+                // hides the second from the only person who can act on it.
+                return (
+                  <p className="content-provenance" role="note">
+                    <Languages size={14} />
+                    <span>
+                      {fallback && <span>{t('content.fallback')}</span>}
+                      {stale && <span>{t('content.stale')}</span>}
+                    </span>
+                  </p>
+                )
+              })()}
               <div className="reason-box">
                 <Sparkles size={18} />
                 <span>
-                  <strong>Why Mai recommends this</strong>
+                  <strong>{t('app.detail.why')}</strong>
                   {selectedProduct.reason}
                 </span>
               </div>
               <div className="detail-grid">
                 <span>
                   <Clock3 size={18} />
-                  <small>Duration</small>
-                  <strong>{Math.round(selectedProduct.duration_minutes / 60)} hours</strong>
+                  <small>{t('app.filter.duration')}</small>
+                  <strong>
+                    {t.plural(
+                      'app.hours',
+                      Math.round(selectedProduct.duration_minutes / 60),
+                    )}
+                  </strong>
                 </span>
                 <span>
                   <CalendarDays size={18} />
-                  <small>Selected date</small>
-                  <strong>{formatDate(date)}</strong>
+                  <small>{t('app.detail.selectedDate')}</small>
+                  <strong>{formatDate(locale, date, t)}</strong>
                 </span>
                 <span>
                   <Users size={18} />
-                  <small>Guests</small>
-                  <strong>{travellers} travellers</strong>
+                  <small>{t('app.search.guests')}</small>
+                  <strong>{t.plural('app.travellers', travellers)}</strong>
                 </span>
               </div>
               <div className="option-card">
@@ -1612,10 +1956,13 @@ function App() {
                 </span>
                 <div>
                   <strong>
-                    {selectedProduct.options?.[0]?.name ?? 'Standard experience'}
+                    {selectedProduct.options?.[0]?.name ??
+                      t('app.detail.standardOption')}
                   </strong>
                   <small>
-                    {selectedProduct.options?.[0]?.start_times?.[0] ?? 'Flexible start'} · Instant confirmation
+                    {selectedProduct.options?.[0]?.start_times?.[0] ??
+                      t('app.detail.flexibleStart')}{' '}
+                    · {t('app.detail.instant')}
                   </small>
                 </div>
                 <b>
@@ -1624,14 +1971,18 @@ function App() {
               </div>
               <div className="modal-booking-row">
                 <div>
-                  <span>Total from</span>
+                  <span>{t('app.detail.totalFrom')}</span>
                   <strong>
                     {money(
                       selectedProduct.currency,
                       selectedProduct.price * travellers,
                     )}
                   </strong>
-                  <small>for {travellers} guests</small>
+                  <small>
+                    {t('app.detail.forGuests', {
+                      count: t.plural('app.guests', travellers),
+                    })}
+                  </small>
                 </div>
                 <button
                   className="ask-about-button"
@@ -1642,14 +1993,14 @@ function App() {
                   }}
                 >
                   <MessageCircle size={18} />
-                  Ask about this
+                  {t('app.cta.askAbout')}
                 </button>
                 <button
                   className="checkout-button"
                   onClick={() => void addToCart(selectedProduct)}
                 >
                   <ShoppingBag size={18} />
-                  Add to trip
+                  {t('app.cta.addToTrip')}
                 </button>
               </div>
             </div>
@@ -1674,13 +2025,13 @@ function App() {
             ))}
           </div>
           <span>
-            <small>{cartItems.length} experience{cartItems.length > 1 ? 's' : ''}</small>
+            <small>{t.plural('app.experiences', cartItems.length)}</small>
             <strong>
               {money(cartItems[0]?.experience.currency ?? 'USD', cartTotal)}
             </strong>
           </span>
           <button onClick={() => setCartOpen(true)}>
-            View trip <ArrowRight size={16} />
+            {t('app.cart.viewTrip')} <ArrowRight size={16} />
           </button>
         </div>
       )}
@@ -1689,12 +2040,13 @@ function App() {
         <button
           className="mobile-menu-dismiss"
           onClick={() => setMobileMenuOpen(false)}
-          aria-label="Close menu"
+          aria-label={t('app.a11y.closeMenu')}
         >
           <Minus />
         </button>
       )}
     </div>
+    </LocaleProvider>
   )
 }
 

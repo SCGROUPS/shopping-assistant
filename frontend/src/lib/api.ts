@@ -1,6 +1,15 @@
 import { demoExperiences } from '../data/demo'
+import { formatTime } from './format'
+import { translate } from './i18n'
+import type {
+  LocalizedText,
+  MessageKey,
+  MessageVars,
+  PluralBase,
+} from './i18n'
 import type {
   AssistantAction,
+  ContentFieldMeta,
   AssistantContext,
   AssistantMessage,
   CartItem,
@@ -17,9 +26,37 @@ const SESSION_ID =
   localStorage.getItem('vietra-session-id') ?? crypto.randomUUID()
 localStorage.setItem('vietra-session-id', SESSION_ID)
 
-const jsonHeaders = {
-  'Content-Type': 'application/json',
+// One function builds every header set. The first attempt had two - a
+// conditional `Accept-Language` in `request()` and an unconditional one here -
+// and because explicit headers win over the spread, this one's empty string
+// silently overwrote the browser's own language on search, events, SSE and
+// every cart mutation. A shopper could have browsed in Vietnamese and searched
+// in English. Two places deciding one header is the same bug as two lists of
+// the same fields: it does not fail, it disagrees.
+const baseHeaders = (): Record<string, string> => ({
   'X-Session-ID': SESSION_ID,
+  // Omitted, never empty. An empty `Accept-Language` is a claim about
+  // language; absence lets the server fall back to the browser's own header,
+  // which is a better guess than ours.
+  ...(preferredLocale ? { 'Accept-Language': preferredLocale } : {}),
+})
+
+const jsonHeaders = (): Record<string, string> => ({
+  ...baseHeaders(),
+  'Content-Type': 'application/json',
+})
+
+// Endonyms: a language menu is read by someone who cannot yet read the page,
+// so "Tieng Viet" is findable where "Vietnamese" is not.
+export const LOCALE_NAMES: Record<string, string> = {
+  en: 'English',
+  vi: 'Tiếng Việt',
+  zh: '中文',
+  ja: '日本語',
+  ko: '한국어',
+  fr: 'Français',
+  de: 'Deutsch',
+  es: 'Español',
 }
 
 export const SUPPORTED_CURRENCIES = [
@@ -32,6 +69,31 @@ export const SUPPORTED_CURRENCIES = [
   'KRW',
   'JPY',
 ] as const
+
+// The shopper's language, sent on every request as `Accept-Language`. The
+// server negotiates and decides - the header is a preference, not an
+// instruction - and every response says which locale it actually resolved,
+// which is what the UI reads rather than assuming it got what it asked for.
+let preferredLocale = localStorage.getItem('vietra-locale') ?? ''
+
+export const setPreferredLocale = (locale: string) => {
+  preferredLocale = locale
+  // Removed rather than stored blank: "no preference" is the absence of a
+  // choice, and an empty string in storage is a stored choice that happens to
+  // be empty. Rolling back a failed switch can land here.
+  if (locale) localStorage.setItem('vietra-locale', locale)
+  else localStorage.removeItem('vietra-locale')
+}
+
+export const getPreferredLocale = () => preferredLocale
+
+// What the server said it actually served, which is what times and counts
+// produced down here must be formatted in. `preferredLocale` is a request and
+// can differ; formatting to a language the page is not in is the same mistake
+// as the switcher showing an unconfirmed choice.
+let resolvedLocale = 'en'
+
+export const getResolvedLocale = () => resolvedLocale
 
 // Display currency is presentation state, so it lives here rather than being
 // threaded through every call signature. The authoritative VND price always
@@ -66,7 +128,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: {
-      'X-Session-ID': SESSION_ID,
+      ...baseHeaders(),
       ...init?.headers,
     },
   })
@@ -87,28 +149,244 @@ const allowDemoFallbackOrThrow = (error: unknown) => {
   throw error
 }
 
-const actionLabels: Record<string, string> = {
-  ADD_TO_CART: 'Add to trip',
-  CHECK_AVAILABILITY: 'Check times',
-  PREPARE_CHECKOUT: 'Review checkout',
-  CONFIRM_SIMULATED_CHECKOUT: 'Confirm demo purchase',
-  VIEW_VOUCHER: 'View voucher',
+// The service sends an action `type`; the words on the button are ours, so they
+// belong to the dictionary rather than to this map.
+const actionLabels: Record<string, MessageKey> = {
+  ADD_TO_CART: 'assistant.action.addToCart',
+  CHECK_AVAILABILITY: 'assistant.action.checkAvailability',
+  PREPARE_CHECKOUT: 'assistant.action.prepareCheckout',
+  CONFIRM_SIMULATED_CHECKOUT: 'assistant.action.confirmSimulated',
+  VIEW_VOUCHER: 'assistant.action.viewVoucher',
+}
+
+/**
+ * Prose the assistant service wrote, which is already in the shopper's language
+ * because the request carried their locale. It has no dictionary key and must
+ * not acquire one. When the service says nothing, the fallback is ours, so it
+ * does have a key.
+ */
+const assistantProse = (value: unknown): LocalizedText =>
+  typeof value === 'string' && value.trim()
+    ? { raw: value }
+    : { key: 'assistant.defaultReply' }
+
+// Sentences the assistant service writes for itself rather than relaying from
+// the model. Those cannot be in the shopper's language - the service has no
+// dictionary - so it sends a code and the numbers that go in it, and the words
+// are chosen here. Every one of these lines used to arrive as English prose,
+// including the ones a shopper only ever sees when the model is unreachable.
+const KNOWN_MESSAGE_CODES = new Set([
+  'assistant.msg.searchResults',
+  'assistant.msg.noResults',
+  'assistant.msg.noResults.ask',
+  'assistant.msg.compareNeedsTwo',
+  'assistant.msg.comparison',
+  'assistant.msg.noComplement',
+  'assistant.msg.noComplement.ask',
+  'assistant.msg.complements',
+  'assistant.msg.added',
+  'assistant.msg.checkoutTotal',
+  'assistant.msg.cannotBookYet',
+  'assistant.msg.booked',
+  'assistant.msg.unavailable',
+])
+
+/**
+ * The assistant's line, preferring the code over the prose.
+ *
+ * A code the server sends and this build does not know is reported, not
+ * printed: `assistant.msg.added` in a chat bubble is worse than the English
+ * sentence it shipped alongside, so the fallback is the prose.
+ */
+// Codes whose sentence changes with a count, so the wording has to be chosen
+// against the shopper's language rather than by adding an "s".
+const PLURAL_MESSAGE_CODES = new Set([
+  'assistant.msg.searchResults',
+  'assistant.msg.checkoutTotal',
+])
+
+// The service sends an amount and a currency as two plain fields. Pairing them
+// here means the sentence is rendered with the shopper's own separators and
+// symbol placement instead of the server's `1,500,000 VND`.
+const readMessageVars = (value: unknown): MessageVars => {
+  const raw = (value ?? {}) as Record<string, unknown>
+  const vars: MessageVars = {}
+  for (const [name, item] of Object.entries(raw)) {
+    if (name === 'currency') continue
+    if (name === 'total' && typeof item === 'number') {
+      vars.total = {
+        amount: item,
+        currency: String(raw.currency ?? 'VND'),
+      }
+      continue
+    }
+    if (typeof item === 'string' || typeof item === 'number') vars[name] = item
+  }
+  return vars
+}
+
+const assistantMessage = (
+  code: unknown,
+  rawVars: unknown,
+  prose: unknown,
+): LocalizedText => {
+  if (typeof code === 'string' && code) {
+    if (KNOWN_MESSAGE_CODES.has(code)) {
+      const vars = readMessageVars(rawVars)
+      if (PLURAL_MESSAGE_CODES.has(code)) {
+        return {
+          plural: code as PluralBase,
+          count: Number(vars.count ?? 0),
+          vars,
+        }
+      }
+      return { key: code as MessageKey, vars }
+    }
+    reportContractViolation('message_code', code)
+  }
+  return assistantProse(prose)
 }
 
 const normalizeAssistantAction = (
   action: Record<string, unknown>,
 ): AssistantAction => ({
   type: String(action.type) as AssistantAction['type'],
-  label:
-    String(action.label ?? '') ||
-    actionLabels[String(action.type)] ||
-    'Continue',
+  // A label the service sent is prose it wrote in the shopper's language;
+  // anything we choose ourselves has to come from the dictionary.
+  label: action.label
+    ? { raw: String(action.label) }
+    : { key: actionLabels[String(action.type)] ?? 'assistant.action.continue' },
   experience_id: action.experience_id
     ? String(action.experience_id)
     : undefined,
   option_id: action.option_id ? String(action.option_id) : undefined,
   slot_id: action.slot_id ? String(action.slot_id) : undefined,
 })
+
+// A field the server was supposed to send and did not, or sent in a shape this
+// build does not understand. Recorded rather than swallowed: every silent
+// coercion in this file has eventually turned into a defect nobody could see,
+// because the coerced value was indistinguishable from a real answer.
+const reportContractViolation = (field: string, value: unknown): void => {
+  console.error(`[contract] ${field} was ${JSON.stringify(value)}`)
+  api.track('api_contract_violation', { field, value: String(value) })
+}
+
+// A fact the catalogue is required to state. Coercing an absent field to
+// `false` would mark every experience sold out, non-refundable and unsuitable
+// for families the moment a backend stopped sending it - and the storefront
+// would render that with complete confidence. The safe value is still used, so
+// the page works, but the disagreement is reported.
+const readFact = (item: Record<string, unknown>, field: string): boolean => {
+  const value = item[field]
+  if (typeof value === 'boolean') return value
+  reportContractViolation(field, value)
+  return false
+}
+
+// Codes this build knows how to render. An unrecognised one means the
+// catalogue is describing the product in terms the storefront cannot show, so
+// it is reported once here rather than silently vanishing at render time.
+const KNOWN_BADGE_CODES = new Set([
+  'instant_confirmation',
+  'family_friendly',
+  'free_cancellation',
+  'available',
+  'sold_out',
+])
+
+// The constraints the search gave up to find results. Codes, because this
+// sentence is read by the shopper: assembling it as English prose on the server
+// meant a Vietnamese storefront explained its own compromises in English.
+const KNOWN_RELAXATION_CODES = new Set([
+  'max_duration',
+  'rating',
+  'instant_confirmation',
+  'free_cancellation',
+  'category',
+  'indoor_outdoor',
+  'language',
+  'family_friendly',
+  'dates',
+  'budget',
+  'destination',
+])
+
+const readRelaxations = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  const codes = value.map(String)
+  for (const code of codes) {
+    if (!KNOWN_RELAXATION_CODES.has(code)) {
+      reportContractViolation('relaxed_preferences', code)
+    }
+  }
+  return codes
+}
+
+// Constraints the server understood but did not apply. Unlike a relaxation,
+// which the search chose in order to find something, these were refused - so an
+// unknown code is reported and kept rather than dropped: the shopper is better
+// served by a vague warning than by no warning at all.
+const KNOWN_UNRESOLVED_CODES = new Set([
+  'date_unverified',
+  'date_implausible',
+])
+
+const readUnresolved = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  const codes = value.map(String)
+  for (const code of codes) {
+    if (!KNOWN_UNRESOLVED_CODES.has(code) && !code.startsWith('field.')) {
+      reportContractViolation('unresolved_constraints', code)
+    }
+  }
+  return codes
+}
+
+const readBadges = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  const codes = value.map(String)
+  for (const code of codes) {
+    if (!KNOWN_BADGE_CODES.has(code)) reportContractViolation('badges', code)
+  }
+  return codes
+}
+
+// How the server said this answer should be shown. An unrecognised value is
+// reported rather than coerced: the storefront can render a grid safely while
+// still making it visible that routing was never decided, which is the whole
+// difference between a stale deployment and a silent regression.
+const readInteractionMode = (
+  value: unknown,
+): 'assistant' | 'grid' | 'undetermined' => {
+  if (value === 'assistant' || value === 'grid' || value === 'undetermined') {
+    return value
+  }
+  reportContractViolation('interaction_mode', value)
+  return 'undetermined'
+}
+
+const normalizeContentMeta = (
+  value: unknown,
+): Record<string, ContentFieldMeta> | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([field, meta]) => {
+      if (!meta || typeof meta !== 'object') return null
+      const record = meta as Record<string, unknown>
+      return [
+        field,
+        {
+          locale: String(record.locale ?? ''),
+          provenance: String(record.provenance ?? 'unknown'),
+          stale: record.stale === true,
+          fallback: record.fallback === true,
+        },
+      ] as const
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+  return entries.length ? Object.fromEntries(entries) : undefined
+}
 
 const normalizeExperience = (item: Record<string, unknown>): Experience => {
   const backendOptions = Array.isArray(item.options)
@@ -125,17 +403,14 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
       : []
     return {
       id: String(option.id),
-      name: String(option.name ?? 'Standard experience'),
+      name: String(option.name ?? translate(getResolvedLocale(), 'product.option.standard')),
       price: Number(adultPrice?.amount ?? item.price ?? 0),
       currency: String(adultPrice?.currency ?? item.currency ?? 'VND'),
       validity_type: option.validity_type
         ? String(option.validity_type)
         : undefined,
       start_times: slots.map((slot) =>
-        new Date(String(slot.starts_at)).toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
+        formatTime(resolvedLocale, String(slot.starts_at)),
       ),
       slots: slots.map((slot) => ({
         id: String(slot.id),
@@ -148,13 +423,11 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
       })),
     }
   })
-  const badges = Array.isArray(item.badges)
-    ? item.badges.map(String)
-    : []
+  const badges = readBadges(item.badges)
   return {
     id: String(item.id ?? item.experience_id),
     slug: String(item.slug ?? item.id),
-    title: String(item.title ?? 'Vietnam experience'),
+    title: String(item.title ?? translate(getResolvedLocale(), 'product.untitled')),
     destination: String(item.destination ?? item.location ?? 'Vietnam'),
     location: String(item.location ?? item.destination ?? 'Vietnam'),
     category: String(item.category ?? 'Experience'),
@@ -176,18 +449,20 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
     tags: Array.isArray(item.tags) ? item.tags.map(String) : [],
     badges,
     reason: item.reason ? String(item.reason) : undefined,
+    content_meta: normalizeContentMeta(item.content_meta),
+    locale: item.locale ? String(item.locale) : undefined,
+    // Read, never inferred. These four facts used to be recovered by matching
+    // English words in the badge text, so a translated catalogue would have
+    // reported every experience as unavailable, non-refundable and unsuitable
+    // for families - silently, because the parse always "succeeded".
     available:
-      item.availability === 'AVAILABLE' ||
-      badges.some((badge) => badge.toLowerCase() === 'available'),
-    instant_confirmation: badges.some((badge) =>
-      badge.toLowerCase().includes('instant'),
-    ),
-    free_cancellation: badges.some((badge) =>
-      badge.toLowerCase().includes('free cancellation'),
-    ),
-    family_friendly: badges.some((badge) =>
-      badge.toLowerCase().includes('family'),
-    ),
+      item.available === undefined && item.availability !== undefined
+        ? item.availability === 'AVAILABLE'
+        : readFact(item, 'available'),
+    instant_confirmation: readFact(item, 'instant_confirmation'),
+    free_cancellation: Number(item.free_cancellation_hours ?? 0) > 0,
+    free_cancellation_hours: Number(item.free_cancellation_hours ?? 0),
+    family_friendly: readFact(item, 'family_friendly'),
     accessibility_features: Array.isArray(item.accessibility_features)
       ? item.accessibility_features.map(String)
       : [],
@@ -242,10 +517,19 @@ const normalizeCart = async (
   )
 
   return backendItems.map((item) => {
-    const product = productsById.get(String(item.experience_id))
-    if (!product) {
+    const known = productsById.get(String(item.experience_id))
+    if (!known) {
       throw new Error(`Cart experience ${String(item.experience_id)} is unavailable.`)
     }
+    // The backend resolved this title in the requested locale; the cached
+    // product was resolved in whatever locale was current when it was fetched.
+    // Preferring the cache meant a Vietnamese cart listing English titles -
+    // and only for the products the shopper happened to have already seen,
+    // which is the hardest kind of bug to notice.
+    const title = item.experience_title
+      ? String(item.experience_title)
+      : known.title
+    const product = title === known.title ? known : { ...known, title }
     const startsAt = item.starts_at ? new Date(String(item.starts_at)) : null
     const participants = Array.isArray(item.participants)
       ? (item.participants as Array<Record<string, unknown>>)
@@ -262,10 +546,7 @@ const normalizeCart = async (
       slot_id: item.slot_id ? String(item.slot_id) : undefined,
       starts_at: startsAt?.toISOString(),
       date: startsAt?.toISOString().slice(0, 10) ?? '',
-      time: startsAt?.toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-      }),
+      time: startsAt ? formatTime(resolvedLocale, startsAt) : undefined,
       adults: countFor('adult', 'senior', 'student'),
       children: countFor('child', 'infant'),
       total: Number(item.quoted_total ?? 0),
@@ -345,7 +626,7 @@ export const api = {
   ): void {
     void request('/events', {
       method: 'POST',
-      headers: jsonHeaders,
+      headers: jsonHeaders(),
       body: JSON.stringify({
         event_type: eventType,
         experience_id: options.experienceId ?? null,
@@ -356,14 +637,55 @@ export const api = {
   },
 
   /** Cohort assignment, resolved before first paint. */
-  async sessionContext(): Promise<{ assistantEnabled: boolean }> {
+  async sessionContext(): Promise<{
+    assistantEnabled: boolean
+    locale: string
+    enabledLocales: string[]
+  }> {
     try {
       const payload = await request<Record<string, unknown>>('/session/context')
-      return { assistantEnabled: payload.assistant_enabled !== false }
+      return {
+        assistantEnabled: payload.assistant_enabled !== false,
+        // The locale the server *resolved*, which is not always the one asked
+        // for: a language that is enabled in the browser but not yet in the
+        // catalogue resolves to English, and a switcher showing the request
+        // rather than the result would claim a translation nobody has.
+        locale: (resolvedLocale = String(payload.locale ?? 'en')),
+        enabledLocales: Array.isArray(payload.enabled_locales)
+          ? payload.enabled_locales.map(String)
+          : ['en'],
+      }
     } catch {
-      // A telemetry outage must not remove the assistant.
-      return { assistantEnabled: true }
+      // A telemetry outage must not remove the assistant, and must not offer a
+      // language list the server never confirmed.
+      return { assistantEnabled: true, locale: 'en', enabledLocales: ['en'] }
     }
+  },
+
+  async setLocale(locale: string): Promise<string> {
+    // Persisted server-side as well as locally, because the session preference
+    // is what the assistant and any later device read - localStorage is this
+    // browser's opinion, and the conversation outlives the tab.
+    //
+    // Failures propagate. This used to `catch { return locale }`, which
+    // reported the language the caller asked for as the language the server
+    // agreed to: the UI then switched, the session did not, and every later
+    // request disagreed with the screen. A write whose whole purpose is the
+    // server's answer must not invent one.
+    const payload = await request<Record<string, unknown>>('/session/locale', {
+      method: 'PUT',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ locale }),
+    })
+    // `?? locale` here would have left the same hole the comment above
+    // describes, one layer further in: a 200 that omits the field would report
+    // the requested language as the agreed one. A response that does not name
+    // a locale has not confirmed anything.
+    const confirmed = payload.locale
+    if (typeof confirmed !== 'string' || !confirmed) {
+      throw new ApiRequestError('Locale change was not confirmed', 502)
+    }
+    return (resolvedLocale = confirmed)
   },
 
   async listExperiences(): Promise<Experience[]> {
@@ -381,17 +703,21 @@ export const api = {
     query: string,
     filters: SearchFilters,
     partySize: number,
+    relaxOrder: string[] = [],
   ): Promise<{
     items: Experience[]
     intent?: Record<string, unknown>
     effectiveFilters: SearchFilters
     relaxedPreferences: string[]
+    relaxationCandidates: string[]
+    unresolvedConstraints: string[]
     facets: Record<string, Record<string, number>>
+    interactionMode: 'assistant' | 'grid' | 'undetermined'
   }> {
     try {
       const payload = await request<Record<string, unknown>>('/search', {
         method: 'POST',
-        headers: jsonHeaders,
+        headers: jsonHeaders(),
         body: JSON.stringify({
           query,
           filters,
@@ -399,6 +725,9 @@ export const api = {
           sort: 'recommended',
           page_size: 24,
           display_currency: displayCurrency,
+          // Only what the shopper has agreed to give up. The server relaxes
+          // nothing on its own, so an empty list keeps their search exact.
+          relax_order: relaxOrder,
         }),
       })
       return {
@@ -406,9 +735,17 @@ export const api = {
         intent: payload.intent as Record<string, unknown> | undefined,
         effectiveFilters:
           (payload.effective_filters as SearchFilters | undefined) ?? filters,
-        relaxedPreferences: (payload.relaxed_preferences as string[]) ?? [],
+        relaxedPreferences: readRelaxations(payload.relaxed_preferences),
+        relaxationCandidates: readRelaxations(payload.relaxation_candidates),
+        unresolvedConstraints: readUnresolved(payload.unresolved_constraints),
         facets:
           (payload.facets as Record<string, Record<string, number>>) ?? {},
+        // The server decides whether this request wanted a conversation,
+        // because only it can read the shopper's language. A missing or
+        // unrecognised value is not quietly rewritten to `grid`: that is
+        // exactly how a stale backend would revert the storefront to
+        // keyword-only behaviour with nothing anywhere reporting it.
+        interactionMode: readInteractionMode(payload.interaction_mode),
       }
     } catch (error) {
       allowDemoFallbackOrThrow(error)
@@ -416,7 +753,11 @@ export const api = {
         items: filterDemoProducts(query, filters),
         effectiveFilters: filters,
         relaxedPreferences: [],
+        relaxationCandidates: [],
+        unresolvedConstraints: [],
         facets: {},
+        // The demo catalogue is a fixture, not a judgement about the shopper.
+        interactionMode: 'undetermined',
       }
     }
   },
@@ -463,7 +804,7 @@ export const api = {
     try {
       const conversation = await request<{ id: string }>('/conversations', {
         method: 'POST',
-        headers: jsonHeaders,
+        headers: jsonHeaders(),
         body: JSON.stringify({
           query: context.query,
           filters: context.filters ?? {},
@@ -491,7 +832,7 @@ export const api = {
         `${API_BASE}/conversations/${conversationId}/messages?stream=true`,
         {
           method: 'POST',
-          headers: { ...jsonHeaders, Accept: 'text/event-stream' },
+          headers: { ...jsonHeaders(), Accept: 'text/event-stream' },
           body: JSON.stringify({ message: text, context }),
         },
       )
@@ -546,10 +887,15 @@ export const api = {
       return {
         id: crypto.randomUUID(),
         role: 'assistant',
-        text:
-          (response.message as string) ??
-          (response.text as string) ??
-          'I found a few experiences that fit.',
+        text: assistantMessage(
+          response.message_code,
+          response.message_vars,
+          response.message ?? response.text,
+        ),
+        // The service could not reach the model, so it searched for the text as
+        // written and nothing was added, prepared or booked. Saying so is the
+        // difference between a degraded answer and a wrong one.
+        degraded: response.degraded === true,
         products,
         actions,
         filters: statePatch.filters as SearchFilters | undefined,
@@ -557,50 +903,26 @@ export const api = {
       }
     } catch (error) {
       if (!conversationId.startsWith('demo-') || !ALLOW_DEMO_FALLBACK) throw error
-      const lower = text.toLowerCase()
-      let matches = visibleProducts.length ? visibleProducts : demoExperiences
-      let reply =
-        'I balanced your interests, travel time, availability, and guest ratings. These are the strongest options.'
-
-      if (lower.includes('wheelchair') || lower.includes('accessible')) {
-        matches = demoExperiences.filter(
-          (product) => product.accessibility_features?.length,
-        )
-        reply =
-          'These options publish accessibility details. Ba Na Hills has the strongest step-free route, while the cooking class is the easiest lower-energy choice.'
-      } else if (lower.includes('family') || lower.includes('child')) {
-        matches = demoExperiences.filter(
-          (product) => product.family_friendly,
-        )
-        reply =
-          'For families, I would prioritise short transfers, flexible cancellation, and experiences with natural breaks. The basket boat is the easiest win.'
-      } else if (lower.includes('food') || lower.includes('eat')) {
-        matches = demoExperiences.filter(
-          (product) => product.category === 'Food',
-        )
-        reply =
-          'These are the best hands-on food experiences. Choose the street-food walk for energy and variety, or the cooking class for a slower shared activity.'
-      } else if (lower.includes('rain') || lower.includes('indoor')) {
-        matches = demoExperiences.filter((product) =>
-          ['Wellness', 'Food'].includes(product.category),
-        )
-        reply =
-          'For wet weather, I would keep the plan flexible and mostly covered. This pairing gives you local flavour plus a restorative finish.'
-      } else if (lower.includes('checkout') || lower.includes('book')) {
-        reply =
-          'Your selection can be reserved now. I will recheck the price and time before opening the secure demo checkout.'
-      }
+      // This path exists so the demo renders with no backend. It deliberately
+      // does not interpret the shopper's words: keyword matching on `text` was
+      // a second, worse assistant that answered in English and disagreed with
+      // the real one. Understanding the request is the model's job, so with no
+      // model reachable this offers what is already on screen and says so.
+      const matches = visibleProducts.length ? visibleProducts : demoExperiences
 
       return {
         id: crypto.randomUUID(),
         role: 'assistant',
-        text: reply,
+        text: { key: 'assistant.defaultReply' },
         products: matches.slice(0, 3),
         actions: matches[0]
           ? [
               {
                 type: 'ADD_TO_CART',
-                label: `Add ${matches[0].title}`,
+                label: {
+                  key: 'assistant.action.addNamed',
+                  vars: { title: matches[0].title },
+                },
                 experience_id: matches[0].id,
               },
             ]
@@ -654,7 +976,7 @@ export const api = {
 
       const response = await request<Record<string, unknown>>('/cart/items', {
         method: 'POST',
-        headers: { ...jsonHeaders, 'Idempotency-Key': crypto.randomUUID() },
+        headers: { ...jsonHeaders(), 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({
           experience_id: product.id,
           option_id: optionId,
@@ -695,7 +1017,7 @@ export const api = {
       `/cart/items/${itemId}`,
       {
         method: 'DELETE',
-        headers: { ...jsonHeaders, 'Idempotency-Key': crypto.randomUUID() },
+        headers: { ...jsonHeaders(), 'Idempotency-Key': crypto.randomUUID() },
       },
     )
     return normalizeCart(response, knownProducts)
@@ -722,13 +1044,13 @@ export const api = {
         '/checkout/prepare',
         {
           method: 'POST',
-          headers: { ...jsonHeaders, 'Idempotency-Key': crypto.randomUUID() },
+          headers: { ...jsonHeaders(), 'Idempotency-Key': crypto.randomUUID() },
           body: JSON.stringify({}),
         },
       )
       const booking = await request<Record<string, unknown>>('/checkout/confirm', {
         method: 'POST',
-        headers: { ...jsonHeaders, 'Idempotency-Key': crypto.randomUUID() },
+        headers: { ...jsonHeaders(), 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({
           confirmation: 'CONFIRM',
           customer_details: customer,

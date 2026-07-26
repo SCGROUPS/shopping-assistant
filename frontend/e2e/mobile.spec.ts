@@ -1,10 +1,12 @@
 import { expect, test } from '@playwright/test'
+import { routeSearchAs } from './routing'
 import { installVoiceMock } from './voice-mock'
 
 test('mobile search, assistant drawer, cart, and removal remain responsive', async ({
   page,
 }) => {
   await installVoiceMock(page)
+  await routeSearchAs(page, 'assistant')
   await page.goto('/')
 
   await expect(
@@ -33,7 +35,7 @@ test('mobile search, assistant drawer, cart, and removal remain responsive', asy
   ).toBe(true)
   await assistant.getByRole('button', { name: 'Close assistant' }).click()
 
-  const search = page.getByLabel('What would make this trip memorable?')
+  const search = page.getByTestId('trip-search')
   // Conversational queries hand off to the assistant (docs/SYSTEM_DESIGN.md
   // §8.2); short keyword queries deliberately stay in the grid.
   await search.fill('A relaxed family day near Da Nang with food and culture')
