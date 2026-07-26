@@ -8,6 +8,7 @@ from app.catalog.importer import import_trippass
 from app.catalog.indexing import run_reindex
 from app.catalog.seed import build_seed_catalog
 from app.common.store import store
+from app.content.jobs import drain_translations, enqueue_all
 
 
 def main() -> None:
@@ -20,6 +21,8 @@ def main() -> None:
             "refresh-availability",
             "import-trippass",
             "reindex",
+            "enqueue-translations",
+            "translate",
             "summary",
             "create-operator",
             "list-operators",
@@ -38,6 +41,21 @@ def main() -> None:
         help="Issue a new key for an existing operator, invalidating the old one.",
     )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--locale",
+        action="append",
+        help="Restrict translation work to this locale; repeatable.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Translate at most this many fields, then stop. Omit to drain the queue.",
+    )
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Publish machine output directly instead of holding it for review.",
+    )
     parser.add_argument(
         "--days",
         type=int,
@@ -82,6 +100,28 @@ def main() -> None:
         if backlog:
             summary = ", ".join(f"{n} {status}" for status, n in sorted(backlog.items()))
             print(f"Index backlog not empty: {summary}")
+            raise SystemExit(1)
+        return
+    if args.command == "enqueue-translations":
+        totals = asyncio.run(enqueue_all(locales=args.locale))
+        print(
+            f"Translation queue: {totals['enqueued']} fields enqueued "
+            f"across {totals['experiences']} experiences"
+        )
+        return
+    if args.command == "translate":
+        totals = asyncio.run(
+            drain_translations(
+                limit=args.limit, requires_review=False if args.publish else None
+            )
+        )
+        print(
+            f"Translated {totals['published']} fields "
+            f"({totals['superseded']} superseded, {totals['failed']} failed)"
+        )
+        # A failure here is a field the storefront will keep serving in the
+        # wrong language until somebody looks, so it must not exit zero.
+        if totals["failed"]:
             raise SystemExit(1)
         return
     if args.command == "seed-db":

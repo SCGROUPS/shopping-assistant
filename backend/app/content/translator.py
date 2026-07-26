@@ -1,0 +1,353 @@
+"""The translation worker: lease a job, ask the model, commit only if still wanted.
+
+The commit is the whole point of this module, and it is one transaction that
+does three things or none of them:
+
+1. a conditional `UPDATE translation_fields` that names the generation, the
+   desired fingerprint, the pending status, a non-manual provenance *and* a
+   lease token bound to this exact target;
+2. a column-specific `ON CONFLICT DO UPDATE` write to the wide translation row;
+3. the job's own completion, and the reindex enqueue for the locale.
+
+If the conditional update matches zero rows, the world moved while the model was
+thinking and everything above is rolled back. That is the only correct outcome:
+the alternative is a slow machine translation landing on top of a human's fresh
+correction, which no amount of retrying fixes because the human's text is gone.
+
+The wide-table write must be column-specific. An ORM whole-row flush of
+`experience_translations` writes all four columns, so two workers finishing
+`title` and `description` for the same locale in the same second would each
+write the other's column back to the value they loaded — silently losing one.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import and_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.catalog.indexing import enqueue_experience_reindex
+from app.common.config import get_settings
+from app.common.models import (
+    Experience,
+    ExperienceTranslation,
+    TranslationField,
+    TranslationGlossary,
+    TranslationJob,
+)
+from app.content.enqueue import ENTITY_EXPERIENCE, EXPERIENCE_FIELDS
+
+logger = logging.getLogger(__name__)
+
+# Long enough that a slow model call finishes inside it, short enough that a
+# worker killed mid-flight frees the job within a deploy cycle.
+LEASE_SECONDS = 300
+MAX_ATTEMPTS = 5
+
+_WIDE_COLUMNS = {field: getattr(ExperienceTranslation, field) for field in EXPERIENCE_FIELDS}
+
+
+@dataclass(frozen=True)
+class Leased:
+    job_id: uuid.UUID
+    lease_token: uuid.UUID
+    entity_id: uuid.UUID
+    field: str
+    locale: str
+    fingerprint: str
+    generation: int
+    attempts: int
+    source_text: str
+    source_language: str
+
+
+class GlossaryViolation(RuntimeError):
+    """The model translated a term it was told to leave alone.
+
+    Raised rather than repaired: silently substituting the term back produces a
+    sentence with the right words in a grammar built around different ones.
+    """
+
+
+async def lease_jobs(session: AsyncSession, *, limit: int) -> list[Leased]:
+    """Claim up to `limit` jobs, skipping any another worker holds.
+
+    `SKIP LOCKED` rather than `NOWAIT`: two workers running concurrently is the
+    normal case, and the second should take different work rather than fail.
+    """
+    now = datetime.now(UTC)
+    token = uuid.uuid4()
+
+    claimable = (
+        select(TranslationJob.id)
+        .where(
+            TranslationJob.status.in_(("queued", "leased")),
+            TranslationJob.attempts < MAX_ATTEMPTS,
+            # A leased row is claimable only once its lease has expired, which
+            # is how a killed worker's job returns to the pool without anybody
+            # having to notice it died.
+            (TranslationJob.leased_until.is_(None)) | (TranslationJob.leased_until < now),
+        )
+        .order_by(TranslationJob.created_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+
+    claimed = (
+        await session.execute(
+            update(TranslationJob)
+            .where(TranslationJob.id.in_(claimable))
+            .values(
+                status="leased",
+                lease_token=token,
+                leased_until=now + timedelta(seconds=LEASE_SECONDS),
+                attempts=TranslationJob.attempts + 1,
+            )
+            .returning(
+                TranslationJob.id,
+                TranslationJob.entity_id,
+                TranslationJob.field,
+                TranslationJob.locale,
+                TranslationJob.fingerprint,
+                TranslationJob.generation,
+                TranslationJob.attempts,
+            )
+        )
+    ).all()
+
+    leased: list[Leased] = []
+    for row in claimed:
+        experience = await session.get(Experience, row.entity_id)
+        if experience is None:
+            # The listing was deleted under us. Nothing to translate and nothing
+            # to retry; drop the job rather than burn five attempts on it.
+            await session.execute(
+                update(TranslationJob)
+                .where(TranslationJob.id == row.id)
+                .values(status="cancelled", lease_token=None, leased_until=None)
+            )
+            continue
+        leased.append(
+            Leased(
+                job_id=row.id,
+                lease_token=token,
+                entity_id=row.entity_id,
+                field=row.field,
+                locale=row.locale,
+                fingerprint=row.fingerprint,
+                generation=row.generation,
+                attempts=row.attempts,
+                source_text=getattr(experience, row.field, "") or "",
+                source_language=experience.source_language,
+            )
+        )
+    return leased
+
+
+async def load_glossary(session: AsyncSession, locale: str) -> list[TranslationGlossary]:
+    return list(
+        (
+            await session.scalars(
+                select(TranslationGlossary).where(TranslationGlossary.target_locale == locale)
+            )
+        ).all()
+    )
+
+
+def verify_glossary(text: str, terms: list[TranslationGlossary]) -> None:
+    """Check the output for terms the model was told not to translate.
+
+    Instructing a model is a request; checking the output is a guarantee. A
+    missing term fails the job, which retries and eventually parks it for a
+    human — far better than shipping "Ancient Town" where the brand is "Hoi An".
+    """
+    missing = [
+        term.term
+        for term in terms
+        if term.do_not_translate and term.term.casefold() not in text.casefold()
+    ]
+    if missing:
+        raise GlossaryViolation(f"missing untranslated terms: {', '.join(sorted(missing))}")
+
+
+async def commit_translation(
+    session: AsyncSession,
+    job: Leased,
+    *,
+    translated: str,
+    requires_review: bool,
+) -> bool:
+    """Publish, but only if this job still answers what the field wants.
+
+    Returns False when the world moved — the caller treats that as success for
+    the job (there is nothing left to do) but must not write anything.
+    """
+    conditions = and_(
+        TranslationField.entity_type == ENTITY_EXPERIENCE,
+        TranslationField.entity_id == job.entity_id,
+        TranslationField.field == job.field,
+        TranslationField.locale == job.locale,
+        # Everything a stale worker could be wrong about, named explicitly.
+        TranslationField.generation == job.generation,
+        TranslationField.desired_fingerprint == job.fingerprint,
+        TranslationField.status == "pending",
+        TranslationField.provenance != "manual",
+        # Bound to *this* target, so holding a lease on some other job's row
+        # cannot authorise this write.
+        TranslationJob.id == job.job_id,
+        TranslationJob.lease_token == job.lease_token,
+        TranslationJob.entity_id == TranslationField.entity_id,
+        TranslationJob.field == TranslationField.field,
+        TranslationJob.locale == TranslationField.locale,
+    )
+
+    if requires_review:
+        # Held back from the storefront. The candidate is stored, the published
+        # fingerprint is untouched, and the field stays visibly not-current.
+        values = {
+            "candidate_value": translated,
+            "candidate_fingerprint": job.fingerprint,
+            "status": "needs_review",
+        }
+    else:
+        values = {
+            "published_fingerprint": job.fingerprint,
+            "status": "current",
+            "candidate_value": None,
+            "candidate_fingerprint": None,
+        }
+
+    updated = await session.execute(
+        update(TranslationField)
+        .where(conditions)
+        .values(**values, updated_at=datetime.now(UTC))
+        .returning(TranslationField.entity_id)
+    )
+    if updated.scalar_one_or_none() is None:
+        logger.info(
+            "translation.superseded",
+            extra={
+                "entity_id": str(job.entity_id),
+                "field": job.field,
+                "locale": job.locale,
+                "generation": job.generation,
+            },
+        )
+        return False
+
+    if not requires_review:
+        column = _WIDE_COLUMNS[job.field]
+        await session.execute(
+            pg_insert(ExperienceTranslation)
+            .values(
+                experience_id=job.entity_id,
+                locale=job.locale,
+                **{job.field: translated},
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    ExperienceTranslation.experience_id,
+                    ExperienceTranslation.locale,
+                ],
+                # One column. Naming all four would have two workers write each
+                # other's column back to whatever they loaded.
+                set_={column.key: translated, "updated_at": datetime.now(UTC)},
+            )
+        )
+        # The document for this locale is now built from different text, so it
+        # has to be rebuilt. Same transaction: a published translation that is
+        # not searchable is a translation nobody will ever read.
+        await enqueue_experience_reindex(session, job.entity_id, locales=[job.locale])
+
+    await session.execute(
+        update(TranslationJob)
+        .where(TranslationJob.id == job.job_id)
+        .values(status="done", lease_token=None, leased_until=None, error_detail=None)
+    )
+    return True
+
+
+async def fail_job(session: AsyncSession, job: Leased, detail: str) -> None:
+    """Release the lease and record why, parking the job at the attempt cap."""
+    terminal = job.attempts >= MAX_ATTEMPTS
+    await session.execute(
+        update(TranslationJob)
+        .where(TranslationJob.id == job.job_id)
+        .values(
+            status="failed" if terminal else "queued",
+            lease_token=None,
+            leased_until=None,
+            error_detail=detail[:2000],
+        )
+    )
+    if terminal:
+        await session.execute(
+            update(TranslationField)
+            .where(
+                TranslationField.entity_type == ENTITY_EXPERIENCE,
+                TranslationField.entity_id == job.entity_id,
+                TranslationField.field == job.field,
+                TranslationField.locale == job.locale,
+                TranslationField.generation == job.generation,
+            )
+            .values(status="failed")
+        )
+
+
+async def drain(
+    session_factory,
+    translator,
+    *,
+    limit: int | None = None,
+    requires_review: bool = False,
+) -> dict[str, int]:
+    """Work the queue once. Each job commits in its own transaction.
+
+    One transaction per job, not one for the batch: a glossary violation on the
+    twelfth job must not roll back eleven good translations.
+    """
+    settings = get_settings()
+    batch = limit if limit is not None else settings.translation_batch
+
+    async with session_factory() as session:
+        jobs = await lease_jobs(session, limit=batch)
+        await session.commit()
+
+    counts = {"leased": len(jobs), "published": 0, "superseded": 0, "failed": 0}
+
+    for job in jobs:
+        try:
+            async with session_factory() as session:
+                terms = await load_glossary(session, job.locale)
+            translated = await asyncio.wait_for(
+                translator(job=job, glossary=terms),
+                timeout=settings.translation_timeout_seconds,
+            )
+            verify_glossary(translated, terms)
+        except Exception as exc:  # noqa: BLE001 - every failure is one retry
+            async with session_factory() as session:
+                await fail_job(session, job, f"{type(exc).__name__}: {exc}")
+                await session.commit()
+            counts["failed"] += 1
+            continue
+
+        async with session_factory() as session:
+            published = await commit_translation(
+                session, job, translated=translated, requires_review=requires_review
+            )
+            if not published:
+                await session.execute(
+                    update(TranslationJob)
+                    .where(TranslationJob.id == job.job_id)
+                    .values(status="superseded", lease_token=None, leased_until=None)
+                )
+            await session.commit()
+        counts["published" if published else "superseded"] += 1
+
+    return counts
