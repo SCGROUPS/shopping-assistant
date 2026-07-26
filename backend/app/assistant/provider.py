@@ -98,15 +98,17 @@ SHOPPING_TOOLS: list[dict[str, Any]] = [
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Which of the shopper's constraints to give up first if nothing "
+                    "Constraints the shopper has agreed you may give up if nothing "
                     "matches, most expendable first, from: max_duration, rating, "
                     "instant_confirmation, free_cancellation, category, "
                     "indoor_outdoor, language, family_friendly, dates, budget, "
                     "destination. Fill this only from what the shopper has actually "
                     "said - 'I can be flexible on dates but not on price' is "
-                    "['dates']. Empty when they have not said, which leaves the "
-                    "default order in place. Accessibility needs and exclusions are "
-                    "never relaxed and cannot be listed here."
+                    "['dates']. Leave it empty when they have not said: nothing is "
+                    "then relaxed, and the result reports relaxation_candidates so "
+                    "you can ask them which to give up before searching again. "
+                    "Accessibility needs and exclusions are never relaxed and cannot "
+                    "be listed here."
                 ),
             },
             "limit": {
@@ -221,6 +223,11 @@ class AgentAnswer:
     message: str
     selections: list[Selection] = field(default_factory=list)
     clarification: str | None = None
+    # The agent finished, and what it produced could not be shown. Distinct from
+    # returning nothing at all: by the time the final answer is refused its tool
+    # calls have already run, so the caller must not start over and add the same
+    # experience to the cart a second time. It has to report, not retry.
+    declined: bool = False
 
 
 class AIProvider(Protocol):
@@ -325,14 +332,45 @@ _INJECTED_CHANNEL = re.compile(
     https?://
   | www\.[a-z0-9-]+\.[a-z]{2,}
   | [a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
-  | (?<![\d.]) (?:\+\d{1,3}[\s.-]?)? (?:\(\d{2,4}\)[\s.-]?)? \d{3,4}[\s.-]\d{3,4}(?:[\s.-]\d{3,4})+ (?![\d.])
     """
 )
+
+# Telephone numbers cannot be recognised by grouping alone: `100 000 000 VND`
+# and `0912 345 678` have the same shape, and reading a price as a phone number
+# silently threw away a legitimate answer. What separates them is how they
+# start. A diallable number carries a country code or a trunk `0`; a sum of
+# money does not begin with a leading zero. So the run is anchored on `+` or
+# `0`, and only then measured - a phone is 9 to 15 digits, which a time range
+# ("09.00 - 17.00", seven digits) is not.
+_DIALLABLE_RUN = re.compile(r"(?<![\d\w])(?:\+\d|0)[\d\s.()-]{6,}")
+
+
+def carries_injected_channel(text: str) -> bool:
+    """True if the prose contains a way to reach someone off-platform.
+
+    No tool returns a link, an address or a phone number, so their presence in
+    model prose means the model wrote them - and the likeliest author is
+    catalogue text from whoever wanted the shopper to leave the site and pay
+    somewhere unprotected.
+    """
+    if _INJECTED_CHANNEL.search(text):
+        return True
+    for run in _DIALLABLE_RUN.findall(text):
+        if 9 <= sum(character.isdigit() for character in run) <= 15:
+            return True
+    return False
+
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 
-def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer | None:
+def names_unoffered_id(text: str, offered: set[str]) -> bool:
+    """True if the prose names an experience that is not among `offered`."""
+    allowed = {item.lower() for item in offered}
+    return any(mentioned.lower() not in allowed for mentioned in _UUID.findall(text))
+
+
+def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer:
     """Turn the model's final answer into one the storefront may render.
 
     Filtering the selections was not enough. The ids were checked and the prose
@@ -344,8 +382,10 @@ def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer |
     any of eight. It checks two things that hold whatever the language is: that
     the model was not trying to present offerings we refused, and that the prose
     does not carry a channel no tool could have produced. Failing either, the
-    whole answer is declined and the deterministic path replies instead, because
-    a partly-trustworthy answer is not a thing we can hand to a shopper.
+    whole answer is declined, because a partly-trustworthy answer is not a thing
+    we can hand to a shopper. It is declined rather than dropped: the tool calls
+    behind it have already run, so the caller has to say so and stop, not start
+    the turn again and book the same thing twice.
     """
     selections: list[Selection] = []
     for raw in arguments.get("selections", []) or []:
@@ -356,7 +396,7 @@ def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer |
             # The grounding contract: an id no tool returned cannot be rendered,
             # and presenting it would be an unverifiable claim.
             logger.warning("Agent selected an offering no tool returned: %s", experience_id)
-            return None
+            return AgentAnswer(message="", declined=True)
         selections.append(
             Selection(
                 experience_id=experience_id,
@@ -371,17 +411,22 @@ def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer |
         if isinstance(clarification, str) and clarification.strip()
         else None
     )
-    prose = f"{message}\n{clarification_text or ''}"
+    # Every field the shopper reads, not just the ones that look like prose.
+    # `reason` is free-form model text rendered beside the card, so checking the
+    # message alone left the easiest surface open: a real, bookable experience
+    # with "pay at ..." printed underneath it.
+    prose = "\n".join(
+        [message, clarification_text or "", *(item.reason for item in selections)]
+    )
 
-    if _INJECTED_CHANNEL.search(prose):
+    if carries_injected_channel(prose):
         logger.warning("Agent prose carried a contact channel no tool returned; declining")
-        return None
+        return AgentAnswer(message="", declined=True)
 
     selected = {selection.experience_id for selection in selections}
-    for mentioned in _UUID.findall(prose):
-        if mentioned.lower() not in {item.lower() for item in selected}:
-            logger.warning("Agent prose named an offering it did not select; declining")
-            return None
+    if names_unoffered_id(prose, selected):
+        logger.warning("Agent prose named an offering it did not select; declining")
+        return AgentAnswer(message="", declined=True)
 
     return AgentAnswer(
         message=message,

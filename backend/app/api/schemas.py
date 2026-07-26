@@ -51,11 +51,12 @@ class SearchRequest(BaseModel):
     # tell them apart, and would override a session's chosen Vietnamese with an
     # English nobody requested.
     locale: str | None = None
-    # Which constraints to give up first when nothing matches, most expendable
-    # first. Empty means the search has not been told, and falls back to a
-    # default order - which is what used to be the only behaviour, so the search
-    # decided on every shopper's behalf that their budget mattered less to them
-    # than the language their guide speaks. Codes, from `relaxation_candidates`.
+    # Which constraints the shopper has agreed to give up if nothing matches,
+    # most expendable first. This is an authorisation, not a hint: empty means
+    # nothing may be relaxed and a zero-result search stays a zero-result
+    # search. The search used to relax on its own initiative, which decided on
+    # every shopper's behalf that their budget mattered less to them than the
+    # language their guide speaks. Codes, from `relaxation_candidates`.
     relax_order: list[str] = Field(default_factory=list)
 
 

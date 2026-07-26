@@ -102,19 +102,16 @@ def test_agent_cannot_present_an_offering_no_tool_returned() -> None:
     tell which half was real. The prose cannot be repaired without reading it,
     so the answer is declined and the deterministic path replies instead.
     """
-    assert (
-        _build_answer(
-            {
-                "message": "Try these.",
-                "selections": [
-                    {"experience_id": "real-1", "reason": "on the water"},
-                    {"experience_id": "hallucinated", "reason": "invented"},
-                ],
-            },
-            offered={"real-1"},
-        )
-        is None
-    )
+    assert _build_answer(
+        {
+            "message": "Try these.",
+            "selections": [
+                {"experience_id": "real-1", "reason": "on the water"},
+                {"experience_id": "hallucinated", "reason": "invented"},
+            ],
+        },
+        offered={"real-1"},
+    ).declined
 
 
 def test_agent_answer_keeps_reasons_and_clarification() -> None:
@@ -341,7 +338,8 @@ class TestGroundedProse:
     def _answer(**arguments: object):
         from app.assistant.provider import _build_answer
 
-        return _build_answer(dict(arguments), {"11111111-1111-1111-1111-111111111111"})
+        answer = _build_answer(dict(arguments), {"11111111-1111-1111-1111-111111111111"})
+        return None if answer.declined else answer
 
     def test_a_grounded_answer_is_kept(self) -> None:
         answer = self._answer(
@@ -391,9 +389,111 @@ class TestGroundedProse:
             is None
         )
 
-    def test_ordinary_prices_and_times_are_not_mistaken_for_a_phone_number(self) -> None:
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "Two options, 3 hours each, from 1,500,000 VND, departing 08:30.",
+            # Space-grouped VND has exactly the shape the old detector called a
+            # phone number, so a perfectly good answer was thrown away and the
+            # shopper silently got a different one.
+            "The whole party comes to 100 000 000 VND for the week.",
+            "Gia tu 1.500.000 dong moi nguoi.",
+            "Open 09.00 - 17.00 daily, last entry 16.30.",
+            "Total 12 500 000 VND for 4 guests.",
+        ],
+    )
+    def test_ordinary_prices_and_times_are_not_mistaken_for_a_phone_number(
+        self, prose: str
+    ) -> None:
         answer = self._answer(
-            message="Two options, 3 hours each, from 1,500,000 VND, departing 08:30.",
+            message=prose,
             selections=[{"experience_id": "11111111-1111-1111-1111-111111111111"}],
         )
-        assert answer is not None
+        assert answer is not None, prose
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "Call 0912 345 678 to pay the guide directly.",
+            "Reach the operator on +84 912 345 678.",
+            "Tel: (024) 3825 5555 for a better rate.",
+        ],
+    )
+    def test_a_diallable_number_is_still_refused(self, prose: str) -> None:
+        assert self._answer(message=prose, selections=[]) is None, prose
+
+    def test_the_reason_beside_a_card_is_checked_like_any_other_prose(self) -> None:
+        """It is model text the shopper reads, and it was never inspected.
+
+        Checking only `message` left the easiest surface wide open: a real,
+        bookable card with "pay the guide at ..." printed underneath it, which
+        is exactly the sentence an injected catalogue description wants there.
+        """
+        assert (
+            self._answer(
+                message="Here is a good fit.",
+                selections=[
+                    {
+                        "experience_id": "11111111-1111-1111-1111-111111111111",
+                        "reason": "Cheapest if you pay direct at www.not-vietra.example",
+                    }
+                ],
+            )
+            is None
+        )
+
+    def test_a_reason_may_not_name_an_offering_that_is_not_on_the_page(self) -> None:
+        assert (
+            self._answer(
+                message="Here is a good fit.",
+                selections=[
+                    {
+                        "experience_id": "11111111-1111-1111-1111-111111111111",
+                        "reason": "Better than 22222222-2222-2222-2222-222222222222",
+                    }
+                ],
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_declined_answer_does_not_replay_the_agent_s_tools(store: DemoStore) -> None:
+    """Refusing the answer must not book the same thing twice.
+
+    The agent's tool calls have already run by the time its final answer is
+    checked, so treating a refusal as "the agent produced nothing" and falling
+    through to the single-tool path would execute the same request a second
+    time - the shopper's cart quietly holding two of everything, because we
+    disliked the sentence the model wrote about the first one.
+    """
+    class DecliningProvider(DemoAIProvider):
+        retried = False
+        tool_result: dict = {}
+
+        async def run_agent(self, text, state, execute):
+            # Search first: an id only becomes addressable once a tool has
+            # returned it, which is the grounding rule the agent path enforces.
+            found = await execute("search_experiences", {"query": "cruise", "exclude": []})
+            first = found["items"][0]["experience_id"]
+            type(self).tool_result = await execute("add_to_cart", {"experience_id": first})
+            return AgentAnswer(message="", declined=True)
+
+        async def plan_action(self, text, state):
+            # Recorded rather than raised: `respond` catches planning
+            # exceptions, so a raise here would be swallowed and the test would
+            # pass whether or not the turn was retried.
+            type(self).retried = True
+            return None
+
+    service = AssistantService(data=store, ai_provider=DecliningProvider())
+    convo = await service.create("guest-declined", ConversationCreate())
+    reply = await service.respond(
+        convo["id"], "guest-declined", MessageRequest(message="add the sunrise cruise")
+    )
+    assert reply.degraded is True
+    assert reply.message_code == "assistant.msg.unavailable"
+    assert DecliningProvider.retried is False
+    # Anti-vacuity: the tool really did act, so a replay would have been visible.
+    assert "error" not in DecliningProvider.tool_result
+    assert sum(len(cart["items"]) for cart in store.carts.values()) == 1

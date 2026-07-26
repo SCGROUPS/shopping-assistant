@@ -213,23 +213,50 @@ def test_optional_filters_and_multi_category_interests_do_not_block_search():
     assert filters.family_friendly is True
 
 
-async def test_relaxation_recovers_from_zero_results(client: AsyncClient):
+async def test_a_zero_result_search_offers_choices_instead_of_taking_them(client: AsyncClient):
+    """Nothing is given up until the shopper says so.
+
+    This search used to come back full of results, having quietly dropped the
+    duration and rating the shopper asked for. Now it comes back empty and says
+    what is on the table, so someone can ask them.
+    """
+    filters = {
+        "destination": "Hoi An",
+        "category": "Cruise",
+        "max_duration_minutes": 5,
+        "rating": 4.9,
+    }
+    response = await client.post("/api/v1/search", json={"query": "museum", "filters": filters})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["items"] == [], "the service must not relax on its own initiative"
+    assert payload["relaxed_preferences"] == []
+    assert set(payload["relaxation_candidates"]) == {
+        "destination",
+        "category",
+        "max_duration",
+        "rating",
+    }
+
+
+async def test_the_shopper_authorises_exactly_what_is_given_up(client: AsyncClient):
+    """And nothing beyond it, even if more would have found results."""
+    filters = {
+        "destination": "Hoi An",
+        "category": "Cruise",
+        "max_duration_minutes": 5,
+        "rating": 4.9,
+    }
     response = await client.post(
         "/api/v1/search",
-        json={
-            "query": "museum",
-            "filters": {
-                "destination": "Hoi An",
-                "category": "Cruise",
-                "max_duration_minutes": 5,
-                "rating": 4.9,
-            },
-        },
+        json={"query": "museum", "filters": filters, "relax_order": ["max_duration", "rating"]},
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["items"], "relaxation should recover bookable results"
-    assert payload["relaxed_preferences"], "the shopper must be told what changed"
+    assert payload["items"], "authorised relaxation should recover bookable results"
+    assert set(payload["relaxed_preferences"]) <= {"max_duration", "rating"}
+    assert "destination" not in payload["relaxed_preferences"]
+    assert "category" not in payload["relaxed_preferences"]
 
 
 async def test_relaxation_never_drops_accessibility(client: AsyncClient):
@@ -242,6 +269,7 @@ async def test_relaxation_never_drops_accessibility(client: AsyncClient):
                 "max_duration_minutes": 1,
                 "rating": 5.0,
             },
+            "relax_order": ["max_duration", "rating", "budget", "dates", "destination"],
         },
     )
     assert response.status_code == 200
@@ -253,13 +281,49 @@ async def test_relaxation_never_drops_accessibility(client: AsyncClient):
         assert "wheelchair" in features
 
 
-async def test_facets_allow_sideways_drill_down(client: AsyncClient):
+async def test_an_exclusion_survives_every_authorisation(client: AsyncClient):
+    """`exclude` is the one constraint stated negatively, so it is never on offer.
+
+    A shopper who says "no boats" and then agrees to widen their dates has not
+    agreed to be shown a boat.
+    """
     response = await client.post(
         "/api/v1/search",
-        json={"query": "things to do", "filters": {"category": "Food & drink"}},
+        json={
+            "query": "something to do",
+            "filters": {"exclude": ["cruise"], "rating": 5.0, "max_duration_minutes": 1},
+            "relax_order": [
+                "max_duration",
+                "rating",
+                "category",
+                "dates",
+                "budget",
+                "destination",
+                "exclude",
+            ],
+        },
     )
     assert response.status_code == 200
-    facets = response.json()["facets"]
+    payload = response.json()
+    assert "exclude" not in payload["relaxed_preferences"]
+    assert "exclude" not in payload["relaxation_candidates"]
+    for item in payload["items"]:
+        assert "cruise" not in item["title"].casefold()
+
+
+async def test_facets_allow_sideways_drill_down(client: AsyncClient):
+    # "Food & drink" is not a category this catalogue has. The test passed
+    # anyway, because the search used to quietly drop the filter and count
+    # facets over an unfiltered set - so it never once exercised drilling
+    # sideways out of a real category.
+    response = await client.post(
+        "/api/v1/search",
+        json={"query": "things to do", "filters": {"category": "Food"}},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["items"], "'Food' is a real category and must return results"
+    facets = payload["facets"]
     assert len(facets["category"]) > 1, (
         "category counts must ignore the category filter so shoppers can switch tabs"
     )
@@ -429,44 +493,84 @@ class TestExclusionsMatchWholeWords:
     def test_both_backends_are_given_the_same_definition(self) -> None:
         """The in-memory path and the SQL path must rule out the same things.
 
-        They are separate implementations of one rule, and a disagreement
-        between them is invisible: the demo store would exclude a product that
+        They are two implementations of one rule, and a disagreement between
+        them is invisible: the demo store would exclude a product that
         production kept, with every test passing.
+
+        Asserted against a real PostgreSQL, not against a Python
+        re-implementation of the pattern. A parity test that runs `re.search`
+        on both sides is the very defect it exists to catch: it would agree
+        with itself perfectly while Postgres did something else with `\\m`,
+        `unaccent`, or the escaping.
         """
-        import re
+        import asyncio
+        import os
+
+        from sqlalchemy import text as sql_text
+        from sqlalchemy.ext.asyncio import create_async_engine
 
         from app.search.postgres import exclusion_patterns
         from app.search.service import excluded_by
 
+        database_url = os.getenv("POSTGRES_TEST_DATABASE_URL")
+        if not database_url:
+            pytest.skip("POSTGRES_TEST_DATABASE_URL is required for backend parity")
+
         cases = [
-            ("A quiet space museum", "spa", False),
+            ("A quiet space museum and planetarium", "spa", False),
             ("Luxury spa and hot spring", "spa", True),
             ("Marble Mountains half-day tour", "mountain", True),
             ("Sunrise start from Hoi An", "art", False),
-            ("Water sports at My Khe", "water sport", True),
+            ("Barbecue dinner cruise", "bar", False),
+            ("Water sports at My Khe beach", "water sport", True),
+            ("Tour n\u00fai B\u00e0 N\u00e0", "nui", True),
+            # Punctuation between the words. `tokenize` splits on it while the
+            # SQL pattern joined on `\s+`, so Python ruled this out and
+            # production kept showing it to the shopper who said no.
+            ("Water-sports at My Khe beach", "water sport", True),
+            ("Spa/wellness afternoon", "spa", True),
+            ("Half-day tour of the citadel", "half day", True),
+            # ...but the boundary still has to hold inside a word.
+            ("A spacecraft exhibition", "spa", False),
         ]
-        for text_value, term, expected in cases:
-            assert excluded_by(text_value, [term]) is expected, (text_value, term)
-            # Postgres applies `unaccent` before matching; `tokenize` folds the
-            # accents itself, so the Python-side stand-in does the same.
-            pattern = exclusion_patterns([term])[0].replace(r"\m", r"\b").replace(r"\M", r"\b")
-            folded = " ".join(_tokenize(text_value))
-            assert bool(re.search(pattern, folded, re.I)) is expected, (text_value, term)
+
+        async def from_postgres() -> list[bool]:
+            engine = create_async_engine(database_url)
+            try:
+                async with engine.connect() as connection:
+                    results = []
+                    for haystack, term, _ in cases:
+                        # The same shape the search query uses: excluded when
+                        # any pattern matches the unaccented document.
+                        row = await connection.execute(
+                            sql_text(
+                                "SELECT EXISTS ("
+                                "  SELECT 1 FROM unnest(CAST(:patterns AS text[])) p"
+                                "  WHERE unaccent(CAST(:haystack AS text)) ~* p"
+                                ")"
+                            ),
+                            {"patterns": exclusion_patterns([term]), "haystack": haystack},
+                        )
+                        results.append(bool(row.scalar()))
+                    return results
+            finally:
+                await engine.dispose()
+
+        sql_results = asyncio.run(from_postgres())
+        for (haystack, term, expected), in_sql in zip(cases, sql_results, strict=True):
+            assert excluded_by(haystack, [term]) is expected, (haystack, term, "python")
+            assert in_sql is expected, (haystack, term, "postgres")
 
 
-def _tokenize(text_value: str) -> list[str]:
-    from app.common.ranking import tokenize
 
-    return tokenize(text_value)
-
-
-class TestRelaxationOrderIsNotOurs:
+class TestRelaxationIsAuthorisedNotAssumed:
     """Which constraint a shopper can most afford to lose is their judgement.
 
-    The order was a fixed tuple here, so the search decided on everyone's behalf
-    that the language their guide speaks matters more than their budget. The
-    order is now something the caller can state - the agent fills it from what
-    the shopper actually said - and the default only applies when nobody has.
+    The search used to relax on its own initiative down a fixed tuple, so it
+    decided on everyone's behalf that the language their guide speaks matters
+    more than their budget. Stating an order was not enough of a fix - the
+    service still relaxed when nobody had said anything. `order` is now an
+    authorisation: no code in it, nothing given up.
     """
 
     @staticmethod
@@ -477,14 +581,27 @@ class TestRelaxationOrderIsNotOurs:
             **overrides,  # type: ignore[arg-type]
         )
 
-    def test_the_default_order_is_unchanged_when_nobody_states_one(self) -> None:
+    def test_nothing_is_given_up_when_nobody_authorised_anything(self) -> None:
         from app.search.service import relax_until_results
 
-        _, _, relaxed, _ = relax_until_results([], self._filters(), [])
-        # `language` comes before `budget` in the default sequence.
-        assert relaxed.index("language") < relaxed.index("budget")
+        _, filters, relaxed, candidates = relax_until_results([], self._filters(), [])
+        assert relaxed == [], "an unauthorised relaxation is one the shopper never agreed to"
+        # ...and the filters come back untouched, not merely unreported.
+        assert filters.max_total_price == 1.0
+        assert filters.language == "klingon"
+        assert set(candidates) == {"language", "budget"}
 
-    def test_a_stated_order_is_honoured(self) -> None:
+    def test_only_what_was_authorised_is_given_up(self) -> None:
+        from app.search.service import relax_until_results
+
+        _, filters, relaxed, _ = relax_until_results(
+            [], self._filters(), [], order=["budget"]
+        )
+        assert relaxed == ["budget"]
+        assert filters.max_total_price is None
+        assert filters.language == "klingon", "authorising the budget is not authorising the rest"
+
+    def test_an_authorised_order_is_honoured(self) -> None:
         from app.search.service import relax_until_results
 
         _, _, relaxed, _ = relax_until_results(
@@ -492,14 +609,20 @@ class TestRelaxationOrderIsNotOurs:
         )
         assert relaxed.index("budget") < relaxed.index("language")
 
-    def test_an_unknown_code_does_not_discard_the_rest(self) -> None:
-        """The order comes from a model, so it can name something that is gone."""
+    def test_an_unknown_code_authorises_nothing(self) -> None:
+        """The order comes from a model, so it can name something that is gone.
+
+        It must not be read as blanket permission: a code we do not recognise is
+        not a constraint the shopper agreed to lose.
+        """
         from app.search.service import relax_until_results
 
-        _, _, relaxed, _ = relax_until_results(
+        _, filters, relaxed, _ = relax_until_results(
             [], self._filters(), [], order=["not_a_constraint"]
         )
-        assert set(relaxed) == {"language", "budget"}
+        assert relaxed == []
+        assert filters.max_total_price == 1.0
+        assert filters.language == "klingon"
 
     def test_candidates_are_reported_so_the_shopper_can_be_asked(self) -> None:
         from app.search.service import relaxation_candidates

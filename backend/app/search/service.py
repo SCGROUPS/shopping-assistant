@@ -413,9 +413,14 @@ def _widen_dates(filters: SearchFilters) -> None:
     filters.visit_end = end + timedelta(days=DATE_WIDEN_DAYS)
 
 
-# Ordered least-costly first. Accessibility requirements and explicit exclusions are
-# never relaxed: showing a wheelchair user an inaccessible tour is worse than showing
-# nothing at all.
+# The constraints that can be given up at all, and how. Accessibility
+# requirements and explicit exclusions are absent by design: showing a
+# wheelchair user an inaccessible tour is worse than showing nothing at all, and
+# an exclusion is the one thing the shopper stated negatively.
+#
+# The order of this tuple is not a policy. It is only the order in which
+# candidates are listed to whoever is going to ask the shopper; what actually
+# gets relaxed is whatever they authorise, in the order they authorise it.
 #
 # The second element is a *code*, not a label. These are shown to the shopper -
 # "no exact match, so I relaxed your budget" - and they used to be English prose
@@ -442,8 +447,8 @@ def relaxation_candidates(filters: SearchFilters) -> list[str]:
     Reported so the decision does not have to be ours. Which constraint is
     cheapest to lose is the shopper's judgement, not a fact about the
     catalogue - a family may give up their budget before their dates, and a
-    business traveller the reverse - and the ordering below is only a default
-    for when nobody has said.
+    business traveller the reverse - so this only says what is on the table.
+    Nothing here is given up until the shopper names it.
     """
     return [
         code
@@ -458,33 +463,36 @@ def relax_until_results(
     party: Sequence[Participant],
     order: Sequence[str] | None = None,
 ) -> tuple[list[dict[str, Any]], SearchFilters, list[str], list[str]]:
-    """Find results by progressively relaxing constraints, in a stated order.
+    """Give up only the constraints the caller was authorised to give up.
 
-    A zero-result page is the most common exit point in tourism shopping, so the
-    engine trades an exact match for a bookable one and reports what it changed.
+    A zero-result page is the most common exit point in tourism shopping, and
+    this module used to answer it by relaxing constraints on its own initiative
+    until something was bookable. That was a business judgement made here: a
+    shopper who said "under 2,000,000 VND" could be shown a 5,000,000 VND tour,
+    or one who asked for a Korean-speaking guide could be handed an English one,
+    without ever agreeing to it. Reordering that sequence did not fix it - the
+    service was still the one deciding.
 
-    The order used to be fixed here, which made "your budget matters less to you
-    than the language your guide speaks" a judgement this module made on every
-    shopper's behalf. `order` lets the caller state the preference it actually
-    heard - the agent fills it from what the shopper said - and anything left
-    unnamed keeps the default sequence, so saying nothing changes nothing.
+    So nothing is relaxed unless `order` names it. `order` is an authorisation,
+    not a preference: each code in it is a constraint the shopper has agreed to
+    lose, tried in the order given. With no authorisation the exact-match result
+    is returned unchanged, together with the candidates a caller may ask about.
     """
     eligible = [product for product in products if is_eligible(product, filters, party)]
     if eligible:
         return eligible, filters, [], []
 
-    steps = list(RELAXATION_STEPS)
-    if order:
-        ranked = {code: position for position, code in enumerate(order)}
-        # Anything the caller did not name keeps its default position, after
-        # everything they did. A model can name a constraint that no longer
-        # exists, and that must not disturb the rest.
-        default = {code: position for position, (_, code, _) in enumerate(RELAXATION_STEPS)}
-        steps.sort(key=lambda step: ranked.get(step[1], len(ranked) + default[step[1]]))
+    candidates = relaxation_candidates(filters)
+    if not order:
+        # Nothing was authorised, so nothing is given up. The caller - the agent,
+        # or the storefront asking the shopper directly - decides what to offer.
+        return [], filters, [], candidates
+
+    authorised = [step for code in order for step in RELAXATION_STEPS if step[1] == code]
 
     working = filters.model_copy(deep=True)
     relaxed: list[str] = []
-    for field, label, mutate in steps:
+    for field, label, mutate in authorised:
         if getattr(working, field) in (None, [], ""):
             continue
         mutate(working)
@@ -492,7 +500,7 @@ def relax_until_results(
         eligible = [product for product in products if is_eligible(product, working, party)]
         if eligible:
             return eligible, working, relaxed, relaxation_candidates(working)
-    return [], working, relaxed, []
+    return [], working, relaxed, relaxation_candidates(working)
 
 
 FACET_FIELDS: tuple[tuple[str, str], ...] = (

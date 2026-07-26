@@ -89,6 +89,35 @@ export const unresolvedLabels = (codes: string[], t: Translator): string[] =>
     .filter((key): key is MessageKey => Boolean(key))
     .map((key) => t(key))
 
+// What each constraint would cost the shopper to give up, phrased as an offer.
+// Keyed explicitly rather than built as a template string: an unknown code then
+// renders nothing instead of a raw key, and adding a constraint without a label
+// fails the build rather than the storefront.
+const RELAX_OFFER_KEYS: Record<string, MessageKey> = {
+  max_duration: 'app.relaxOffer.choice.max_duration',
+  rating: 'app.relaxOffer.choice.rating',
+  instant_confirmation: 'app.relaxOffer.choice.instant_confirmation',
+  free_cancellation: 'app.relaxOffer.choice.free_cancellation',
+  category: 'app.relaxOffer.choice.category',
+  indoor_outdoor: 'app.relaxOffer.choice.indoor_outdoor',
+  language: 'app.relaxOffer.choice.language',
+  family_friendly: 'app.relaxOffer.choice.family_friendly',
+  dates: 'app.relaxOffer.choice.dates',
+  budget: 'app.relaxOffer.choice.budget',
+  destination: 'app.relaxOffer.choice.destination',
+}
+
+export const relaxOfferChoices = (
+  codes: string[],
+  t: Translator,
+): { code: string; label: string }[] =>
+  codes
+    .map((code) => ({ code, key: RELAX_OFFER_KEYS[code] }))
+    .filter((entry): entry is { code: string; key: MessageKey } =>
+      Boolean(entry.key),
+    )
+    .map((entry) => ({ code: entry.code, label: t(entry.key) }))
+
 export const relaxationSentence = (
   codes: string[],
   locale: string,

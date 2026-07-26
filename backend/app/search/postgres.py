@@ -26,7 +26,11 @@ def exclusion_patterns(exclusions: list[str]) -> list[str]:
         terms = tokenize(exclusion)
         if not terms:
             continue
-        body = r"\s+".join(re.escape(term) for term in terms)
+        # Any run of non-alphanumerics between the words, not just whitespace.
+        # `tokenize` splits on punctuation, so Python excluded `Water-sports`
+        # while `\s+` left it in the Postgres results - the shopper ruled it out
+        # and production showed it to them anyway.
+        body = "[^[:alnum:]]+".join(re.escape(term) for term in terms)
         patterns.append(rf"\m{body}(s|es)?\M")
     return patterns
 

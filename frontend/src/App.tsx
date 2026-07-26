@@ -46,7 +46,11 @@ import {
 } from './lib/api'
 import { formatCount, formatDate as intlDate, formatMoney } from './lib/format'
 import { LocaleProvider } from './lib/LocaleContext'
-import { relaxationSentence, unresolvedLabels } from './lib/badges'
+import {
+  relaxationSentence,
+  relaxOfferChoices,
+  unresolvedLabels,
+} from './lib/badges'
 import { buildTranslator } from './lib/useLocale'
 import type { Translator } from './lib/useLocale'
 import { chromeReady, isFallback, resolveText, translate } from './lib/i18n'
@@ -204,6 +208,13 @@ function App() {
   }>({ query: '', filters: {}, resultIds: [] })
   const viewedIds = useRef<string[]>([])
   const [relaxedPreferences, setRelaxedPreferences] = useState<string[]>([])
+  // Constraints the shopper could give up, offered rather than taken. The
+  // search no longer relaxes anything by itself, so this is how a zero-result
+  // page becomes a choice instead of a dead end.
+  const [relaxationCandidates, setRelaxationCandidates] = useState<string[]>([])
+  const [authorisedRelaxations, setAuthorisedRelaxations] = useState<string[]>(
+    [],
+  )
   const [unresolvedConstraints, setUnresolvedConstraints] = useState<string[]>(
     [],
   )
@@ -619,12 +630,18 @@ function App() {
     searchQuery = query,
     extraFilters: SearchFilters = {},
     announce = true,
+    relaxOrder: string[] = [],
   ) => {
     setSearching(true)
     setHasSearched(true)
     const filters: SearchFilters = { ...liveFilters(), ...extraFilters }
     try {
-      const result = await api.search(searchQuery, filters, travellers)
+      const result = await api.search(
+        searchQuery,
+        filters,
+        travellers,
+        relaxOrder,
+      )
       api.track('search_submitted', {
         result_count: result.items.length,
         conversational: result.interactionMode === 'assistant',
@@ -638,6 +655,8 @@ function App() {
       }
       setProducts(result.items)
       setRelaxedPreferences(result.relaxedPreferences)
+      setRelaxationCandidates(result.relaxationCandidates)
+      setAuthorisedRelaxations(relaxOrder)
       setUnresolvedConstraints(result.unresolvedConstraints)
       setFacets(result.facets)
       setSearchContext({
@@ -1516,6 +1535,42 @@ function App() {
               </p>
             </div>
           )}
+
+          {/* The search used to answer an empty page by dropping constraints on
+              the shopper's behalf, so someone who said "under 2,000,000 VND"
+              could be shown a tour at three times that. It now returns nothing
+              and says what is on the table; the choice is made here, by them. */}
+          {!searching &&
+            hasSearched &&
+            products.length === 0 &&
+            relaxationCandidates.length > 0 && (
+              <div className="relaxation-offer" role="group">
+                <p className="relaxation-offer__lead">
+                  {t('app.relaxOffer.lead')}
+                </p>
+                <div className="relaxation-offer__choices">
+                  {relaxOfferChoices(relaxationCandidates, t).map(
+                    ({ code, label }) => (
+                      <button
+                        key={code}
+                        type="button"
+                        className="relaxation-offer__choice"
+                        onClick={() => {
+                          const next = [...authorisedRelaxations, code]
+                          api.track('search_relaxation_authorised', {
+                            code,
+                            authorised: next,
+                          })
+                          void runSearch(query, {}, false, next)
+                        }}
+                      >
+                        {label}
+                      </button>
+                    ),
+                  )}
+                </div>
+              </div>
+            )}
 
           {searching || bootstrapping ? (
             <div className="product-grid skeleton-grid">

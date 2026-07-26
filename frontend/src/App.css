@@ -506,6 +506,45 @@
   margin: 0;
 }
 
+/* A zero-result page is now a question, not a dead end: the search stopped
+   deciding which of the shopper's constraints to discard, so these are the
+   choices it offers instead. */
+.relaxation-offer {
+  background: #f6f8fb;
+  border: 1px solid #dbe3ee;
+  border-radius: 14px;
+  margin-bottom: 20px;
+  padding: 18px;
+}
+
+.relaxation-offer__lead {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+
+.relaxation-offer__choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.relaxation-offer__choice {
+  background: #fff;
+  border: 1px solid #c6d2e2;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 8px 14px;
+}
+
+.relaxation-offer__choice:hover,
+.relaxation-offer__choice:focus-visible {
+  background: var(--green);
+  border-color: var(--green);
+  color: #fff;
+}
+
 .search-submit {
   align-items: center;
   background: var(--green);

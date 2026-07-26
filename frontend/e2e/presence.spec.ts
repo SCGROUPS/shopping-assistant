@@ -119,3 +119,70 @@ test('the launcher offers to widen dates when nothing matches', async ({
   await search.press('Enter')
   await expect(page.locator('.assistant-nudge')).toBeHidden()
 })
+
+test('a zero-result search offers choices instead of quietly dropping constraints', async ({
+  page,
+}) => {
+  // The search used to answer an empty page by discarding whichever constraint
+  // its own table ranked cheapest, so a shopper who set a budget could be shown
+  // something well over it and only find out from a banner. Nothing is given up
+  // now until they say so, and this is where they say it.
+  await page.goto('/')
+  await expect(page.locator('.product-grid .product-card').first()).toBeVisible({
+    timeout: 60_000,
+  })
+
+  const authorised: string[][] = []
+  await page.route('**/api/v1/search', async (route) => {
+    const body = route.request().postDataJSON() as { relax_order?: string[] }
+    const order = body.relax_order ?? []
+    authorised.push(order)
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        query_id: '00000000-0000-0000-0000-000000000000',
+        effective_filters: {},
+        // Results appear only once the shopper has authorised something.
+        items: order.includes('budget')
+          ? [
+              {
+                id: '11111111-1111-1111-1111-111111111111',
+                title: 'Sunset river cruise',
+                destination: 'Hoi An',
+                category: 'Cruise',
+                price: 1_500_000,
+                currency: 'VND',
+                rating: 4.8,
+                images: [],
+              },
+            ]
+          : [],
+        facets: {},
+        relaxed_preferences: order.includes('budget') ? ['budget'] : [],
+        relaxation_candidates: order.includes('budget')
+          ? []
+          : ['budget', 'dates'],
+      }),
+    })
+  })
+
+  const search = page.getByTestId('trip-search')
+  await search.fill('a cruise under my budget')
+  await search.press('Enter')
+
+  const offer = page.locator('.relaxation-offer')
+  await expect(offer).toBeVisible({ timeout: 30_000 })
+  await expect(offer).toContainText('Which of these could you set aside?')
+  await expect(page.locator('.product-grid .product-card')).toHaveCount(0)
+
+  // The first request must have authorised nothing at all.
+  expect(authorised[authorised.length - 1]).toEqual([])
+
+  await offer.getByRole('button', { name: 'Go over my budget' }).click()
+
+  await expect(page.locator('.product-grid .product-card')).toHaveCount(1)
+  await expect(page.locator('.relaxation-notice')).toContainText('budget')
+  await expect(offer).toBeHidden()
+  expect(authorised[authorised.length - 1]).toEqual(['budget'])
+})

@@ -188,6 +188,7 @@ const KNOWN_MESSAGE_CODES = new Set([
   'assistant.msg.checkoutTotal',
   'assistant.msg.cannotBookYet',
   'assistant.msg.booked',
+  'assistant.msg.unavailable',
 ])
 
 /**
@@ -702,11 +703,13 @@ export const api = {
     query: string,
     filters: SearchFilters,
     partySize: number,
+    relaxOrder: string[] = [],
   ): Promise<{
     items: Experience[]
     intent?: Record<string, unknown>
     effectiveFilters: SearchFilters
     relaxedPreferences: string[]
+    relaxationCandidates: string[]
     unresolvedConstraints: string[]
     facets: Record<string, Record<string, number>>
     interactionMode: 'assistant' | 'grid' | 'undetermined'
@@ -722,6 +725,9 @@ export const api = {
           sort: 'recommended',
           page_size: 24,
           display_currency: displayCurrency,
+          // Only what the shopper has agreed to give up. The server relaxes
+          // nothing on its own, so an empty list keeps their search exact.
+          relax_order: relaxOrder,
         }),
       })
       return {
@@ -730,6 +736,7 @@ export const api = {
         effectiveFilters:
           (payload.effective_filters as SearchFilters | undefined) ?? filters,
         relaxedPreferences: readRelaxations(payload.relaxed_preferences),
+        relaxationCandidates: readRelaxations(payload.relaxation_candidates),
         unresolvedConstraints: readUnresolved(payload.unresolved_constraints),
         facets:
           (payload.facets as Record<string, Record<string, number>>) ?? {},
@@ -746,6 +753,7 @@ export const api = {
         items: filterDemoProducts(query, filters),
         effectiveFilters: filters,
         relaxedPreferences: [],
+        relaxationCandidates: [],
         unresolvedConstraints: [],
         facets: {},
         // The demo catalogue is a fixture, not a judgement about the shopper.

@@ -17,7 +17,13 @@ from app.api.schemas import (
     SearchFilters,
     SearchRequest,
 )
-from app.assistant.provider import AIProvider, ToolPlan, build_ai_provider
+from app.assistant.provider import (
+    AIProvider,
+    ToolPlan,
+    build_ai_provider,
+    carries_injected_channel,
+    names_unoffered_id,
+)
 from app.bookings.service import BookingService
 from app.cart.service import CartService
 from app.catalog.service import get_product_async, product_card, product_detail
@@ -431,6 +437,20 @@ class AssistantService:
             return None
         if answer is None:
             return None
+        if answer.declined:
+            # The agent's tools have already run by the time its final answer is
+            # refused. Falling through to the deterministic path would replay
+            # them - the same experience added to the cart twice - so this turn
+            # ends here, saying plainly that the reply could not be shown.
+            logger.warning("Agent answer declined; not retrying the turn")
+            return AssistantResponse(
+                message=(
+                    "I could not put together a reply I can stand behind. "
+                    "Please ask me again."
+                ),
+                message_code="assistant.msg.unavailable",
+                degraded=True,
+            )
 
         products: list[AssistantProduct] = []
         for selection in answer.selections:
@@ -654,9 +674,19 @@ class AssistantService:
         message_code: str | None = "assistant.msg.searchResults"
         try:
             enhanced = await self.ai.enhance_assistant(message, facts)
-            if enhanced:
-                message_text = enhanced
-                message_code = None
+            # This is model prose reaching the shopper, so it answers to the
+            # same rule as the agent's: no channel a tool could not have
+            # produced, and no experience that is not on the page. It used to be
+            # rendered verbatim, which made the "deterministic fallback" a
+            # second, unguarded way for injected catalogue text to get through.
+            if enhanced and not carries_injected_channel(enhanced):
+                if not names_unoffered_id(enhanced, set(ids)):
+                    message_text = enhanced
+                    message_code = None
+                else:
+                    logger.warning("Enhanced prose named an offering not on the page; keeping code")
+            elif enhanced:
+                logger.warning("Enhanced prose carried a contact channel; keeping the coded message")
         except Exception:
             logger.exception("Grounded assistant prose enhancement failed")
         return AssistantResponse(

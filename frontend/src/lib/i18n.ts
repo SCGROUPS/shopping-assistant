@@ -204,6 +204,20 @@ const en = {
     'to keep bookable options on screen. Your accessibility needs were kept intact.',
   'app.relaxed.note':
     'Mai can relax a preference while keeping your important constraints intact.',
+  // Offered, not applied. Nothing is given up until the shopper picks one.
+  'app.relaxOffer.lead':
+    'Nothing matches everything you asked for. Which of these could you set aside?',
+  'app.relaxOffer.choice.max_duration': 'Allow longer experiences',
+  'app.relaxOffer.choice.rating': 'Allow a lower rating',
+  'app.relaxOffer.choice.instant_confirmation': 'Allow non-instant confirmation',
+  'app.relaxOffer.choice.free_cancellation': 'Allow no free cancellation',
+  'app.relaxOffer.choice.category': 'Allow other categories',
+  'app.relaxOffer.choice.indoor_outdoor': 'Allow indoor or outdoor',
+  'app.relaxOffer.choice.language': 'Allow another guide language',
+  'app.relaxOffer.choice.family_friendly': 'Allow non-family experiences',
+  'app.relaxOffer.choice.dates': 'Widen my dates',
+  'app.relaxOffer.choice.budget': 'Go over my budget',
+  'app.relaxOffer.choice.destination': 'Look in other destinations',
   'app.plan.lede':
     'These experiences work together by location, pace, and time of day. Add one and Mai will reshape the rest of your plan.',
   'app.plan.sample': 'Market-to-table class · Hoi An',
@@ -353,6 +367,8 @@ const en = {
     'I cannot book yet. Ask me to prepare the checkout first so you can review the total.',
   'assistant.msg.booked':
     'Your simulated booking {booking} is confirmed. Voucher {voucher} is ready.',
+  'assistant.msg.unavailable':
+    'I could not put together a reply I can stand behind, so I have not shown it. Nothing was booked. Please ask me again.',
   'assistant.reserveFailed':
     'I could not reserve {title} because its availability changed. Please choose another time or experience.',
   'assistant.addedToTrip':
@@ -611,6 +627,19 @@ const vi: Dictionary = {
     'để giữ lại những lựa chọn còn đặt được. Các nhu cầu hỗ trợ tiếp cận của bạn không bao giờ bị nới lỏng.',
   'app.relaxed.note':
     'Mai có thể nới lỏng một tiêu chí mà vẫn giữ nguyên những điều kiện quan trọng với bạn.',
+  'app.relaxOffer.lead':
+    'Không có lựa chọn nào khớp với tất cả yêu cầu của bạn. Bạn có thể bỏ bớt tiêu chí nào?',
+  'app.relaxOffer.choice.max_duration': 'Chấp nhận thời lượng dài hơn',
+  'app.relaxOffer.choice.rating': 'Chấp nhận đánh giá thấp hơn',
+  'app.relaxOffer.choice.instant_confirmation': 'Không cần xác nhận tức thì',
+  'app.relaxOffer.choice.free_cancellation': 'Không cần hủy miễn phí',
+  'app.relaxOffer.choice.category': 'Xem thêm danh mục khác',
+  'app.relaxOffer.choice.indoor_outdoor': 'Trong nhà hay ngoài trời đều được',
+  'app.relaxOffer.choice.language': 'Chấp nhận ngôn ngữ hướng dẫn khác',
+  'app.relaxOffer.choice.family_friendly': 'Không cần phù hợp gia đình',
+  'app.relaxOffer.choice.dates': 'Mở rộng ngày đi',
+  'app.relaxOffer.choice.budget': 'Vượt ngân sách một chút',
+  'app.relaxOffer.choice.destination': 'Tìm ở điểm đến khác',
   'app.plan.lede':
     'Những trải nghiệm này kết hợp tốt với nhau về địa điểm, nhịp độ và thời điểm trong ngày.',
   'app.plan.sample': 'Lớp nấu ăn từ chợ đến bàn · Hội An',
@@ -744,6 +773,8 @@ const vi: Dictionary = {
     'Tôi chưa thể đặt chỗ. Hãy yêu cầu tôi chuẩn bị thanh toán trước để bạn xem lại tổng tiền.',
   'assistant.msg.booked':
     'Đơn đặt mô phỏng {booking} của bạn đã được xác nhận. Phiếu {voucher} đã sẵn sàng.',
+  'assistant.msg.unavailable':
+    'Tôi chưa soạn được câu trả lời đủ tin cậy nên không hiển thị. Không có đơn nào được đặt. Vui lòng hỏi lại giúp tôi.',
   'assistant.reserveFailed':
     'Tôi không thể giữ chỗ {title} vì tình trạng chỗ đã thay đổi. Vui lòng chọn khung giờ hoặc trải nghiệm khác.',
   'assistant.addedToTrip':
