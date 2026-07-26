@@ -133,8 +133,13 @@ def test_no_call_site_anywhere_asks_for_an_unsupported_effort():
 
 
 # Which efforts each deployment accepts, established against the live endpoint
-# rather than from documentation. The disagreement between the two rows is the
+# rather than from documentation. The disagreement between the rows is the
 # entire hazard: there is no value that is safe on both.
+#
+# gpt-5-nano has since been deleted from the account, so its row can no longer
+# be re-checked against anything. It stays because it is the row that caused the
+# outage - it is the only one that accepts "minimal" and the only one that
+# rejects "none" - and deleting it would leave the rule below looking arbitrary.
 EFFORTS_BY_MODEL = {
     "gpt-5-nano": {"minimal", "low", "medium", "high"},
     "gpt-5.4-nano": {"none", "low", "medium", "high", "xhigh"},
