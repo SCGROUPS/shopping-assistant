@@ -25,7 +25,7 @@ from openai import (
     NotFoundError,
     RateLimitError,
 )
-from sqlalchemy import select, text, update
+from sqlalchemy import event, select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.common.config import get_settings
@@ -43,8 +43,10 @@ from app.common.models import (
 from app.content import spend
 from app.content import translator as translator_module
 from app.content.enqueue import (
+    EXPERIENCE_FIELDS,
     enqueue_experience_translations,
     mark_manual_translation,
+    target_locales,
 )
 from app.content.fingerprints import (
     desired_fingerprint,
@@ -1122,3 +1124,42 @@ async def test_a_settlement_cannot_credit_a_day_it_never_charged(factory):
         assert await spend.spent_today(session) == Decimal("0"), (
             "today must not absorb yesterday's correction"
         )
+
+
+async def test_enqueueing_an_experience_does_not_scale_round_trips_with_locales(factory):
+    """Statement count is a correctness property when the database is elsewhere.
+
+    The application runs in a different Azure region from PostgreSQL, so every
+    statement costs a real round trip. Inserting each field row and each job
+    individually is 4 fields x 7 locales x 2 = 56 of them per experience, which
+    added ten minutes to the catalogue job across the live catalogue. The work
+    is decided in memory and written in two statements instead.
+
+    Pinned rather than described, because this is exactly the kind of thing a
+    later refactor reintroduces while every behavioural test still passes.
+    """
+    statements: list[str] = []
+
+    async with factory() as session:
+        connection = await session.connection()
+
+        def record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement.split()[0].upper())
+
+        event.listen(connection.sync_connection.engine, "before_cursor_execute", record)
+        try:
+            enqueued = await enqueue_experience_translations(session, EXPERIENCE_ID)
+            await session.commit()
+        finally:
+            event.remove(connection.sync_connection.engine, "before_cursor_execute", record)
+
+    locales = len(target_locales("en"))
+    assert enqueued == len(EXPERIENCE_FIELDS) * locales
+
+    inserts = statements.count("INSERT")
+    assert inserts == 2, (
+        f"one insert for the field rows and one for the jobs, got {inserts}: {statements}"
+    )
+    assert len(statements) <= 6, (
+        f"a fixed cost per experience, not one per locale, got {len(statements)}"
+    )

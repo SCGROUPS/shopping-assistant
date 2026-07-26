@@ -144,7 +144,15 @@ async def enqueue_experience_translations(
         ).all()
     }
 
-    enqueued = 0
+    # Everything below is decided in memory and written in two statements. The
+    # obvious shape - insert the field, then insert its job, per (field, locale)
+    # - is 56 round trips per experience, and the application runs in a
+    # different region from the database. That cost the catalogue job ten extra
+    # minutes on the deploy that introduced it. Nothing about the decisions
+    # changed; only how many times they cross the network.
+    pending_rows: list[dict] = []
+    job_values: list[dict] = []
+
     for field in EXPERIENCE_FIELDS:
         text_value = getattr(experience, field, "") or ""
         for locale in wanted:
@@ -154,101 +162,156 @@ async def enqueue_experience_translations(
                 locale=locale,
             )
             row = existing.get((field, locale))
-            provenance = row.provenance if row is not None else "machine"
-            desired = desired_fingerprint(
-                source=source, recipe=recipe, provenance=provenance
-            )
 
             if row is None:
-                generation = 0
-                inserted = await session.execute(
-                    pg_insert(TranslationField)
-                    .values(
-                        entity_type=ENTITY_EXPERIENCE,
-                        entity_id=experience_id,
-                        field=field,
-                        locale=locale,
-                        provenance=provenance,
-                        status="pending",
-                        published_fingerprint=None,
-                        desired_fingerprint=desired,
-                        generation=generation,
-                    )
-                    .on_conflict_do_nothing()
-                    .returning(TranslationField.entity_id)
+                # A row that does not exist yet is machine-owned by definition:
+                # a human cannot have claimed a field nobody has created.
+                pending_rows.append(
+                    {
+                        "entity_type": ENTITY_EXPERIENCE,
+                        "entity_id": experience_id,
+                        "field": field,
+                        "locale": locale,
+                        "provenance": "machine",
+                        "status": "pending",
+                        "published_fingerprint": None,
+                        "desired_fingerprint": desired_fingerprint(
+                            source=source, recipe=recipe, provenance="machine"
+                        ),
+                        "generation": 0,
+                    }
                 )
-                if inserted.scalar_one_or_none() is None:
-                    # Another caller created the row between our locked read and
-                    # this insert, so `DO NOTHING` did exactly that - and taking
-                    # the insert branch anyway would enqueue a job for a
-                    # generation the surviving row does not have. Re-read it
-                    # under the lock and treat it as the update it now is.
-                    row = await session.get(
-                        TranslationField,
-                        (ENTITY_EXPERIENCE, experience_id, field, locale),
-                        with_for_update=True,
-                    )
-                    if row is None:
-                        continue
-                    provenance = row.provenance
-                    desired = desired_fingerprint(
-                        source=source, recipe=recipe, provenance=provenance
-                    )
-                    # `source` and `recipe` were both computed under the
-                    # experience lock this transaction holds, so they cannot
-                    # have moved while we waited for the row lock here.
-                    if row.desired_fingerprint == desired:
-                        continue
-                    generation = row.generation + 1
-                    row.desired_fingerprint = desired
-                    row.generation = generation
-                    row.status = "pending"
-                    row.candidate_value = None
-                    row.candidate_fingerprint = None
-            elif row.desired_fingerprint != desired:
-                generation = row.generation + 1
-                row.desired_fingerprint = desired
-                row.generation = generation
-                # A rejected row reopens only when what it should say changes -
-                # which is exactly here. Anything already `current` becomes
-                # pending again because it now answers text that has moved.
-                row.status = "pending"
-                # The candidate answered the old fingerprint. Keeping it would
-                # let a reviewer approve text that describes a title nobody has.
-                row.candidate_value = None
-                row.candidate_fingerprint = None
-            else:
+                continue
+
+            desired = desired_fingerprint(
+                source=source, recipe=recipe, provenance=row.provenance
+            )
+            if row.desired_fingerprint == desired:
                 # Nothing to do, and crucially no job: a hundred re-imports of
                 # unchanged content must create no work at all.
                 continue
 
-            if provenance == "manual":
+            row.generation += 1
+            row.desired_fingerprint = desired
+            # A rejected row reopens only when what it should say changes -
+            # which is exactly here. Anything already `current` becomes pending
+            # again because it now answers text that has moved.
+            row.status = "pending"
+            # The candidate answered the old fingerprint. Keeping it would let a
+            # reviewer approve text that describes a title nobody has.
+            row.candidate_value = None
+            row.candidate_fingerprint = None
+
+            if row.provenance == "manual":
                 # A human owns this field. It is now marked stale so the console
                 # can surface it, but no machine job is created - a translator
                 # outranks the model, and silently overwriting them is the
                 # failure this whole table exists to prevent.
                 continue
 
-            result = await session.execute(
-                pg_insert(TranslationJob)
-                .values(
-                    id=uuid.uuid4(),
-                    entity_type=ENTITY_EXPERIENCE,
-                    entity_id=experience_id,
-                    field=field,
-                    locale=locale,
-                    fingerprint=desired,
-                    generation=generation,
-                    status="queued",
-                    attempts=0,
-                )
-                .on_conflict_do_nothing(constraint="ux_translation_job_target")
-                .returning(TranslationJob.id)
+            job_values.append(
+                _job_values(experience_id, field, locale, desired, row.generation)
             )
-            if result.scalar_one_or_none() is not None:
-                enqueued += 1
 
-    return enqueued
+    if pending_rows:
+        landed = await session.execute(
+            pg_insert(TranslationField)
+            .values(pending_rows)
+            .on_conflict_do_nothing()
+            .returning(TranslationField.field, TranslationField.locale)
+        )
+        created = set(landed.all())
+        for spec in pending_rows:
+            key = (spec["field"], spec["locale"])
+            if key in created:
+                job_values.append(
+                    _job_values(
+                        experience_id, key[0], key[1], spec["desired_fingerprint"], 0
+                    )
+                )
+                continue
+            # Another caller created the row between our locked read and this
+            # insert, so `DO NOTHING` did exactly that - and enqueueing against
+            # generation 0 anyway would describe a generation the surviving row
+            # does not have. Rare enough to be worth a round trip each.
+            recovered = await _adopt_concurrent_row(
+                session,
+                experience_id=experience_id,
+                field=key[0],
+                locale=key[1],
+                text_value=getattr(experience, key[0], "") or "",
+                source_language=experience.source_language,
+                recipe=recipe,
+            )
+            if recovered is not None:
+                job_values.append(recovered)
+
+    if not job_values:
+        return 0
+
+    enqueued = await session.execute(
+        pg_insert(TranslationJob)
+        .values(job_values)
+        .on_conflict_do_nothing(constraint="ux_translation_job_target")
+        .returning(TranslationJob.id)
+    )
+    return len(enqueued.all())
+
+
+def _job_values(
+    experience_id: uuid.UUID, field: str, locale: str, fingerprint: str, generation: int
+) -> dict:
+    return {
+        "id": uuid.uuid4(),
+        "entity_type": ENTITY_EXPERIENCE,
+        "entity_id": experience_id,
+        "field": field,
+        "locale": locale,
+        "fingerprint": fingerprint,
+        "generation": generation,
+        "status": "queued",
+        "attempts": 0,
+    }
+
+
+async def _adopt_concurrent_row(
+    session: AsyncSession,
+    *,
+    experience_id: uuid.UUID,
+    field: str,
+    locale: str,
+    text_value: str,
+    source_language: str,
+    recipe: str,
+) -> dict | None:
+    """Treat a row that appeared under us as the update it now is."""
+    row = await session.get(
+        TranslationField,
+        (ENTITY_EXPERIENCE, experience_id, field, locale),
+        with_for_update=True,
+    )
+    if row is None:
+        return None
+
+    source = source_fingerprint(
+        text=text_value, source_language=source_language, locale=locale
+    )
+    desired = desired_fingerprint(
+        source=source, recipe=recipe, provenance=row.provenance
+    )
+    # `text_value` and `recipe` were both read under the experience lock this
+    # transaction holds, so neither can have moved while we waited for the row.
+    if row.desired_fingerprint == desired:
+        return None
+
+    row.generation += 1
+    row.desired_fingerprint = desired
+    row.status = "pending"
+    row.candidate_value = None
+    row.candidate_fingerprint = None
+    if row.provenance == "manual":
+        return None
+    return _job_values(experience_id, field, locale, desired, row.generation)
 
 
 async def mark_manual_translation(
