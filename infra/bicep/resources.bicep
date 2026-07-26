@@ -608,6 +608,35 @@ resource alertRecipients 'Microsoft.Insights/actionGroups@2023-01-01' = if (!emp
   }
 }
 
+// KQL bodies as literals with a placeholder. Bicep does not interpolate a
+// multi-line string, so the app name is substituted with replace() below.
+var kqlAppFilter = '''
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == '__APP__'
+| where Log_s has 'Intent extraction failed'
+| summarize FailedSearches = count()
+'''
+
+// Only a rejection. "gave up" is logged on the ok=True unverified path, where
+// the revision serves normally - paging sev-0 for that teaches people to
+// ignore the rule that means the storefront is dark.
+// The probe answered "cannot tell" rather than "no". The revision serves, so
+// this is not an outage - but a probe that never manages to ask is how the
+// gate silently stops being a gate, which is worth knowing without paging.
+var kqlProbeUnverified = '''
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == '__APP__'
+| where Log_s has_any ('Intent probe gave up', 'Intent probe did not answer', 'Intent probe crashed')
+| summarize UnverifiedProbes = count()
+'''
+
+var kqlProbeFilter = '''
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == '__APP__'
+| where Log_s has 'Intent probe' and Log_s has 'rejected'
+| summarize RejectedProbes = count()
+'''
+
 // Compiles to resourceId(), which is a pure string function, so it stays
 // valid when no email was given and the action group was never deployed.
 var alertActions = empty(alertEmail) ? [] : [alertRecipients.id]
@@ -633,12 +662,11 @@ resource intentFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-p
           // it swings between 0 and 1 on no real signal - and the provider has
           // already retried twice before this line is ever written, so a single
           // occurrence is a shopper who got an unfiltered page, not a blip.
-          query: '''
-ContainerAppConsoleLogs_CL
-| where ContainerAppName_s == '${appName}'
-| where Log_s has 'Intent extraction failed'
-| summarize FailedSearches = count()
-'''
+          // replace(), not interpolation: a Bicep multi-line string is literal, so
+          // '${appName}' compiles into the KQL verbatim and the rule matches
+          // nothing forever. It still deploys, still shows green, and stays
+          // silent through the outage it was written for.
+          query: replace(kqlAppFilter, '__APP__', appName)
           timeAggregation: 'Total'
           metricMeasureColumn: 'FailedSearches'
           operator: 'GreaterThan'
@@ -673,14 +701,44 @@ resource intentProbeAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
     criteria: {
       allOf: [
         {
-          query: '''
-ContainerAppConsoleLogs_CL
-| where ContainerAppName_s == '${appName}'
-| where Log_s has 'Intent probe' and Log_s has_any ('rejected', 'gave up')
-| summarize RejectedProbes = count()
-'''
+          query: replace(kqlProbeFilter, '__APP__', appName)
           timeAggregation: 'Total'
           metricMeasureColumn: 'RejectedProbes'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: alertActions
+    }
+  }
+}
+
+resource intentProbeUnverifiedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'alert-${prefix}-intent-probe-unverified'
+  location: location
+  properties: {
+    displayName: 'Vietra: the readiness gate could not check itself'
+    description: 'The startup probe could not get an answer from the intent deployment and let the revision serve unverified. Nothing is down, but the protection against shipping a revision that understands nobody was not actually applied.'
+    severity: 3
+    enabled: true
+    scopes: [
+      logs.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          query: replace(kqlProbeUnverified, '__APP__', appName)
+          timeAggregation: 'Total'
+          metricMeasureColumn: 'UnverifiedProbes'
           operator: 'GreaterThan'
           threshold: 0
           failingPeriods: {
