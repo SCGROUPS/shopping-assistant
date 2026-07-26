@@ -10,13 +10,22 @@ recoverable by retrying.
 import asyncio
 import os
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
+import httpx
 import pytest
 from conftest import create_postgres_schema, reset_postgres
-from sqlalchemy import select, update
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    InternalServerError,
+    NotFoundError,
+    RateLimitError,
+)
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.common.config import get_settings
@@ -942,11 +951,11 @@ async def test_the_daily_budget_is_not_refunded_by_restarting_the_worker(factory
     limit = 0.05
 
     async with factory() as first:
-        assert await spend.reserve(first, limit, Decimal("0.04")) is True
+        assert await spend.reserve(first, limit, Decimal("0.04")) is not None
         await first.commit()
 
     async with factory() as second:
-        assert await spend.reserve(second, limit, Decimal("0.04")) is False, (
+        assert await spend.reserve(second, limit, Decimal("0.04")) is None, (
             "a second process must see what the first already spent"
         )
         await second.commit()
@@ -966,13 +975,13 @@ async def test_an_overrun_is_recorded_rather_than_hidden(factory):
     """
     limit = 1.0
     async with factory() as session:
-        assert await spend.reserve(session, limit, Decimal("0.01")) is True
-        await spend.settle(session, Decimal("0.01"), Decimal("2.50"))
+        day = await spend.reserve(session, limit, Decimal("0.01"))
+        await spend.settle(session, day, Decimal("0.01"), Decimal("2.50"))
         await session.commit()
 
     async with factory() as session:
         assert await spend.spent_today(session) == Decimal("2.5000")
-        assert await spend.reserve(session, limit) is False
+        assert await spend.reserve(session, limit) is None
 
 
 async def test_a_swept_job_does_not_strand_its_field(factory):
@@ -1024,18 +1033,31 @@ async def test_an_unrecognised_failure_is_not_retried_on_a_schedule(factory):
     assert classify(TimeoutError()) == "transient"
     assert classify(ConnectionError()) == "transient"
     assert classify(AttributeError("'NoneType' object has no attribute 'client'")) == "permanent"
-    assert classify(PermissionError()) == "transient", "an OSError subclass is a socket error"
     assert classify(GlossaryViolation("missing term")) == "permanent"
     assert classify(RuntimeError("translator returned nothing")) == "permanent"
+    # An earlier version made every OSError transient to catch "socket errors".
+    # These are the ones it actually caught.
+    assert classify(PermissionError()) == "permanent"
+    assert classify(FileNotFoundError()) == "permanent"
 
-    class ApiError(Exception):
-        def __init__(self, status_code: int) -> None:
-            self.status_code = status_code
+    # The classification has to match the exceptions the installed SDK really
+    # raises. `APIConnectionError` does not derive from `OSError` or
+    # `ConnectionError`, so inferring from base classes parked real outages.
+    request = httpx.Request("POST", "https://example.invalid/openai")
+    assert classify(APIConnectionError(request=request)) == "transient"
+    assert classify(APITimeoutError(request=request)) == "transient"
 
-    assert classify(ApiError(429)) == "transient", "rate limited means come back later"
-    assert classify(ApiError(503)) == "transient"
-    assert classify(ApiError(401)) == "permanent", "a bad credential will not fix itself"
-    assert classify(ApiError(404)) == "permanent", "a missing deployment is a config error"
+    def _status(cls, code: int):
+        return cls(
+            "boom",
+            response=httpx.Response(code, request=request),
+            body=None,
+        )
+
+    assert classify(_status(RateLimitError, 429)) == "transient", "rate limited means later"
+    assert classify(_status(InternalServerError, 503)) == "transient"
+    assert classify(_status(AuthenticationError, 401)) == "permanent", "a bad key stays bad"
+    assert classify(_status(NotFoundError, 404)) == "permanent", "a missing deployment is config"
 
 
 async def test_a_budget_smaller_than_one_call_buys_nothing(factory):
@@ -1047,8 +1069,56 @@ async def test_a_budget_smaller_than_one_call_buys_nothing(factory):
     stop, and it has to work on the first call, not the second.
     """
     async with factory() as session:
-        assert await spend.reserve(session, 0.001) is False
+        assert await spend.reserve(session, 0.001) is None
         await session.commit()
 
     async with factory() as session:
         assert await spend.spent_today(session) == Decimal("0")
+
+
+async def test_a_call_without_reported_usage_still_costs_money(factory):
+    """`usage` is optional in the SDK, and a missing one is not a free call.
+
+    Settling an unknown cost as zero credits the whole reservation back on every
+    successful call, so on a provider that omits usage the ledger never advances
+    and the ceiling is never reached - the budget silently stops existing. The
+    conservative reservation is kept instead.
+    """
+    limit = 10.0
+    async with factory() as session:
+        day = await spend.reserve(session, limit)
+        assert day is not None
+        await spend.settle(session, day, spend.ESTIMATE, None)
+        await session.commit()
+
+    async with factory() as session:
+        assert await spend.spent_today(session) == spend.ESTIMATE
+
+
+async def test_a_settlement_cannot_credit_a_day_it_never_charged(factory):
+    """A call that starts at 23:59 settles on the following day.
+
+    Deriving the day independently at reserve and at settle time means the
+    charged day stays overstated forever while an uncharged day is credited
+    below zero. The reservation returns the day it wrote, and that is the row
+    settlement corrects.
+    """
+    yesterday = date.today() - timedelta(days=1)
+    async with factory() as session:
+        await session.execute(
+            text(
+                "INSERT INTO translation_spend (day, amount) VALUES (:day, :amount)"
+            ),
+            {"day": yesterday, "amount": Decimal("0.01")},
+        )
+        await spend.settle(session, yesterday, spend.ESTIMATE, Decimal("0.05"))
+        await session.commit()
+
+    async with factory() as session:
+        charged = await session.scalar(
+            text("SELECT amount FROM translation_spend WHERE day = :day"), {"day": yesterday}
+        )
+        assert charged == Decimal("0.0500")
+        assert await spend.spent_today(session) == Decimal("0"), (
+            "today must not absorb yesterday's correction"
+        )

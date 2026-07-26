@@ -55,10 +55,17 @@ def build_glossary_instruction(terms: list[TranslationGlossary]) -> str:
     return " ".join(lines)
 
 
-def _call_cost(response: Any, model: str) -> Decimal:
+def _call_cost(response: Any, model: str) -> Decimal | None:
+    """The cost of a call, or None when the provider did not report usage.
+
+    None is not zero. `usage` is optional in the SDK, and returning zero for a
+    missing one made settlement credit the whole reservation back on every
+    successful call - so on a provider that omits usage the budget would never
+    advance and the ceiling would never be reached.
+    """
     usage = getattr(response, "usage", None)
     if usage is None:
-        return Decimal("0")
+        return None
     cost = estimate_cost(
         model,
         float(getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0),
@@ -89,11 +96,12 @@ def make_translator(provider: Any, session_factory: Any = None):
 
         settings = get_settings()
         budget_limit = settings.translation_daily_budget
+        charged_day = None
         if session_factory is not None:
             async with session_factory() as session:
-                claimed = await budget.reserve(session, budget_limit)
+                charged_day = await budget.reserve(session, budget_limit)
                 await session.commit()
-            if not claimed:
+            if charged_day is None:
                 raise BudgetExceeded(
                     f"Daily translation budget of ${budget_limit:.2f} reached"
                 )
@@ -128,8 +136,12 @@ def make_translator(provider: Any, session_factory: Any = None):
             # was reserved outside it: the money left regardless of what the
             # commit guards decide about the text.
             async with session_factory() as session:
+                # Settled against the day the reservation charged, not against
+                # "today": a call that starts at 23:59 finishes on the next day
+                # and would otherwise credit a day that was never charged.
                 await budget.settle(
                     session,
+                    charged_day,
                     budget.ESTIMATE,
                     _call_cost(response, settings.translation_deployment),
                 )

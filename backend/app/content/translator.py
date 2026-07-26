@@ -28,7 +28,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from openai import APIConnectionError
 from sqlalchemy import and_, func, select, text, tuple_, update
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -96,10 +98,24 @@ class GlossaryViolation(RuntimeError):
 # we do not recognise, we cannot know, and the honest answer to "I do not know"
 # is to stop and be visible in the failed queue rather than to spend money on a
 # guess in a loop.
+# Named explicitly rather than inferred from a base class, because the SDK's
+# hierarchy does not line up with Python's: `openai.APIConnectionError` derives
+# from `APIError`, *not* from `OSError` or `ConnectionError`, so an actual
+# provider outage - the single most common transient failure there is - was
+# being parked as permanent. `APITimeoutError` subclasses `APIConnectionError`
+# and needs no separate entry.
+#
+# `OSError` used to be here as a catch-all for "socket-level errors". It caught
+# `PermissionError` and `FileNotFoundError` instead, which are configuration
+# problems that will fail identically forever.
 TRANSIENT_FAILURES: tuple[type[Exception], ...] = (
     TimeoutError,
     ConnectionError,
-    OSError,  # covers the socket-level errors the SDK re-raises
+    APIConnectionError,
+    # A dropped database connection is the same kind of "try again" as a dropped
+    # HTTP one; a bad query is not, and raises ProgrammingError instead.
+    sa_exc.OperationalError,
+    sa_exc.InterfaceError,
 )
 
 # Retryable by status rather than by type: the SDK raises one class for most
