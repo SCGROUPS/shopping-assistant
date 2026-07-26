@@ -238,6 +238,23 @@ def _matches_destination(value: str, known: set[str]) -> bool:
     )
 
 
+def _preference_weight(preference: dict[str, Any]) -> float | None:
+    """How strongly the model judged the shopper wants this, if it said.
+
+    `None` means the model offered no opinion, which the ranker reads as full
+    strength - saying nothing about how much you want something is not the same
+    as saying you barely want it. Zero is a real answer and means the opposite.
+
+    Booleans are excluded explicitly because `isinstance(True, int)` is true in
+    Python, and a model that answers `weight: true` would otherwise be recorded
+    as having judged the preference maximally important.
+    """
+    weight = preference.get("weight")
+    if isinstance(weight, int | float) and not isinstance(weight, bool):
+        return max(0.0, min(1.0, float(weight)))
+    return None
+
+
 def merge_filters(explicit: SearchFilters, intent: SearchIntent) -> tuple[SearchFilters, list[str]]:
     values = explicit.model_dump()
     unresolved: list[str] = []
@@ -259,6 +276,7 @@ def merge_filters(explicit: SearchFilters, intent: SearchIntent) -> tuple[Search
     for preference in intent.soft_preferences:
         if preference.get("field") == "family_friendly" and values["family_friendly"] is None:
             values["family_friendly"] = bool(preference.get("value"))
+            values["family_friendly_weight"] = _preference_weight(preference)
         # Routed to `preferred_category`, never to `category`: the shopper said
         # they would like this kind of thing, not that they would refuse the
         # rest. It reaches the ranker as a preference and the eligibility gate
@@ -271,9 +289,7 @@ def merge_filters(explicit: SearchFilters, intent: SearchIntent) -> tuple[Search
             value = preference.get("value")
             if isinstance(value, str) and value:
                 values["preferred_category"] = value
-                weight = preference.get("weight")
-                if isinstance(weight, int | float) and not isinstance(weight, bool):
-                    values["preferred_category_weight"] = max(0.0, min(1.0, float(weight)))
+                values["preferred_category_weight"] = _preference_weight(preference)
     values["exclusions"] = list(dict.fromkeys([*values["exclusions"], *intent.exclusions]))
     if values["visit_start"] and not values["visit_end"]:
         values["visit_end"] = values["visit_start"]
@@ -681,7 +697,11 @@ class SearchService:
             field = str(preference.get("field", "")).casefold()
             value = str(preference.get("value", "")).casefold()
             if field == "category" and value and value not in known_categories:
-                unmatched.append("category_unmatched")
+                # Distinct from the hard-constraint code above. Dropping a
+                # requirement widens the grid the shopper is shown; dropping a
+                # preference leaves the same grid in a different order. A client
+                # that cannot tell them apart cannot explain either one.
+                unmatched.append("preferred_category_unmatched")
                 continue
             kept_preferences.append(preference)
         if unmatched:

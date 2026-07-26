@@ -16,6 +16,7 @@ from app.common.config import get_settings
 from app.common.degradation import intent_health
 from app.common.features import (
     CATEGORY_TAKE_RATE,
+    INTRINSIC_BUDGET,
     availability_fit,
     margin_fit,
     merchandising_multiplier,
@@ -143,7 +144,9 @@ class VocabularyRecordingProvider:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         return [deterministic_embedding(text) for text in texts]
 
-    async def extract_intent(self, text: str, *, categories=None, destinations=None) -> SearchIntent:
+    async def extract_intent(
+        self, text: str, *, categories=None, destinations=None
+    ) -> SearchIntent:
         self.categories, self.destinations = categories, destinations
         return SearchIntent(search_text=text)
 
@@ -933,10 +936,7 @@ async def test_a_preferred_category_ranks_matches_up_without_hiding_the_rest():
     # preference working, so a mean would have reported a regression.
     common = preferred_ranks.keys() & baseline_ranks.keys()
     assert common, "no food experience appears in both pages to compare"
-    moved = {
-        item_id: (baseline_ranks[item_id], preferred_ranks[item_id])
-        for item_id in common
-    }
+    moved = {item_id: (baseline_ranks[item_id], preferred_ranks[item_id]) for item_id in common}
     assert all(after <= before for before, after in moved.values()), (
         f"a preferred-category item ranked lower once the preference was expressed: {moved}"
     )
@@ -944,18 +944,14 @@ async def test_a_preferred_category_ranks_matches_up_without_hiding_the_rest():
         f"expressing a preference for Food changed nothing: {moved}. The preference is "
         "carried through the intent but never reaches the ranker, so 'soft' means 'ignored'."
     )
-    # A floor, not just a direction. "Something moved up" passed while the
-    # average item gained a single position - technically honoured, invisible
-    # to a shopper who asked for food and got the same page with one swap in
-    # it. Every paired item clears two places here; the floor is set at two so
-    # that diluting the preference term (another intrinsic signal, a flat mean
-    # again) fails instead of quietly degrading to a token gesture.
-    gains = [before - after for before, after in moved.values()]
-    assert min(gains) >= 2, (
-        f"preferring Food moved its items by {gains} places. The preference is reaching "
-        "the ranker but is too weak to reorder the page, which reads to a shopper as "
-        "having been ignored."
-    )
+    # Direction only. A magnitude floor was tried here and removed: the number
+    # of places an item climbs is a property of this fixture - how many rivals
+    # sit near it, and how tightly - not of the ranker. Measured across the demo
+    # catalogue at one weight, categories moved by anything from 0 to 5 places,
+    # so any floor that held for Food was an accident of Food. The claim that
+    # the preference is strong enough to matter belongs in
+    # `test_a_stated_preference_outweighs_everything_noticed_for_the_shopper`,
+    # where it can be stated about the scoring function itself.
     assert len(preferred_ranks) >= len(baseline_ranks), (
         "preferring a category put less of it on the page than not mentioning it at all"
     )
@@ -1073,9 +1069,13 @@ async def test_a_preferred_category_we_do_not_stock_is_dropped_and_declared():
         "a category the catalogue does not stock reached the ranker as a preference: "
         f"{response.effective_filters.preferred_category!r}"
     )
-    assert "category_unmatched" in response.unresolved_constraints, (
+    assert "preferred_category_unmatched" in response.unresolved_constraints, (
         "the preference was discarded without telling the shopper; "
         f"unresolved_constraints={response.unresolved_constraints}"
+    )
+    assert "category_unmatched" not in response.unresolved_constraints, (
+        "a dropped preference was reported with the code for a dropped requirement, so "
+        "the client cannot tell 'we widened your grid' from 'we ignored your preference'"
     )
     assert response.items, "dropping an unsatisfiable preference must not empty the grid"
 
@@ -1095,9 +1095,7 @@ class BrokenIntentProvider:
         return [deterministic_embedding(text) for text in texts]
 
     async def extract_intent(self, text: str, **_) -> SearchIntent:
-        raise RuntimeError(
-            "400 Unsupported value: 'minimal' is not supported with this model"
-        )
+        raise RuntimeError("400 Unsupported value: 'minimal' is not supported with this model")
 
 
 @pytest.mark.asyncio
@@ -1140,7 +1138,14 @@ async def test_a_healthy_page_is_not_marked_as_degraded():
     response = await service.search(SearchRequest(query="lantern workshop in hoi an"))
 
     assert "intent_unavailable" not in response.unresolved_constraints
-    assert intent_health.snapshot().failures == 0
+    snapshot = intent_health.snapshot()
+    assert snapshot.failures == 0
+    # Zero failures out of zero calls is what a counter that was never wired up
+    # also reports, and it would satisfy the line above forever.
+    assert snapshot.calls == 1, (
+        f"the page was built with {snapshot.calls} recorded intent calls; a healthy ratio "
+        "that comes from never counting anything is the same silence in a new place"
+    )
     intent_health.reset()
 
 
@@ -1181,9 +1186,7 @@ def test_the_models_strength_of_preference_reaches_the_ranker():
     other = {**food, "category": "Tour"}
 
     faint_gap = preference_fit(food, faint_filters) - preference_fit(other, faint_filters)
-    emphatic_gap = preference_fit(food, emphatic_filters) - preference_fit(
-        other, emphatic_filters
-    )
+    emphatic_gap = preference_fit(food, emphatic_filters) - preference_fit(other, emphatic_filters)
 
     assert faint_gap > 0, "even a faint preference should favour the category"
     assert emphatic_gap > faint_gap * 2, (
@@ -1210,4 +1213,44 @@ def test_every_category_we_stock_has_its_own_take_rate():
     assert not rated - stocked, (
         f"take rates for categories the catalogue does not stock: {sorted(rated - stocked)}. "
         "A key here that no product can have is a rename that was never finished."
+    )
+
+
+def test_a_stated_preference_outweighs_everything_noticed_for_the_shopper():
+    """The magnitude claim, made about the ranker rather than about a fixture.
+
+    A shopper who says what they want must not be outvoted by the things the
+    ranker notices on their behalf. This is the property the removed
+    displacement floor was reaching for, stated where it is actually true:
+    against the scoring function, with no catalogue involved.
+
+    Pinned as a share rather than a constant so the guarantee survives someone
+    adding a fourth intrinsic signal - which is exactly how a per-signal weight
+    would have eroded it.
+    """
+    product = {
+        "category": "Food",
+        "family_friendly": True,
+        "indoor_outdoor": "indoor",
+        "duration_minutes": 120,
+        "rating": 4.5,
+        "instant_confirmation": True,
+        "options": [{"free_cancellation_hours": 24}],
+        "languages": ["en", "vi"],
+    }
+    stated = SearchFilters(preferred_category="Food")
+    matched = preference_fit(product, stated)
+    missed = preference_fit({**product, "category": "Tour"}, stated)
+
+    # Everything intrinsic is perfect for this product, so the whole difference
+    # between these two scores is the stated preference being honoured.
+    share = matched - missed
+    assert share > 0.5, (
+        f"a stated preference is worth {share:.2f} of the score against a full set of "
+        "intrinsic signals; the shopper's own words carry less weight than what we "
+        "noticed for them, so saying what you want barely changes the page"
+    )
+    assert share == pytest.approx(1 / (1 + INTRINSIC_BUDGET)), (
+        "the stated share has drifted from the declared budget, which means the trade "
+        "between what a shopper says and what we notice is no longer the one written down"
     )

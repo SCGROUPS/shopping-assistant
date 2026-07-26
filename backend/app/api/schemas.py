@@ -33,6 +33,7 @@ class SearchFilters(BaseModel):
     # request. Strength of preference is a reading of the shopper's language,
     # so it belongs to the model, not to a constant in the ranker.
     preferred_category_weight: float | None = Field(default=None, ge=0.0, le=1.0)
+    family_friendly_weight: float | None = Field(default=None, ge=0.0, le=1.0)
     rating: float | None = Field(default=None, ge=0, le=5)
     max_duration_minutes: int | None = Field(default=None, ge=1)
     accessibility: list[str] = Field(default_factory=list)

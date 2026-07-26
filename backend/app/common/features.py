@@ -22,6 +22,12 @@ from app.common.ranking import bayesian_rating
 # table outlived two vocabulary changes carrying spellings the catalogue had
 # stopped using ("Food experience", "Transport ticket"), which silently earned
 # every renamed item the default rate instead of its own.
+# Everything the ranker notices on a shopper's behalf, taken together, is worth
+# this much against one thing they actually said. Expressed as a total rather
+# than per-signal so that adding a new intrinsic signal splits this share
+# instead of quietly outvoting the shopper.
+INTRINSIC_BUDGET = 0.75
+
 CATEGORY_TAKE_RATE: dict[str, float] = {
     "Day trip": 0.18,
     "Cruise": 0.18,
@@ -125,20 +131,29 @@ def preference_fit(
     With nothing expressed, every remaining signal is intrinsic and shares one
     weight, so the score is identical to the plain mean it replaces.
     """
-    # Weighted mean of (value, weight) pairs.
+    # Weighted mean of (value, weight) pairs. Signals the shopper stated are
+    # collected at full weight; ones noticed on their behalf are collected
+    # separately and share a fixed budget between them, whatever their number.
     signals: list[tuple[float, float]] = []
+    noticed: list[float] = []
     stated = 1.0
-    # Noticed on the shopper's behalf: enough to break ties between items that
-    # match what was asked for equally well, not enough to overturn it.
-    noticed = 0.25
 
     wants_family = filters.family_friendly or any(
         person.type in {"child", "infant"} for person in party
     )
     if wants_family:
-        # Stated if they asked; noticed if we inferred it from the party.
-        weight = stated if filters.family_friendly else noticed
-        signals.append((1.0 if product["family_friendly"] else 0.0, weight))
+        fit = 1.0 if product["family_friendly"] else 0.0
+        if filters.family_friendly:
+            # Asked for. Carries the model's strength for the same reason the
+            # preferred category does - it arrives by the same soft-preference
+            # path, and reading one judgement while discarding the other would
+            # make two equally expressed wishes count differently.
+            strength = filters.family_friendly_weight
+            signals.append((fit, stated if strength is None else strength))
+        else:
+            # Inferred from a party that includes a child. Worth noticing, not
+            # worth overriding what was actually said.
+            noticed.append(fit)
 
     # A category the shopper preferred but did not require. Without this the
     # soft branch had nowhere to go: `category` was the only category field
@@ -166,20 +181,30 @@ def preference_fit(
 
     # Intrinsic signals: these matter to every tourist, whether or not they
     # thought to ask for them.
-    signals.append((1.0 if product["instant_confirmation"] else 0.0, noticed))
-    signals.append(
-        (
-            1.0
-            if any(option["free_cancellation_hours"] > 0 for option in product["options"])
-            else 0.0,
-            noticed,
-        )
+    noticed.append(1.0 if product["instant_confirmation"] else 0.0)
+    noticed.append(
+        1.0 if any(option["free_cancellation_hours"] > 0 for option in product["options"]) else 0.0
     )
-    signals.append((min(1.0, len(product["languages"]) / 4), noticed))
+    noticed.append(min(1.0, len(product["languages"]) / 4))
+
+    # Shared, not per-signal. A per-signal weight silently re-dilutes everything
+    # the shopper actually said each time someone adds another thing we happen
+    # to notice: at 0.25 each, three intrinsic signals leave a stated preference
+    # 57% of the vote and eight would leave it 33%, for no decision anyone made.
+    # As a budget, the trade is stated once and adding a signal divides the
+    # noticed share rather than taking from the stated one.
+    if noticed:
+        share = INTRINSIC_BUDGET / len(noticed)
+        signals.extend((value, share) for value in noticed)
+
     total = sum(weight for _, weight in signals)
     if not total:
-        # Every signal was weighted zero, which is the model saying none of this
-        # should sway the order. Neutral, so relevance decides alone.
+        # Not reachable while INTRINSIC_BUDGET is positive, since the three
+        # intrinsic signals are always present and always share it. Kept as a
+        # division guard rather than as a claim about the model: it exists so
+        # that setting the budget to zero produces a neutral score instead of a
+        # crash, and it is deliberately not describing a state the model can
+        # put us in.
         return 0.0
     return sum(value * weight for value, weight in signals) / total
 
