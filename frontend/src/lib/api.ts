@@ -71,7 +71,11 @@ let preferredLocale = localStorage.getItem('vietra-locale') ?? ''
 
 export const setPreferredLocale = (locale: string) => {
   preferredLocale = locale
-  localStorage.setItem('vietra-locale', locale)
+  // Removed rather than stored blank: "no preference" is the absence of a
+  // choice, and an empty string in storage is a stored choice that happens to
+  // be empty. Rolling back a failed switch can land here.
+  if (locale) localStorage.setItem('vietra-locale', locale)
+  else localStorage.removeItem('vietra-locale')
 }
 
 export const getPreferredLocale = () => preferredLocale
@@ -175,7 +179,7 @@ const normalizeContentMeta = (
           locale: String(record.locale ?? ''),
           provenance: String(record.provenance ?? 'unknown'),
           stale: record.stale === true,
-          requested: record.requested ? String(record.requested) : undefined,
+          fallback: record.fallback === true,
         },
       ] as const
     })
@@ -463,16 +467,18 @@ export const api = {
     // Persisted server-side as well as locally, because the session preference
     // is what the assistant and any later device read - localStorage is this
     // browser's opinion, and the conversation outlives the tab.
-    try {
-      const payload = await request<Record<string, unknown>>('/session/locale', {
-        method: 'PUT',
-        headers: jsonHeaders(),
-        body: JSON.stringify({ locale }),
-      })
-      return (resolvedLocale = String(payload.locale ?? locale))
-    } catch {
-      return locale
-    }
+    //
+    // Failures propagate. This used to `catch { return locale }`, which
+    // reported the language the caller asked for as the language the server
+    // agreed to: the UI then switched, the session did not, and every later
+    // request disagreed with the screen. A write whose whole purpose is the
+    // server's answer must not invent one.
+    const payload = await request<Record<string, unknown>>('/session/locale', {
+      method: 'PUT',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ locale }),
+    })
+    return (resolvedLocale = String(payload.locale ?? locale))
   },
 
   async listExperiences(): Promise<Experience[]> {

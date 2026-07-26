@@ -20,8 +20,12 @@ export type ContentFieldMeta = {
   provenance: string
   /** Published, but the source has changed since. */
   stale: boolean
-  /** The locale the shopper asked for, which may not be the one served. */
-  requested?: string
+  /**
+   * The requested locale had no content, so another was served. Taken from
+   * the backend rather than re-derived here: negotiation has one owner, and
+   * a client that recomputes it will disagree with the server eventually.
+   */
+  fallback: boolean
 }
 
 export type Experience = {

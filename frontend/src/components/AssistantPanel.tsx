@@ -139,7 +139,7 @@ export function AssistantPanel({
 
       <div className="assistant-context">
         <MessageCircle size={15} />
-        Looking at {visibleProducts.length} experiences in Central Vietnam
+        {t('assistant.lookingAt', { count: visibleProducts.length })}
       </div>
 
       <div className="assistant-messages">
@@ -241,7 +241,10 @@ export function AssistantPanel({
                                     : 'secondary'
                                 }
                                 data-product-id={product.id}
-                                aria-label={`${action.label} for ${product.title}`}
+                                aria-label={t('card.a11y.action', {
+                                  action: action.label,
+                                  title: product.title,
+                                })}
                                 onClick={() => onAction(action, [product])}
                               >
                                 {action.type === 'ADD_TO_CART' ? (
@@ -306,7 +309,7 @@ export function AssistantPanel({
             </span>
             <div className="assistant-thinking">
               <LoaderCircle size={15} className="spin" />
-              Checking fit, timing, and availability…
+              {t('assistant.thinking')}
             </div>
           </div>
         )}
@@ -335,7 +338,8 @@ export function AssistantPanel({
           rows={2}
         />
         <VoiceInputButton
-          label="Talk to Mai"
+          label={t('assistant.a11y.voice')}
+          stopLabel={t('app.search.voiceStop')}
           disabled={busy}
           onTranscript={(transcript, final) => {
             setValue(transcript)
@@ -355,7 +359,7 @@ export function AssistantPanel({
         </button>
       </div>
       <p className="assistant-disclaimer">
-        Mai checks catalog facts and live demo availability before taking action.
+        {t('assistant.footnote')}
       </p>
     </aside>
   )

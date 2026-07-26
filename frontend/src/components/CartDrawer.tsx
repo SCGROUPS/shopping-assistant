@@ -52,7 +52,7 @@ export function CartDrawer({
         <button
           className="drawer-backdrop visible"
           onClick={onClose}
-          aria-label="Close cart"
+          aria-label={t('cart.close')}
         />
       )}
       <aside
@@ -101,8 +101,10 @@ export function CartDrawer({
                       {item.date} {item.time ? `· ${item.time}` : ''}
                     </span>
                     <span>
-                      {item.adults} adults
-                      {item.children ? ` · ${item.children} children` : ''}
+                      {t.plural('cart.adults', item.adults)}
+                      {item.children
+                        ? ` · ${t.plural('cart.children', item.children)}`
+                        : ''}
                     </span>
                     <b>
                       {money(item.experience.currency, item.total)}
@@ -111,7 +113,7 @@ export function CartDrawer({
                   <button
                     className="remove-item"
                     onClick={() => onRemove(item.id)}
-                    aria-label={`Remove ${item.experience.title}`}
+                    aria-label={t('card.a11y.remove', { title: item.experience.title })}
                   >
                     <Trash2 size={16} />
                   </button>
@@ -141,7 +143,7 @@ export function CartDrawer({
                       </div>
                       <button
                         onClick={() => onAddCrossSell(product)}
-                        aria-label={`Add ${product.title}`}
+                        aria-label={t('card.a11y.add', { title: product.title })}
                       >
                         <Plus size={16} />
                       </button>
@@ -154,9 +156,7 @@ export function CartDrawer({
             {onCheckPlan && (
               <button className="cart-plan-check" onClick={onCheckPlan}>
                 <MessageCircle size={16} />
-                {clashing
-                  ? 'Two items clash — ask Mai to re-time one'
-                  : 'Check my plan with Mai'}
+                {clashing ? t('cart.clash') : t('cart.checkPlan')}
               </button>
             )}
 

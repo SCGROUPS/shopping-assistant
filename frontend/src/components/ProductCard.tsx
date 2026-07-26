@@ -41,7 +41,7 @@ export function ProductCard({
 }: ProductCardProps) {
   // Formatting locale comes from the provider, not a module constant, so
   // prices re-render when the shopper switches language.
-  const { locale } = useLocale()
+  const { locale, t } = useLocale()
   const money = (currency: string, amount: number) =>
     formatMoney(locale, currency, amount)
   const [saved, setSaved] = useState(false)
@@ -51,7 +51,7 @@ export function ProductCard({
       <button
         className="product-image-button"
         onClick={() => onView(product)}
-        aria-label={`View ${product.title}`}
+        aria-label={t('card.a11y.view', { title: product.title })}
       >
         <img
           className="product-image"
@@ -137,7 +137,7 @@ export function ProductCard({
         </div>
         <div className="product-footer">
           <div className="price">
-            <span>From</span>
+            <span>{t('card.from')}</span>
             <strong>
               {product.display_price != null && product.display_currency
                 ? money(product.display_currency, product.display_price)
@@ -145,8 +145,10 @@ export function ProductCard({
             </strong>
             <span>
               {product.display_price != null && product.display_currency
-                ? `per guest · ${money(product.currency, product.price)}`
-                : 'per guest'}
+                ? t('card.perGuestWith', {
+                    price: money(product.currency, product.price),
+                  })
+                : t('card.perGuest')}
             </span>
           </div>
           <div className="product-actions">
@@ -154,8 +156,8 @@ export function ProductCard({
               <button
                 className="icon-action"
                 onClick={() => onAsk(product)}
-                aria-label={`Ask Mai about ${product.title}`}
-                title="Ask about this"
+                aria-label={t('card.askAbout', { title: product.title })}
+                title={t('card.ask')}
               >
                 <MessageCircle size={18} />
               </button>
@@ -163,13 +165,13 @@ export function ProductCard({
             <button
               className="icon-action"
               onClick={() => onView(product)}
-              aria-label="View details"
+              aria-label={t('card.viewDetails')}
             >
               <ArrowUpRight size={18} />
             </button>
             <button className="add-button" onClick={() => onAdd(product)}>
               <ShoppingBag size={16} />
-              Add
+              {t('card.add')}
             </button>
           </div>
         </div>

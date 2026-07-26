@@ -1,8 +1,6 @@
 import { useMemo } from 'react'
 import type { ReactNode } from 'react'
-import { translate } from './i18n'
-import type { MessageKey } from './i18n'
-import { LocaleContext } from './useLocale'
+import { LocaleContext, buildTranslator } from './useLocale'
 
 export const LocaleProvider = ({
   locale,
@@ -12,7 +10,7 @@ export const LocaleProvider = ({
   children: ReactNode
 }) => {
   const value = useMemo(
-    () => ({ locale, t: (key: MessageKey) => translate(locale, key) }),
+    () => ({ locale, t: buildTranslator(locale) }),
     [locale],
   )
   return (

@@ -46,6 +46,7 @@ type VoiceInputButtonProps = {
   onTranscript: (transcript: string, final: boolean) => void
   disabled?: boolean
   label: string
+  stopLabel: string
 }
 
 const recognitionErrorMessage = (error: string) => {
@@ -62,6 +63,7 @@ export function VoiceInputButton({
   onTranscript,
   disabled = false,
   label,
+  stopLabel,
 }: VoiceInputButtonProps) {
   const [listening, setListening] = useState(false)
   const [status, setStatus] = useState('')
@@ -130,7 +132,7 @@ export function VoiceInputButton({
     }
   }
 
-  const accessibleLabel = listening ? 'Stop listening' : label
+  const accessibleLabel = listening ? stopLabel : label
 
   return (
     <>
