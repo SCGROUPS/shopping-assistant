@@ -26,6 +26,20 @@ settings = get_settings()
 
 PROBE_ATTEMPTS = 5
 PROBE_RETRY_SECONDS = 3.0
+# Two, not one: a 400 is usually the deterministic defect this probe exists to
+# find, but content filtering and some gateway paths use the same code, and one
+# of those must not darken the storefront.
+REJECTIONS_TO_CONFIRM = 2
+# The catalogue is a nicety here, not the point. Waiting on a database that is
+# still waking would spend the probe's whole budget before it asked the model
+# anything.
+VOCABULARY_TIMEOUT_SECONDS = 3.0
+# The whole verdict has to land inside the readiness grace period
+# (initialDelaySeconds 5 + a few 10s polls, see infra/bicep/resources.bicep), or
+# a revision that is perfectly healthy would be killed for being slow to prove
+# it. Everything below is bounded so that this deadline is the backstop and not
+# the mechanism.
+PROBE_DEADLINE_SECONDS = 25.0
 
 
 async def _probe_vocabulary() -> tuple[list[str], list[str]]:
@@ -37,16 +51,27 @@ async def _probe_vocabulary() -> tuple[list[str], list[str]]:
     it exists to break. The failure being hunted here is in the request shape,
     not the enum contents, so a small stand-in is a faithful enough probe and
     far better than not asking.
+
+    Bounded rather than merely guarded against raising: a database that is
+    waking blocks on connect, and an unbounded await here would hold the verdict
+    open past the point where readiness has already let the revision serve.
+
+    The stand-in is taken from the same declared vocabulary the rest of the
+    system uses, not spelled out again here. A hand-written copy of the
+    catalogue's words in application code is exactly the drift that put retired
+    categories in the take-rate table.
     """
+    from app.catalog.seed import DESTINATIONS
+    from app.catalog.vocabulary import CATEGORIES
     from app.common.persistence import catalog_products
 
     try:
-        products = await catalog_products()
-    except Exception as error:  # noqa: BLE001
+        products = await asyncio.wait_for(catalog_products(), timeout=VOCABULARY_TIMEOUT_SECONDS)
+    except Exception as error:  # noqa: BLE001 - includes the timeout above
         logger.warning("Intent probe could not load the catalogue: %s", error)
         products = []
     if not products:
-        return ["Food", "Transport"], ["Hoi An", "Hanoi"]
+        return list(CATEGORIES[:2]), [str(item["name"]) for item in DESTINATIONS[:2]]
     return (
         sorted({product["category"] for product in products}),
         sorted({product["destination"] for product in products}),
@@ -57,15 +82,38 @@ async def _run_intent_probe() -> None:
     """Record whether the intent deployment accepts the request we send it.
 
     Retried, because "could not tell" must never be allowed to settle as "fine".
-    A rejection is deterministic and answers on the first attempt; the retries
-    are for the startup-shaped problems - a cold upstream, a connection not yet
+    A rejection is deterministic and answers almost immediately; the retries are
+    for the startup-shaped problems - a cold upstream, a connection not yet
     open - that would otherwise leave the question permanently unanswered and
     the revision permanently trusted.
+
+    A rejection, once seen, is never downgraded. Later attempts can only confirm
+    it or overturn it by actually passing: an inconclusive attempt after a
+    rejection leaves the rejection standing, because "the model did not answer"
+    is not evidence that the request it already refused has become valid.
+
+    Recording `ok=False` here darkens this revision (readiness fails, and on a
+    single-replica deployment the ingress has no other backend). That is the
+    intended trade and it is not a small one: a storefront that sells nothing
+    is better than one that appears to work while understanding nobody, and it
+    self-heals - an unready replica takes no traffic, scales to zero, and the
+    next cold start probes again.
     """
     from app.assistant.provider import build_ai_provider
 
+    # A provider with no endpoint configured is the in-process demo one, which
+    # cannot reject anything. Probing it would record a pass for a conversation
+    # that never happened.
+    if not settings.azure_enabled:
+        intent_health.record_probe(
+            ok=True, detail="not applicable: no Azure OpenAI endpoint is configured"
+        )
+        return
+
     categories, destinations = await _probe_vocabulary()
     detail = "the intent probe never completed"
+    rejection: str | None = None
+    rejections = 0
     for attempt in range(1, PROBE_ATTEMPTS + 1):
         try:
             result = await probe_intent(
@@ -75,18 +123,27 @@ async def _run_intent_probe() -> None:
             detail = f"the intent probe could not run: {error}"
             logger.warning("Intent probe attempt %s could not run: %s", attempt, error)
         else:
-            if not result.ok:
-                logger.error("Intent probe FAILED: %s", result.detail)
-                intent_health.record_probe(ok=False, detail=result.detail)
-                return
-            if "inconclusive" not in result.detail:
+            detail = result.detail
+            if result.passed:
                 logger.info("Intent probe: %s", result.detail)
                 intent_health.record_probe(ok=True, detail=result.detail)
                 return
-            detail = result.detail
-            logger.warning("Intent probe attempt %s inconclusive: %s", attempt, result.detail)
+            if result.rejected:
+                rejections += 1
+                rejection = result.detail
+                logger.error("Intent probe attempt %s was rejected: %s", attempt, result.detail)
+                if rejections >= REJECTIONS_TO_CONFIRM:
+                    intent_health.record_probe(ok=False, detail=result.detail)
+                    return
+            else:
+                logger.warning("Intent probe attempt %s inconclusive: %s", attempt, result.detail)
         if attempt < PROBE_ATTEMPTS:
             await asyncio.sleep(PROBE_RETRY_SECONDS)
+
+    if rejection is not None:
+        logger.error("Intent probe rejected and never overturned: %s", rejection)
+        intent_health.record_probe(ok=False, detail=rejection)
+        return
 
     # Every attempt failed for reasons that were not a rejection. Serving is
     # still the right call - the model being unreachable is not evidence that
@@ -94,6 +151,32 @@ async def _run_intent_probe() -> None:
     # but this is reported as unverified rather than as a pass.
     logger.error("Intent probe gave up after %s attempts: %s", PROBE_ATTEMPTS, detail)
     intent_health.record_probe(ok=True, detail=f"unverified: {detail}")
+
+
+async def _supervise_intent_probe() -> None:
+    """Guarantee a verdict, so readiness can insist on having one.
+
+    `ready()` refuses to call a revision ready before the probe has answered,
+    which is only safe if an answer is certain to arrive. Every wait inside the
+    probe is individually bounded; this is the backstop for the ones that are
+    not waits at all - a socket that never returns, an SDK retry loop longer
+    than expected.
+
+    Timing out is recorded as unverified, never as a rejection, and never over
+    the top of a verdict already reached.
+    """
+    try:
+        await asyncio.wait_for(_run_intent_probe(), timeout=PROBE_DEADLINE_SECONDS)
+    except TimeoutError:
+        if intent_health.probe() is None:
+            logger.error("Intent probe did not answer within %ss", PROBE_DEADLINE_SECONDS)
+            intent_health.record_probe(
+                ok=True, detail=f"unverified: no answer within {PROBE_DEADLINE_SECONDS}s"
+            )
+    except Exception as error:  # noqa: BLE001 - a probe that crashes must still answer
+        if intent_health.probe() is None:
+            logger.exception("Intent probe crashed")
+            intent_health.record_probe(ok=True, detail=f"unverified: probe crashed: {error}")
 
 
 @asynccontextmanager
@@ -114,7 +197,7 @@ async def lifespan(app: FastAPI):
     worker = asyncio.create_task(index_worker_loop())
     # Run alongside startup rather than blocking it: a slow model must not stop
     # the service coming up, and readiness stays false until the answer is in.
-    probe = asyncio.create_task(_run_intent_probe())
+    probe = asyncio.create_task(_supervise_intent_probe())
     try:
         yield
     finally:
@@ -186,7 +269,13 @@ async def ready() -> JSONResponse:
     # none of them, which is indistinguishable from working and is precisely how
     # two outages survived their own deployments. Failing readiness here leaves
     # the previous revision serving, which does understand its shoppers.
-    intent_ok = probe is None or probe.ok
+    #
+    # An unanswered probe is not ready. The whole point is that a revision must
+    # prove it can be understood before it is given shoppers, and "we have not
+    # asked yet" is not proof - it is the same silence, arriving a few seconds
+    # earlier. `_supervise_intent_probe` guarantees an answer within
+    # PROBE_DEADLINE_SECONDS, which is what makes insisting on one safe.
+    intent_ok = probe is not None and probe.ok
     healthy = (settings.demo_mode or database) and intent_ok
     body = {
         "status": "ready" if healthy else "degraded",
