@@ -16,6 +16,7 @@ from app.common.features import (
     promotion_active,
     quality,
 )
+from app.common.locales import DEFAULT_LOCALE
 from app.common.persistence import catalog_products, demand_stats, event_history
 from app.common.ranking import cosine_similarity, mmr_diversify, time_decay
 from app.common.runtime_config import get_config
@@ -177,11 +178,12 @@ class RecommendationService:
         filters: SearchFilters | None = None,
         party: Sequence[Participant] = (),
         display_currency: str | None = None,
+        locale: str = DEFAULT_LOCALE,
     ) -> RecommendationResponse:
-        products = await catalog_products(self.data)
+        products = await catalog_products(self.data, locale=locale)
         products_by_id = {product["id"]: product for product in products}
         current = (
-            await get_product_async(experience_id, self.data)
+            await get_product_async(experience_id, self.data, locale=locale)
             if experience_id
             else None
         )
@@ -248,7 +250,7 @@ class RecommendationService:
             )
 
         if not candidates:
-            return RecommendationResponse(items=[])
+            return RecommendationResponse(items=[], locale=locale)
         # A pin lifts a product within the rail's own ordering, bounded the
         # same way search bounds it.
         candidates.sort(
@@ -281,7 +283,7 @@ class RecommendationService:
                     display_currency=display_currency,
                 )
             )
-        return RecommendationResponse(items=items)
+        return RecommendationResponse(items=items, locale=locale)
 
 
 async def session_interest_tags(

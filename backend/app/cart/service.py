@@ -28,6 +28,7 @@ from app.common.persistence import (
     lock_idempotency,
     require_session_factory,
 )
+from app.common.resolution import resolve_experience_text
 from app.common.store import DemoStore, store
 
 
@@ -35,7 +36,7 @@ class CartService:
     def __init__(self, data: DemoStore = store) -> None:
         self.data = data
 
-    async def get_cart(self, session_id: str) -> CartView:
+    async def get_cart(self, session_id: str, locale: str) -> CartView:
         if not database_mode():
             return self._demo_get_cart(session_id)
         factory = require_session_factory()
@@ -51,10 +52,14 @@ class CartService:
                 )
                 db.add(cart)
                 await db.flush()
-            return await self._db_view(db, cart)
+            return await self._db_view(db, cart, locale)
 
     async def add_item(
-        self, session_id: str, request: CartItemRequest, idempotency_key: str
+        self,
+        session_id: str,
+        request: CartItemRequest,
+        idempotency_key: str,
+        locale: str,
     ) -> CartView:
         if not database_mode():
             return self._demo_add_item(session_id, request, idempotency_key)
@@ -202,7 +207,7 @@ class CartService:
             )
             cart.version += 1
             await db.flush()
-            response = await self._db_view(db, cart)
+            response = await self._db_view(db, cart, locale)
             db.add(
                 IdempotencyRecord(
                     session_id=shopping_session.id,
@@ -214,7 +219,11 @@ class CartService:
             return response
 
     async def remove_item(
-        self, session_id: str, item_id: UUID, idempotency_key: str
+        self,
+        session_id: str,
+        item_id: UUID,
+        idempotency_key: str,
+        locale: str,
     ) -> CartView:
         if not database_mode():
             return self._demo_remove_item(session_id, item_id, idempotency_key)
@@ -252,7 +261,7 @@ class CartService:
             await db.delete(item)
             cart.version += 1
             await db.flush()
-            response = await self._db_view(db, cart)
+            response = await self._db_view(db, cart, locale)
             db.add(
                 IdempotencyRecord(
                     session_id=shopping_session.id,
@@ -263,18 +272,27 @@ class CartService:
             )
             return response
 
-    async def validate(self, session_id: str) -> CartView:
+    async def validate(self, session_id: str, locale: str) -> CartView:
         if not database_mode():
             return self._demo_validate(session_id)
         factory = require_session_factory()
         async with factory() as db, db.begin():
             shopping_session = await ensure_session(db, session_id)
-            _cart, view = await self.validate_db(db, shopping_session.id)
+            _cart, view = await self.validate_db(db, shopping_session.id, locale=locale)
             return view
 
     async def validate_db(
-        self, db, shopping_session_id: UUID, *, lock_slots: bool = False
+        self, db, shopping_session_id: UUID, *, locale: str, lock_slots: bool = False
     ) -> tuple[Cart, CartView]:
+        """`locale` is required and keyword-only, deliberately.
+
+        The previous signature defaulted it to English, and the checkout path
+        simply did not pass it: a shopper read a Vietnamese cart and then paid
+        against an English one, which is precisely the moment "is this what I
+        chose?" must not arise. A default here cannot distinguish "English was
+        requested" from "nobody said", so it is gone, and a future call site
+        that forgets is a type error rather than a quiet mistranslation.
+        """
         cart = await self._active_cart(db, shopping_session_id)
         if cart is None:
             raise ApiError(
@@ -314,7 +332,7 @@ class CartService:
                         "A selected experience is no longer available",
                         "cart-revalidation",
                     )
-        return cart, await self._db_view(db, cart)
+        return cart, await self._db_view(db, cart, locale)
 
     async def _active_cart(self, db, shopping_session_id: UUID) -> Cart | None:
         return await db.scalar(
@@ -343,19 +361,28 @@ class CartService:
         )
         return CartView.model_validate(record.response) if record else None
 
-    async def _db_view(self, db, cart: Cart) -> CartView:
+    async def _db_view(self, db, cart: Cart, locale: str) -> CartView:
         rows = await db.execute(
-            select(CartItem, Experience.title, ExperienceOption.name)
+            select(CartItem, Experience, ExperienceOption.name)
             .join(Experience, Experience.id == CartItem.experience_id)
             .join(ExperienceOption, ExperienceOption.id == CartItem.option_id)
             .where(CartItem.cart_id == cart.id)
             .order_by(CartItem.created_at)
         )
+        rows_all = rows.all()
+        # Through the shared resolver, not a join on `Experience.title`. A cart
+        # that names products in the source language while the page that filled
+        # it named them in the shopper's own reads as a different product, and
+        # "is this the thing I chose?" is the worst question to raise at the
+        # moment of payment.
+        titles = await resolve_experience_text(
+            db, [experience for _, experience, _ in rows_all], locale
+        )
         items = [
             CartItemView(
                 id=item.id,
                 experience_id=item.experience_id,
-                experience_title=experience_title,
+                experience_title=titles[experience.id]["title"].value,
                 option_id=item.option_id,
                 option_name=option_name,
                 slot_id=item.slot_id,
@@ -378,7 +405,7 @@ class CartService:
                 quantity=item.quantity,
                 quoted_total=float(item.quoted_total),
             )
-            for item, experience_title, option_name in rows.all()
+            for item, experience, option_name in rows_all
         ]
         total = sum(item.quoted_total for item in items)
         return CartView(

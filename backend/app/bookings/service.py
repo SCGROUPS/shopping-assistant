@@ -44,6 +44,7 @@ class BookingService:
         session_id: str,
         *,
         idempotency_key: str,
+        locale: str,
         customer_details: dict[str, str] | None = None,
     ) -> BookingView:
         if not database_mode():
@@ -69,7 +70,7 @@ class BookingService:
                 return BookingView.model_validate(repeated.response)
 
             cart, cart_view = await self.carts.validate_db(
-                db, shopping_session.id, lock_slots=True
+                db, shopping_session.id, locale=locale, lock_slots=True
             )
             existing = await db.scalar(
                 select(Booking).where(Booking.cart_id == cart.id)

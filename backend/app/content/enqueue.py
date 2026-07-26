@@ -25,6 +25,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.config import get_settings
+from app.common.field_policy import fields_requiring_review, translated_fields
 from app.common.locales import SUPPORTED_LOCALES
 from app.common.models import (
     Experience,
@@ -41,20 +42,16 @@ from app.content.fingerprints import (
 # The prose a shopper reads. Deliberately not every text column on the row:
 # `slug` is an identifier, and translating it would break every link that has
 # ever been shared.
-EXPERIENCE_FIELDS: tuple[str, ...] = (
-    "title",
-    "short_description",
-    "description",
-    "meeting_point",
-)
+EXPERIENCE_FIELDS: tuple[str, ...] = translated_fields()
 
 # Fields whose machine translation is held for a human (§6.5). The split is by
 # consequence, not by environment: a wrong adjective costs relevance, a wrong
 # meeting point puts a traveller on the wrong street. Requiring review of
 # everything floods a queue nobody can staff - there is no Korean reviewer -
 # and auto-publishing everything ships a wrong meeting point because nobody
-# reads Korean either.
-REVIEW_REQUIRED_FIELDS: frozenset[str] = frozenset({"meeting_point"})
+# reads Korean either. Decided in `common/field_policy.py` alongside the
+# stale-serving rule, which is the same judgement about the same fields.
+REVIEW_REQUIRED_FIELDS: frozenset[str] = fields_requiring_review()
 
 ENTITY_EXPERIENCE = "experience"
 
@@ -183,9 +180,7 @@ async def enqueue_experience_translations(
                 )
                 continue
 
-            desired = desired_fingerprint(
-                source=source, recipe=recipe, provenance=row.provenance
-            )
+            desired = desired_fingerprint(source=source, recipe=recipe, provenance=row.provenance)
             if row.desired_fingerprint == desired:
                 # Nothing to do, and crucially no job: a hundred re-imports of
                 # unchanged content must create no work at all.
@@ -209,9 +204,7 @@ async def enqueue_experience_translations(
                 # failure this whole table exists to prevent.
                 continue
 
-            job_values.append(
-                _job_values(experience_id, field, locale, desired, row.generation)
-            )
+            job_values.append(_job_values(experience_id, field, locale, desired, row.generation))
 
     if pending_rows:
         landed = await session.execute(
@@ -225,9 +218,7 @@ async def enqueue_experience_translations(
             key = (spec["field"], spec["locale"])
             if key in created:
                 job_values.append(
-                    _job_values(
-                        experience_id, key[0], key[1], spec["desired_fingerprint"], 0
-                    )
+                    _job_values(experience_id, key[0], key[1], spec["desired_fingerprint"], 0)
                 )
                 continue
             # Another caller created the row between our locked read and this
@@ -293,12 +284,8 @@ async def _adopt_concurrent_row(
     if row is None:
         return None
 
-    source = source_fingerprint(
-        text=text_value, source_language=source_language, locale=locale
-    )
-    desired = desired_fingerprint(
-        source=source, recipe=recipe, provenance=row.provenance
-    )
+    source = source_fingerprint(text=text_value, source_language=source_language, locale=locale)
+    desired = desired_fingerprint(source=source, recipe=recipe, provenance=row.provenance)
     # `text_value` and `recipe` were both read under the experience lock this
     # transaction holds, so neither can have moved while we waited for the row.
     if row.desired_fingerprint == desired:

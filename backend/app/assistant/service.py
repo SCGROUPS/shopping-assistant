@@ -25,6 +25,7 @@ from app.catalog.service import get_product_async, product_card, product_detail
 from app.common.config import get_settings
 from app.common.errors import ApiError
 from app.common.llm_cost import BudgetExceeded
+from app.common.locales import DEFAULT_LOCALE
 from app.common.models import (
     Conversation,
     ConversationMessage,
@@ -290,10 +291,29 @@ class AssistantService:
             ).all()
             return len(messages)
 
+    @staticmethod
+    def _locale(conversation: dict[str, Any]) -> str:
+        """The locale this conversation is being held in.
+
+        Carried on the conversation rather than passed down every call. The
+        agent path fans out through tools, streaming and rendering, and a
+        parameter that eight call sites have to remember to forward is one
+        that a ninth will not - which is precisely how the assistant, the
+        primary guided-shopping path, ended up searching English documents
+        while the storefront around it had been locale-aware for a release.
+        """
+        value = conversation.get("state", {}).get("locale")
+        return value if isinstance(value, str) else DEFAULT_LOCALE
+
     async def respond(
-        self, conversation_id: UUID, session_id: str, request: MessageRequest
+        self,
+        conversation_id: UUID,
+        session_id: str,
+        request: MessageRequest,
+        locale: str = DEFAULT_LOCALE,
     ) -> AssistantResponse:
         conversation = await self.get(conversation_id, session_id)
+        conversation["state"]["locale"] = locale
         message_count = await self._conversation_message_count(conversation_id)
         if message_count // 2 >= self.settings.assistant_max_session_turns:
             raise ApiError(
@@ -443,7 +463,11 @@ class AssistantService:
         products: list[AssistantProduct] = []
         for selection in answer.selections:
             try:
-                product = await get_product_async(UUID(selection.experience_id), self.data)
+                product = await get_product_async(
+                    UUID(selection.experience_id),
+                    self.data,
+                    locale=self._locale(conversation),
+                )
             except (ApiError, ValueError):
                 logger.warning("Agent selected an unknown offering %s", selection.experience_id)
                 continue
@@ -504,6 +528,7 @@ class AssistantService:
                     filters=filters,
                     party=party,
                     page_size=int(limit) if isinstance(limit, int) and limit > 0 else 8,
+                    locale=self._locale(conversation),
                 )
             )
             return {
@@ -522,6 +547,7 @@ class AssistantService:
                 limit=4,
                 filters=filters,
                 party=party,
+                locale=self._locale(conversation),
             )
             return {
                 "anchor_experience_id": str(current["id"]),
@@ -586,6 +612,7 @@ class AssistantService:
                 filters=filters,
                 party=conversation["state"].get("party", []),
                 page_size=5,
+                locale=self._locale(conversation),
             )
         )
         if result.intent.needs_clarification:
@@ -599,7 +626,7 @@ class AssistantService:
         conversation["state"]["filters"] = result.effective_filters.model_dump(mode="json")
         products = [
             self._commerce_product(
-                await get_product_async(product.id, self.data),
+                await get_product_async(product.id, self.data, locale=self._locale(conversation)),
                 product.reason or "Matches your request.",
             )
             for product in result.items
@@ -700,7 +727,10 @@ class AssistantService:
 
     async def _compare(self, conversation: dict[str, Any]) -> AssistantResponse:
         ids = conversation["state"].get("last_result_ids", [])[:3]
-        products = [await get_product_async(UUID(item), self.data) for item in ids]
+        products = [
+            await get_product_async(UUID(item), self.data, locale=self._locale(conversation))
+            for item in ids
+        ]
         if len(products) < 2:
             return AssistantResponse(
                 message="Please search for at least two experiences before asking me to compare."
@@ -751,6 +781,7 @@ class AssistantService:
             placement="complete_your_day",
             experience_id=current["id"],
             limit=4,
+            locale=self._locale(conversation),
             filters=SearchFilters.model_validate(conversation["state"].get("filters", {})),
             party=[
                 Participant.model_validate(item) for item in conversation["state"].get("party", [])
@@ -766,7 +797,7 @@ class AssistantService:
             )
         products = [
             self._commerce_product(
-                await get_product_async(item.id, self.data),
+                await get_product_async(item.id, self.data, locale=self._locale(conversation)),
                 item.reason or "Complements your current choice.",
                 item.reason_code,
             )
@@ -811,6 +842,7 @@ class AssistantService:
                 participants=participants,
             ),
             f"assistant-{conversation['id']}-{await self._conversation_message_count(conversation['id'])}",
+            self._locale(conversation),
         )
         conversation["state"]["pending_action"] = None
         party_label = ", ".join(
@@ -834,7 +866,7 @@ class AssistantService:
     async def _prepare_checkout(
         self, conversation: dict[str, Any], session_id: str
     ) -> AssistantResponse:
-        cart = await self.carts.validate(session_id)
+        cart = await self.carts.validate(session_id, self._locale(conversation))
         conversation["state"]["pending_action"] = "CONFIRM_CHECKOUT"
         return AssistantResponse(
             message=(
@@ -862,6 +894,7 @@ class AssistantService:
         booking = await self.bookings.confirm(
             session_id,
             idempotency_key=f"assistant-checkout-{conversation['id']}",
+            locale=self._locale(conversation),
         )
         conversation["state"]["pending_action"] = None
         return AssistantResponse(
@@ -884,7 +917,10 @@ class AssistantService:
                 "Search for an experience before this action.",
                 "no-selection",
             )
-        products = [await get_product_async(UUID(item), self.data) for item in ids]
+        products = [
+            await get_product_async(UUID(item), self.data, locale=self._locale(conversation))
+            for item in ids
+        ]
         return _resolve_referent(products, message)
 
     def _commerce_product(

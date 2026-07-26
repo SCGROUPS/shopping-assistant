@@ -15,6 +15,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.admin.auth import CatalogWrite, ReadAccess
+from app.api.locale import LOCALE_PREFERENCE_KEY, RequestLocale
 from app.api.schemas import (
     BookingView,
     CartItemRequest,
@@ -25,6 +26,7 @@ from app.api.schemas import (
     EventRequest,
     ExperienceDetail,
     ExperienceListResponse,
+    LocalePreferenceRequest,
     MessageRequest,
     Participant,
     RecommendationResponse,
@@ -42,6 +44,7 @@ from app.common.config import get_settings
 from app.common.database import database_ready
 from app.common.errors import ApiError
 from app.common.llm_cost import ledger
+from app.common.locales import canonical_locale, negotiate_locale
 from app.common.models import BehaviorEvent
 from app.common.persistence import (
     catalog_products,
@@ -66,18 +69,31 @@ IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=8,
 
 @router.post("/search", response_model=SearchResponse)
 async def search(
-    request: SearchRequest, session_id: SessionHeader = "demo-session"
+    request: SearchRequest,
+    locale: RequestLocale,
+    session_id: SessionHeader = "demo-session",
 ) -> SearchResponse:
-    result = await search_service.search(request)
+    # The body field outranks the query parameter, because a POST body is the
+    # more specific statement of what this particular search is for. It is an
+    # input to negotiation, not a second source of truth: honoured verbatim it
+    # would let a client search a locale the storefront has not enabled and
+    # receive an empty corpus that reads as a catalogue problem, and ignored
+    # entirely it would break the documented precedence in which an explicit
+    # request outranks a session preference.
+    asked = canonical_locale(request.locale)
+    chosen = asked if asked in get_settings().enabled_locales else locale
+    result = await search_service.search(request.model_copy(update={"locale": chosen}))
     await _capture(
         session_id,
         EventRequest(event_type="search_submitted", query_id=result.query_id),
+        chosen,
     )
     return result
 
 
 @router.get("/experiences", response_model=ExperienceListResponse)
 async def list_experiences(
+    locale: RequestLocale,
     destination: str | None = None,
     category: str | None = None,
     limit: int = Query(default=20, ge=1, le=50),
@@ -86,7 +102,7 @@ async def list_experiences(
 ) -> ExperienceListResponse:
     products = [
         product
-        for product in await catalog_products()
+        for product in await catalog_products(locale=locale)
         if product["status"] == "PUBLISHED"
         and (not destination or product["destination"].casefold() == destination.casefold())
         and (not category or product["category"].casefold() == category.casefold())
@@ -98,17 +114,21 @@ async def list_experiences(
             for product in products[offset : offset + limit]
         ],
         total=len(products),
+        locale=locale,
     )
 
 
 @router.get("/experiences/{experience_id}", response_model=ExperienceDetail)
 async def experience_detail(
-    experience_id: UUID, session_id: SessionHeader = "demo-session"
+    experience_id: UUID,
+    locale: RequestLocale,
+    session_id: SessionHeader = "demo-session",
 ) -> ExperienceDetail:
-    product = await get_product_async(experience_id)
+    product = await get_product_async(experience_id, locale=locale)
     await _capture(
         session_id,
         EventRequest(event_type="experience_viewed", experience_id=experience_id),
+        locale,
     )
     return product_detail(product)
 
@@ -116,13 +136,16 @@ async def experience_detail(
 @router.get("/experiences/{experience_id}/availability")
 async def availability(
     experience_id: UUID,
+    locale: RequestLocale,
     visit_start: datetime | None = None,
     session_id: SessionHeader = "demo-session",
 ) -> dict[str, Any]:
-    product = await get_product_async(experience_id)
+    product = await get_product_async(experience_id, locale=locale)
     detail = product_detail(product, visit_start)
     await _capture(
-        session_id, EventRequest(event_type="availability_checked", experience_id=experience_id)
+        session_id,
+        EventRequest(event_type="availability_checked", experience_id=experience_id),
+        locale,
     )
     return {
         "experience_id": experience_id,
@@ -133,6 +156,7 @@ async def availability(
 
 @router.get("/recommendations", response_model=RecommendationResponse)
 async def recommendations(
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
     placement: str = Query(default="for_you"),
     experience_id: UUID | None = None,
@@ -161,14 +185,17 @@ async def recommendations(
         filters=filters,
         party=party,
         display_currency=display_currency,
+        locale=locale,
     )
 
 
 @router.post("/events", status_code=202)
 async def capture_event(
-    request: EventRequest, session_id: SessionHeader = "demo-session"
+    request: EventRequest,
+    locale: RequestLocale,
+    session_id: SessionHeader = "demo-session",
 ) -> dict[str, Any]:
-    return await _capture(session_id, request)
+    return await _capture(session_id, request, locale)
 
 
 @router.post("/conversations", status_code=201)
@@ -200,6 +227,7 @@ async def conversation_message(
     conversation_id: UUID,
     body: MessageRequest,
     http_request: Request,
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
     stream: bool | None = Query(default=None),
 ) -> Any:
@@ -209,17 +237,20 @@ async def conversation_message(
         else "text/event-stream" in http_request.headers.get("accept", "").casefold()
     )
     if not wants_stream:
-        response = await assistant_service.respond(conversation_id, session_id, body)
-        await _capture(session_id, EventRequest(event_type="assistant_message_sent"))
+        response = await assistant_service.respond(conversation_id, session_id, body, locale=locale)
+        await _capture(session_id, EventRequest(event_type="assistant_message_sent"), locale)
         return JSONResponse(jsonable_encoder(response))
 
     async def events():
         yield _sse("status", {"status": "working"})
         try:
-            response = await assistant_service.respond(conversation_id, session_id, body)
+            response = await assistant_service.respond(
+                conversation_id, session_id, body, locale=locale
+            )
             await _capture(
                 session_id,
                 EventRequest(event_type="assistant_message_sent"),
+                locale,
             )
             yield _sse("text_delta", {"delta": response.message})
             if response.products:
@@ -249,20 +280,22 @@ async def conversation_message(
 
 
 @router.get("/cart", response_model=CartView)
-async def get_cart(session_id: SessionHeader = "demo-session") -> CartView:
-    return await cart_service.get_cart(session_id)
+async def get_cart(locale: RequestLocale, session_id: SessionHeader = "demo-session") -> CartView:
+    return await cart_service.get_cart(session_id, locale)
 
 
 @router.post("/cart/items", response_model=CartView)
 async def add_cart_item(
     request: CartItemRequest,
     idempotency_key: IdempotencyHeader,
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
 ) -> CartView:
-    result = await cart_service.add_item(session_id, request, idempotency_key)
+    result = await cart_service.add_item(session_id, request, idempotency_key, locale)
     await _capture(
         session_id,
         EventRequest(event_type="cart_item_added", experience_id=request.experience_id),
+        locale,
     )
     return result
 
@@ -271,17 +304,19 @@ async def add_cart_item(
 async def remove_cart_item(
     item_id: UUID,
     idempotency_key: IdempotencyHeader,
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
 ) -> CartView:
-    return await cart_service.remove_item(session_id, item_id, idempotency_key)
+    return await cart_service.remove_item(session_id, item_id, idempotency_key, locale)
 
 
 @router.post("/checkout/prepare", response_model=CheckoutPrepareResponse)
 async def prepare_checkout(
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
 ) -> CheckoutPrepareResponse:
-    cart = await cart_service.validate(session_id)
-    await _capture(session_id, EventRequest(event_type="checkout_started"))
+    cart = await cart_service.validate(session_id, locale)
+    await _capture(session_id, EventRequest(event_type="checkout_started"), locale)
     return CheckoutPrepareResponse(
         cart=cart,
         ready=True,
@@ -293,17 +328,19 @@ async def prepare_checkout(
 async def confirm_checkout(
     request: CheckoutConfirmRequest,
     idempotency_key: IdempotencyHeader,
+    locale: RequestLocale,
     session_id: SessionHeader = "demo-session",
 ) -> BookingView:
     # Read the cart before confirming: confirmation clears it, and a booking
     # event with no experience attached is invisible to demand stats, so the
     # highest-weight signal in the product would never reach ranking.
-    cart = await cart_service.get_cart(session_id)
+    cart = await cart_service.get_cart(session_id, locale)
     booked = [item.experience_id for item in cart.items]
     booking = await booking_service.confirm(
         session_id,
         idempotency_key=idempotency_key,
         customer_details=request.customer_details,
+        locale=locale,
     )
     for experience_id in booked or [None]:
         await _capture(
@@ -314,6 +351,7 @@ async def confirm_checkout(
                 placement=request.placement,
                 properties={"booking_reference": booking.booking_reference},
             ),
+            locale,
         )
     return booking
 
@@ -374,7 +412,9 @@ async def import_catalog(
 
 
 @router.get("/session/context")
-async def session_context(session_id: SessionHeader = "demo-session") -> dict[str, Any]:
+async def session_context(
+    locale: RequestLocale, session_id: SessionHeader = "demo-session"
+) -> dict[str, Any]:
     """Bootstrap the storefront: which cohort is this shopper in?
 
     The frontend must know before first paint whether to render the assistant
@@ -385,6 +425,42 @@ async def session_context(session_id: SessionHeader = "demo-session") -> dict[st
         "session_id": session_id,
         "assistant_enabled": not assistant_holdout(session_id),
         "assistant_holdout": assistant_holdout(session_id),
+        "locale": locale,
+        "enabled_locales": list(get_settings().enabled_locales),
+    }
+
+
+@router.put("/session/locale")
+async def set_session_locale(
+    body: LocalePreferenceRequest, session_id: SessionHeader = "demo-session"
+) -> dict[str, Any]:
+    """Persist the switcher's choice for this session.
+
+    Negotiated rather than stored verbatim, so a locale that is not enabled
+    cannot be parked in a session and quietly applied to every later request
+    once someone notices the storefront looks wrong.
+    """
+    settings = get_settings()
+    chosen = negotiate_locale(explicit=body.locale, enabled=settings.enabled_locales)
+    if not database_mode():
+        session = store.session(session_id)
+        session["preference_state"] = {
+            **(session.get("preference_state") or {}),
+            LOCALE_PREFERENCE_KEY: chosen,
+        }
+    else:
+        factory = require_session_factory()
+        async with factory() as db:
+            record = await ensure_session(db, session_id)
+            record.preference_state = {
+                **(record.preference_state or {}),
+                LOCALE_PREFERENCE_KEY: chosen,
+            }
+            await db.commit()
+    return {
+        "locale": chosen,
+        "requested": body.locale,
+        "enabled_locales": list(settings.enabled_locales),
     }
 
 
@@ -416,7 +492,14 @@ async def api_health() -> dict[str, Any]:
     }
 
 
-async def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
+async def _capture(session_id: str, request: EventRequest, locale: str) -> dict[str, Any]:
+    """Record an event, always stamped with the locale it happened in.
+
+    Stamped here rather than at each call site because a locale recorded on
+    nine events out of ten is worse than none: the tenth looks like English
+    traffic, and the conclusion drawn from the mix - "nobody uses Korean" - is
+    the one that gets a locale switched off.
+    """
     allowed = {
         "search_submitted",
         "search_results_viewed",
@@ -447,6 +530,12 @@ async def _capture(session_id: str, request: EventRequest) -> dict[str, Any]:
         for key, value in request.properties.items()
         if key.casefold() not in {"message", "text", "email", "phone", "name"}
     }
+    # Assigned, not defaulted. `setdefault` let a client send
+    # `properties: {"locale": "ko"}` on a Vietnamese request and have it stored
+    # verbatim, so the one number used to decide whether a locale stays enabled
+    # was writable by anyone with curl. The server resolved this request; the
+    # request does not get a second opinion about itself.
+    safe_properties["locale"] = locale
     if not database_mode():
         event = {
             "id": len(store.events) + 1,

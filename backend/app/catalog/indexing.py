@@ -30,14 +30,15 @@ from sqlalchemy import case, func, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.common.locales import DEFAULT_LOCALE, SUPPORTED_LOCALES, fallback_chain
+from app.common.locales import SUPPORTED_LOCALES
 from app.common.models import (
     Destination,
     Experience,
     ExperienceSearchDocument,
-    ExperienceTranslation,
     IndexWorkItem,
 )
+from app.common.resolution import resolution_chain as _resolution_chain
+from app.common.resolution import resolve_experience_text, source_locale
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.assistant.provider import AIProvider
@@ -179,18 +180,6 @@ async def enqueue_reindex(
     return len(result.all())
 
 
-def source_locale(experience: Experience) -> str:
-    """The record's authoring language, in the one spelling everything else uses.
-
-    Locale tags are case-insensitive by specification and case-sensitive as
-    database strings. Normalising in some places and not others is worse than
-    not normalising at all: a record stored as `VI` would be indexed under
-    `vi` while its resolution chain looked for translations tagged `VI`, so the
-    document would be built, stored, and searchable - containing no text.
-    """
-    return (experience.source_language or DEFAULT_LOCALE).strip().lower()
-
-
 async def mark_locale_indexed(
     session: AsyncSession,
     experience_id: uuid.UUID,
@@ -265,21 +254,8 @@ async def retire_satisfied_work(
 
 
 async def resolution_chain(experience: Experience, locale: str) -> tuple[str, ...]:
-    """Locales to try for `locale`, in order, for this particular record.
-
-    The configured chain ends at English, which is right for a catalogue
-    authored in English and wrong for one authored in Vietnamese: a product
-    written in Vietnamese and not yet translated has no English text, so a
-    chain ending at `en` resolves to nothing and the product reads as blank.
-    Appending `source_language` guarantees every chain ends somewhere that is
-    populated, because the publish gate requires the source locale to be
-    complete.
-    """
-    ordered = [*fallback_chain(locale), source_locale(experience), DEFAULT_LOCALE]
-    seen: dict[str, None] = {}
-    for candidate in ordered:
-        seen.setdefault(candidate, None)
-    return tuple(seen)
+    """Locales to try for `locale`, in order, for this particular record."""
+    return _resolution_chain(experience, locale)
 
 
 async def resolved_document_text(
@@ -296,42 +272,22 @@ async def resolved_document_text(
     retrieval filters on locale and an absent document is never a candidate.
     Indexing what is *served* keeps the index and the page in agreement, which
     is the only version of this that cannot surprise anyone.
+
+    The resolution rule itself lives in `common/resolution.py` and is shared
+    with the API. It has to be: if the page resolved a field differently from
+    the indexer, a shopper would find a product by words the page never
+    displays, and neither side's tests would fail.
     """
-    chain = await resolution_chain(experience, locale)
-    rows = (
-        await session.execute(
-            select(ExperienceTranslation).where(
-                ExperienceTranslation.experience_id == experience.id,
-                ExperienceTranslation.locale.in_(chain),
-            )
-        )
-    ).scalars()
-    translations = {row.locale: row for row in rows}
-
-    source = source_locale(experience)
-
-    def resolve(field: str) -> str:
-        for candidate in chain:
-            if candidate == source:
-                value = getattr(experience, field, "") or ""
-                if value:
-                    return value
-                continue
-            row = translations.get(candidate)
-            if row is not None:
-                value = getattr(row, field, "") or ""
-                if value:
-                    return value
-        return getattr(experience, field, "") or ""
-
+    resolved = await resolve_experience_text(session, [experience], locale)
+    fields = resolved[experience.id]
     parts: list[str] = [
-        resolve("title"),
+        fields["title"].value,
         destination_name,
         experience.category,
         *(experience.subcategories or []),
         *(experience.interest_tags or []),
-        resolve("short_description"),
-        resolve("description"),
+        fields["short_description"].value,
+        fields["description"].value,
         experience.indoor_outdoor or "",
         *(experience.accessibility_features or []),
         *(experience.languages or []),

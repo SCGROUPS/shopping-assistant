@@ -15,7 +15,13 @@ resource chatModelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2
   name: chatDeployment
   sku: {
     name: 'GlobalStandard'
-    capacity: 10
+    // Sized for the translation backfill, not for the storefront. Eight
+    // thousand field-locale pairs at capacity 10 (10K TPM) spend almost the
+    // whole run collecting 429s and publish a handful per batch, so a full
+    // catalogue would take weeks of two-hourly runs. This is also why the
+    // number lives here: raising it only in the portal means the next
+    // deployment quietly puts it back.
+    capacity: 300
   }
   properties: {
     model: {

@@ -46,8 +46,10 @@ class Settings(BaseSettings):
     # finishes overnight. Bounded because the provider rate limits, and each
     # lane holds a database session for the length of a model call.
     # Sized against the deployment's tokens-per-minute quota, not against
-    # what the event loop could manage. Eight lanes against a 10K TPM
-    # deployment spend most of their time collecting 429s.
+    # what the event loop could manage: eight lanes against a 10K TPM
+    # deployment spend most of their time collecting 429s. The translate job
+    # overrides this to match its own quota; this default is the safe one for
+    # anything that has not been told what it is talking to.
     translation_concurrency: int = 3
     # Translation runs in its own container, so this ceiling is its own and
     # cannot starve the storefront. Hitting it defers work to the next run
@@ -60,6 +62,14 @@ class Settings(BaseSettings):
     # would park the queue exactly as five real failures do. This deadline is
     # what lets the run hand its work back instead.
     translation_run_seconds: float = 2400.0
+
+    # Which locales the storefront will actually serve. The gate, not a list of
+    # what exists: `SUPPORTED_LOCALES` says what the system understands, this
+    # says what has content good enough to show a paying customer. A locale is
+    # added here once its coverage and eval gates pass (spec 7, "locale
+    # readiness"), which is why it ships as `['en']` and moves under its own
+    # release rather than arriving with the machinery.
+    enabled_locales: list[str] = Field(default_factory=lambda: ["en"])
 
     assistant_max_tool_rounds: int = 3
     assistant_max_session_turns: int = 12

@@ -356,7 +356,12 @@ resource embeddingJob 'Microsoft.App/jobs@2024-03-01' = {
             '-c'
           ]
           args: [
-            'uv run --no-sync python -m app.catalog.cli seed-db && uv run --no-sync python -m app.catalog.cli refresh-availability && { uv run --no-sync python -m app.catalog.cli import-trippass || echo "Trippass import skipped: supplier feed unavailable"; } && uv run --no-sync python -m app.catalog.cli enqueue-translations && uv run --no-sync python -m app.catalog.cli reindex'
+            // Each step is timed. This job is fourteen minutes of a
+            // twenty-nine minute deploy and reported nothing about where they
+            // went, so every proposal to speed it up was a guess. `step` runs
+            // one CLI command and prints its duration; the deploy log then
+            // attributes the time without anyone having to reproduce it.
+            'step() { l="$1"; shift; s=$(date -u +%s); echo "--> $l"; "$@"; r=$?; echo "==> $l finished in $(( $(date -u +%s) - s ))s"; return $r; }; cli() { uv run --no-sync python -m app.catalog.cli "$@"; }; step seed-db cli seed-db && step refresh-availability cli refresh-availability && { step import-trippass cli import-trippass || echo "Trippass import skipped: supplier feed unavailable"; } && step enqueue-translations cli enqueue-translations && step reindex cli reindex'
           ]
           env: [
             {
@@ -486,6 +491,14 @@ resource translateJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               name: 'AZURE_OPENAI_API_VERSION'
               value: '2025-04-01-preview'
+            }
+            {
+              // Set here rather than in the application default, because it is
+              // a fact about this job against this deployment's quota and not
+              // about the software. The storefront shares the code and has no
+              // reason to inherit a backfill's concurrency.
+              name: 'TRANSLATION_CONCURRENCY'
+              value: '12'
             }
           ]
           resources: {

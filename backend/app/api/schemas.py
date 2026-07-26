@@ -4,8 +4,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.common.locales import DEFAULT_LOCALE
-
 ParticipantType = Literal["adult", "child", "infant", "senior", "student"]
 
 
@@ -47,7 +45,12 @@ class SearchRequest(BaseModel):
     # because it selects the corpus, not the formatting: a Vietnamese query has
     # to be parsed with the configuration its documents were indexed with, or it
     # stems differently on each side and simply stops matching.
-    locale: str = DEFAULT_LOCALE
+    #
+    # `None` rather than `"en"`, so "the client did not say" is distinguishable
+    # from "the client asked for English". With a default the route could not
+    # tell them apart, and would override a session's chosen Vietnamese with an
+    # English nobody requested.
+    locale: str | None = None
 
 
 class IntentValue(BaseModel):
@@ -63,6 +66,28 @@ class SearchIntent(BaseModel):
     exclusions: list[str] = Field(default_factory=list)
     needs_clarification: bool = False
     clarification_question: str | None = None
+
+
+class LocalePreferenceRequest(BaseModel):
+    locale: str
+
+
+class ContentFieldMeta(BaseModel):
+    """Where one displayed string came from, and whether it is current.
+
+    Three independent facts. Collapsing staleness into the same field as
+    fallback loses one of them in the case that needs both: a stale English
+    translation served to a German shopper is both, and reporting only
+    `fallback` hides that the text is also out of date.
+    """
+
+    locale: str
+    # source | manual | machine | imported | unknown
+    provenance: str
+    # Published, but the source has changed since.
+    stale: bool = False
+    # Not the language the shopper asked for.
+    fallback: bool = False
 
 
 class PriceView(BaseModel):
@@ -118,6 +143,17 @@ class ExperienceCard(BaseModel):
     reason: str | None = None
     reason_code: str | None = None
     options: list[OptionView] = Field(default_factory=list)
+    # The locale this card was resolved in, and where each translated string
+    # came from. Additive, per spec 4.3: the fields stay plain strings, so a
+    # client that ignores this keeps working, and one that reads it can label
+    # a description that fell back to English or has gone stale. A client that
+    # cannot tell fallback from translation cannot tell us either.
+    #
+    # Required, with no default. A default of English is indistinguishable
+    # from "whoever built this card forgot to say", and the second one is a
+    # mistranslation reported to nobody.
+    locale: str
+    content_meta: dict[str, ContentFieldMeta] = Field(default_factory=dict)
 
 
 class ExperienceDetail(ExperienceCard):
@@ -147,15 +183,21 @@ class SearchResponse(BaseModel):
     recommendations: list[ExperienceCard] | None = None
     facets: dict[str, dict[str, int]]
     relaxed_preferences: list[str] = Field(default_factory=list)
+    # On the envelope, not only on the cards. Zero results is exactly the case
+    # where a client most needs to know which corpus was searched, and exactly
+    # the case where there is no card to carry it.
+    locale: str
 
 
 class ExperienceListResponse(BaseModel):
     items: list[ExperienceCard]
     total: int
+    locale: str
 
 
 class RecommendationResponse(BaseModel):
     items: list[ExperienceCard]
+    locale: str
 
 
 class EventRequest(BaseModel):

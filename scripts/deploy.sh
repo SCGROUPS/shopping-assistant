@@ -11,6 +11,27 @@ resource_group="rg-${prefix}-poc"
 registry_name="$(printf '%s' "$prefix" | tr -d '-' | tr '[:upper:]' '[:lower:]')vietra"
 bootstrap_image="mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
 
+# Deploy phases announce themselves with elapsed time. Without this the script
+# ran for nineteen minutes between the image push and the final URL without
+# printing a single line, across four distinct phases - so a deploy that hung
+# gave an operator no way to tell a slow migration from a stuck job, and no
+# way to attribute the duration afterwards either. `phase` closes the previous
+# one before opening the next, so the numbers add up to the whole.
+_phase_name=""
+_phase_started=0
+phase() {
+  local now
+  now="$(date -u +%s)"
+  if [[ -n "$_phase_name" ]]; then
+    printf '==> %s took %dm%02ds\n' "$_phase_name" \
+      $(( (now - _phase_started) / 60 )) $(( (now - _phase_started) % 60 ))
+  fi
+  _phase_name="$1"
+  _phase_started="$now"
+  [[ -n "$_phase_name" ]] && printf -- '--> %s\n' "$_phase_name"
+  return 0
+}
+
 az account set --subscription "$subscription"
 
 if [[ -z "${POSTGRES_ADMIN_PASSWORD:-}" ]]; then
@@ -142,6 +163,7 @@ else
     exit 1
   }
 fi
+phase "Build and push image"
 az acr build \
   --resource-group "$resource_group" \
   --registry "$registry" \
@@ -187,7 +209,15 @@ run_job() {
     return 1
   fi
 
-  for _ in $(seq 1 "$attempts"); do
+  # The execution name is printed before the wait, not after it. A deploy that
+  # is still going is exactly when someone needs the identifier to go and read
+  # the job's own logs, and printing it only on failure means it is available
+  # in every case except the one where it is wanted.
+  echo "${description} running as ${execution}"
+
+  local started elapsed attempt
+  started="$(date -u +%s)"
+  for attempt in $(seq 1 "$attempts"); do
     status="$(az containerapp job execution show \
       --resource-group "$resource_group" \
       --name "$job_name" \
@@ -203,6 +233,14 @@ run_job() {
         return 1
         ;;
     esac
+    # A heartbeat every two minutes. Silence for fourteen minutes is
+    # indistinguishable from a hang, and the difference decides whether
+    # somebody cancels a deploy that was about to succeed.
+    if (( attempt % 12 == 0 )); then
+      elapsed=$(( $(date -u +%s) - started ))
+      printf '    %s still running after %dm%02ds (status: %s)\n' \
+        "$description" $(( elapsed / 60 )) $(( elapsed % 60 )) "${status:-unknown}"
+    fi
     sleep 10
   done
 
@@ -215,6 +253,7 @@ run_job() {
 # app to the new image too; updating the job's image directly is what lets the
 # schema go first. Migrations must therefore be expand-only - the old code is
 # still serving traffic while this runs, and must keep working afterwards.
+phase "Schema migration"
 az containerapp job update \
   --resource-group "$resource_group" \
   --name "job-${prefix}-migrate" \
@@ -223,6 +262,7 @@ az containerapp job update \
 
 run_job "job-${prefix}-migrate" "Schema migration"
 
+phase "Promote application (stack deployment)"
 deploy_stack "${login_server}/vietra:latest" "$build_revision"
 
 # The catalogue job imports, reconciles and then drains the index queue, and
@@ -230,8 +270,10 @@ deploy_stack "${login_server}/vietra:latest" "$build_revision"
 # to outlast the job's own 3600s timeout rather than inherit the migration's,
 # so that a job which fails on time reports as failed rather than as a script
 # that gave up on something still running.
+phase "Catalogue import, reconcile and index"
 run_job "job-${prefix}-catalog" "Catalog job" 380
 
+phase "Wait for the application to answer"
 hostname="$(az containerapp show \
   --resource-group "$resource_group" \
   --name "$app_name" \
@@ -252,6 +294,7 @@ curl --fail --silent "${app_url}/api/v1/experiences?limit=1" >/dev/null
 # Only now, with the stack deployed, migrated, seeded and answering. A
 # fingerprint recorded any earlier would let the next deployment skip the
 # infrastructure step on the strength of a run that never finished.
+phase ""
 az group update \
   --name "$resource_group" \
   --set "tags.stackFingerprint=${stack_fingerprint}" \
