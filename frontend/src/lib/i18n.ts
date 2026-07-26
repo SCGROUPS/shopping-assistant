@@ -342,6 +342,8 @@ const en = {
     'I could not confirm the date you mentioned, so these results are not limited to it. Please pick your dates in the filters.',
   'unresolved.date_implausible':
     'The date I read did not look like a date you could book, so these results are not limited to it. Please pick your dates in the filters.',
+  'unresolved.category_unmatched':
+    'I read your request as a type of experience we do not group things by, so these results are not limited to it. Use the category filter to narrow them down.',
   'assistant.degraded':
     'I could not reach my planning model, so I searched for what you wrote. I could not add anything to your cart, prepare a checkout or book. Please try again in a moment.',
   'assistant.msg.searchResults_one': 'I found one option that fits.',
@@ -751,6 +753,8 @@ const vi: Dictionary = {
     'Tôi chưa xác nhận được ngày bạn nhắc tới, nên kết quả này không giới hạn theo ngày đó. Vui lòng chọn ngày trong bộ lọc.',
   'unresolved.date_implausible':
     'Ngày tôi đọc được không giống một ngày có thể đặt, nên kết quả này không giới hạn theo ngày đó. Vui lòng chọn ngày trong bộ lọc.',
+  'unresolved.category_unmatched':
+    'Tôi hiểu yêu cầu của bạn theo một loại trải nghiệm mà chúng tôi không phân nhóm, nên kết quả này không giới hạn theo loại đó. Bạn có thể dùng bộ lọc danh mục để thu hẹp.',
   'assistant.degraded':
     'Tôi chưa kết nối được tới mô hình lập kế hoạch, nên tôi chỉ tìm theo đúng nội dung bạn viết. Tôi chưa thể thêm vào giỏ, chuẩn bị thanh toán hay đặt chỗ. Vui lòng thử lại sau giây lát.',
   'assistant.msg.searchResults_other':

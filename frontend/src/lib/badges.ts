@@ -81,6 +81,7 @@ export const relaxationLabels = (codes: string[], t: Translator): string[] =>
 const UNRESOLVED_KEYS: Record<string, MessageKey> = {
   date_unverified: 'unresolved.date_unverified',
   date_implausible: 'unresolved.date_implausible',
+  category_unmatched: 'unresolved.category_unmatched',
 }
 
 export const unresolvedLabels = (codes: string[], t: Translator): string[] =>
