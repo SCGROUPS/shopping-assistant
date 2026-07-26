@@ -7,12 +7,14 @@ from app.catalog.db_seed import refresh_availability, seed_database
 from app.catalog.importer import import_trippass
 from app.catalog.indexing import run_reindex
 from app.catalog.seed import build_seed_catalog
+from app.common.logging_setup import configure_logging
 from app.common.store import store
 from app.content.jobs import backlog as translation_backlog
 from app.content.jobs import drain_translations, enqueue_all
 
 
 def main() -> None:
+    configure_logging()
     parser = argparse.ArgumentParser(description="Seed or export the POC tourism catalog")
     parser.add_argument(
         "command",

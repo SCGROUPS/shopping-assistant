@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from openai import APIConnectionError
+from openai import APIConnectionError, RateLimitError
 from sqlalchemy import and_, func, select, text, tuple_, update
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -571,6 +571,19 @@ async def _run_one(session_factory, translator, job: Leased, *, hold_all: bool) 
             timeout=settings.translation_timeout_seconds,
         )
         verify_glossary(job.source_text, translated, terms)
+    except RateLimitError as exc:
+        # Backpressure, not failure. The provider is telling us to come back,
+        # and the work is untouched - so this must not cost an attempt. It did:
+        # the first production run put the whole catalogue into `failed` in
+        # ninety seconds, because eight lanes against a 10K TPM deployment burn
+        # five attempts each faster than the quota window refills.
+        #
+        # The sleep is inside the semaphore deliberately. It holds the lane, so
+        # a rate-limited batch stops asking instead of spinning through its
+        # remaining jobs at full speed to collect the same 429.
+        await asyncio.sleep(_retry_after(exc))
+        await _defer(session_factory, job, f"rate limited: {exc}")
+        return "throttled"
     except BudgetExceeded as exc:
         # Not a failure of this job: the work is fine, we simply declined to pay
         # for it right now. Consuming an attempt would mean a spending ceiling
@@ -598,6 +611,27 @@ async def _run_one(session_factory, translator, job: Leased, *, hold_all: bool) 
         return await _record_failure(session_factory, job, exc)
 
     return "published" if published else "superseded"
+
+
+# Long enough to let a per-minute quota window actually refill. A one-second
+# retry against a TPM limit is just a second 429.
+DEFAULT_RETRY_AFTER = 20.0
+MAX_RETRY_AFTER = 120.0
+
+
+def _retry_after(exc: Exception) -> float:
+    """How long the provider asked us to wait, when it says so.
+
+    Guessing is what produces a retry storm; the header exists precisely so we
+    do not have to. Capped so a provider returning something absurd cannot idle
+    the worker until its replica timeout kills it.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    raw = headers.get("retry-after") if headers else None
+    try:
+        return min(max(float(raw), 1.0), MAX_RETRY_AFTER)  # pyright: ignore[reportArgumentType]
+    except (TypeError, ValueError):
+        return DEFAULT_RETRY_AFTER
 
 
 async def _defer(session_factory, job: Leased, detail: str) -> str:
@@ -682,6 +716,11 @@ async def drain(
         "retrying": 0,
         "failed": 0,
         "deferred": 0,
+        # Counted apart from `deferred` because they mean opposite things to the
+        # caller: a spent budget means stop, a rate limit means slow down. One
+        # 429 collapsing into `deferred` would end the whole drain and leave the
+        # backlog to a job that runs every two hours.
+        "throttled": 0,
     }
     if not jobs:
         return counts

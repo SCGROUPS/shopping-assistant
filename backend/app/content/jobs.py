@@ -77,6 +77,7 @@ async def drain_translations(
         "retrying": 0,
         "failed": 0,
         "deferred": 0,
+        "throttled": 0,
     }
     translator = make_translator(provider, session_factory)
 
@@ -100,6 +101,14 @@ async def drain_translations(
             # left off, with every attempt still available.
             logger.warning("translation.budget_reached", extra={"counts": counts})
             break
+        if counts["throttled"]:
+            # Throttling is not "no progress", it is the provider pacing us, and
+            # `_run_one` has already waited out the interval it asked for. The
+            # attempts were handed back, so going round again is free; stopping
+            # here would leave a 10K TPM deployment translating one batch every
+            # two hours.
+            logger.info("translation.throttled", extra={"counts": counts})
+            continue
         if counts["published"] == 0 and counts["superseded"] == 0:
             # Nothing moved forward. Draining again would lease the same jobs
             # back the moment their leases expire and burn the rest of their

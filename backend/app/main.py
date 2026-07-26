@@ -14,6 +14,7 @@ from app.api.routes import router
 from app.common.config import get_settings
 from app.common.database import database_ready
 from app.common.errors import install_error_handlers
+from app.common.logging_setup import configure_logging
 from app.common.store import store
 
 settings = get_settings()
@@ -21,6 +22,7 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging()
     if settings.demo_mode:
         store.seed()
         yield

@@ -56,6 +56,7 @@ from app.content.fingerprints import (
 from app.content.translator import (
     MAX_ATTEMPTS,
     GlossaryViolation,
+    _retry_after,
     classify,
     commit_translation,
     drain,
@@ -491,6 +492,7 @@ async def test_a_clean_drain_publishes_and_marks_current(factory):
         "published": 4,
         "superseded": 0,
         "retrying": 0,
+        "throttled": 0,
         "failed": 0,
         "deferred": 0,
     }
@@ -1163,3 +1165,70 @@ async def test_enqueueing_an_experience_does_not_scale_round_trips_with_locales(
     assert len(statements) <= 6, (
         f"a fixed cost per experience, not one per locale, got {len(statements)}"
     )
+
+
+async def test_a_rate_limit_does_not_cost_the_job_an_attempt(factory):
+    """429 is the provider pacing us, not the translation being wrong.
+
+    The first production run parked the entire catalogue in `failed` inside
+    ninety seconds: eight lanes against a 10K TPM deployment collect 429s faster
+    than the quota window refills, and each one consumed an attempt, so every
+    job burned all five without a single real failure. The work is untouched, so
+    the attempt has to be handed back.
+    """
+    await _enqueue(factory, locales=["vi"])
+
+    request = httpx.Request("POST", "https://example.invalid/openai")
+    limited = RateLimitError(
+        "slow down",
+        response=httpx.Response(429, request=request, headers={"retry-after": "1"}),
+        body=None,
+    )
+
+    async def rate_limited(*, job, glossary):
+        raise limited
+
+    counts = await drain(factory, rate_limited, limit=4)
+    assert counts["throttled"] == 4
+    assert counts["failed"] == 0 and counts["retrying"] == 0
+
+    for job in await _jobs(factory):
+        assert job.status == "queued"
+        assert job.attempts == 0, "a throttled job must be exactly as it was"
+        assert job.failure_kind is None
+
+    # And the same jobs are still fully available to a worker that gets through.
+    async def succeeds(*, job, glossary):
+        return f"[vi] {job.source_text}"
+
+    counts = await drain(factory, succeeds, limit=4)
+    assert counts["published"] == 4
+
+
+async def test_throttling_is_reported_apart_from_a_spent_budget(factory):
+    """The two mean opposite things: one says slow down, the other says stop.
+
+    Collapsing a 429 into `deferred` ends the drain loop, which would leave a
+    rate-limited deployment translating a single batch every two hours - the
+    backlog would never close.
+    """
+    assert "throttled" in (await drain(factory, _echo, limit=1))
+
+
+def test_a_retry_after_header_is_believed_but_not_blindly(factory):
+    request = httpx.Request("POST", "https://example.invalid/openai")
+
+    def limited(headers):
+        return RateLimitError(
+            "slow down",
+            response=httpx.Response(429, request=request, headers=headers),
+            body=None,
+        )
+
+    assert _retry_after(limited({"retry-after": "7"})) == 7.0
+    # No header at all: guessing short is how a retry storm starts.
+    assert _retry_after(limited({})) == translator_module.DEFAULT_RETRY_AFTER
+    assert _retry_after(limited({"retry-after": "banana"})) == translator_module.DEFAULT_RETRY_AFTER
+    # A provider returning something absurd must not idle the worker until its
+    # replica timeout kills it.
+    assert _retry_after(limited({"retry-after": "99999"})) == translator_module.MAX_RETRY_AFTER
