@@ -106,9 +106,7 @@ async def _publish(factory, locale, **values):
     """Publish a translation the way the worker does: text plus field state."""
     async with factory() as session:
         await enqueue_experience_translations(session, EXPERIENCE_ID, locales=[locale])
-        session.add(
-            ExperienceTranslation(experience_id=EXPERIENCE_ID, locale=locale, **values)
-        )
+        session.add(ExperienceTranslation(experience_id=EXPERIENCE_ID, locale=locale, **values))
         for field in values:
             row = (
                 await session.execute(
@@ -293,9 +291,7 @@ async def test_resolution_does_not_scale_its_queries_with_the_catalogue(factory)
         await session.commit()
 
     async with factory() as session:
-        experiences = list(
-            (await session.execute(select(Experience))).scalars().all()
-        )
+        experiences = list((await session.execute(select(Experience))).scalars().all())
 
     statements: list[str] = []
     engine = create_async_engine(DATABASE_URL)
@@ -367,9 +363,7 @@ def test_accept_language_is_ordered_by_quality_not_by_position():
 
 def test_an_unserved_header_tag_does_not_shadow_one_we_do_serve():
     """`normalize_locale` answers `en` for anything unknown, which would win."""
-    assert (
-        negotiate_locale(accept_language="sv,vi;q=0.9", enabled=["en", "vi"]) == "vi"
-    )
+    assert negotiate_locale(accept_language="sv,vi;q=0.9", enabled=["en", "vi"]) == "vi"
 
 
 def test_a_locale_that_is_not_enabled_degrades_rather_than_being_honoured():
@@ -433,9 +427,7 @@ async def api_client():
 
     from app.main import app
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         yield client
 
 
@@ -582,12 +574,7 @@ def test_an_unknown_explicit_locale_does_not_override_a_valid_session_choice():
     an unserviceable tag into a deliberate-looking request for English that
     then outranks the Vietnamese the session already chose.
     """
-    assert (
-        negotiate_locale(
-            explicit="sv", session_preference="vi", enabled=["en", "vi"]
-        )
-        == "vi"
-    )
+    assert negotiate_locale(explicit="sv", session_preference="vi", enabled=["en", "vi"]) == "vi"
     assert (
         negotiate_locale(
             explicit="klingon",
@@ -598,9 +585,7 @@ def test_an_unknown_explicit_locale_does_not_override_a_valid_session_choice():
         == "vi"
     )
     assert (
-        negotiate_locale(
-            session_preference="sv", accept_language="fr", enabled=["en", "fr"]
-        )
+        negotiate_locale(session_preference="sv", accept_language="fr", enabled=["en", "fr"])
         == "fr"
     )
 
@@ -639,9 +624,7 @@ async def test_the_assistant_searches_the_locale_the_request_resolved(api_client
     settings = get_settings()
     settings.enabled_locales = ["en", "vi"]
     try:
-        created = await api_client.post(
-            "/api/v1/conversations", json={}, headers=headers
-        )
+        created = await api_client.post("/api/v1/conversations", json={}, headers=headers)
         conversation_id = created.json()["id"]
 
         seen: list[str | None] = []

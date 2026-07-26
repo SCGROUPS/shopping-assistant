@@ -63,9 +63,7 @@ def _matches(product: dict[str, Any], term: str) -> bool:
     return re.search(_word_pattern(term), _text(product)) is not None
 
 
-def forbid_terms(
-    products: Sequence[dict[str, Any]], terms: Iterable[str]
-) -> list[Violation]:
+def forbid_terms(products: Sequence[dict[str, Any]], terms: Iterable[str]) -> list[Violation]:
     """No returned product may be about a thing the shopper ruled out.
 
     "Somewhere in the ocean, not mountain" is the canonical case. The old
@@ -82,9 +80,7 @@ def forbid_terms(
     return violations
 
 
-def require_any_term(
-    products: Sequence[dict[str, Any]], terms: Sequence[str]
-) -> list[Violation]:
+def require_any_term(products: Sequence[dict[str, Any]], terms: Sequence[str]) -> list[Violation]:
     """Every returned product must relate to at least one thing asked for."""
     if not terms:
         return []
@@ -158,9 +154,7 @@ def min_rating(products: Sequence[dict[str, Any]], floor: float) -> list[Violati
     ]
 
 
-def max_duration_minutes(
-    products: Sequence[dict[str, Any]], ceiling: int
-) -> list[Violation]:
+def max_duration_minutes(products: Sequence[dict[str, Any]], ceiling: int) -> list[Violation]:
     return [
         Violation(
             "max_duration_minutes",
@@ -171,9 +165,7 @@ def max_duration_minutes(
     ]
 
 
-def require_category(
-    products: Sequence[dict[str, Any]], category: str
-) -> list[Violation]:
+def require_category(products: Sequence[dict[str, Any]], category: str) -> list[Violation]:
     return [
         Violation(
             "require_category",
@@ -244,9 +236,7 @@ def message_mentions(message: str, terms: Sequence[str]) -> list[Violation]:
     ]
 
 
-def grounded(
-    products: Sequence[dict[str, Any]], offered_ids: set[str]
-) -> list[Violation]:
+def grounded(products: Sequence[dict[str, Any]], offered_ids: set[str]) -> list[Violation]:
     """Every product shown must trace back to something a tool actually returned.
 
     This is the convention the agent is held to: it curates and explains, it

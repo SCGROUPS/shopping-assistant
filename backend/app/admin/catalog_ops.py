@@ -219,9 +219,7 @@ async def list_experiences(query: CatalogQuery) -> dict[str, Any]:
         overrides = {
             override.experience_id: list(override.fields or [])
             for override in await session.scalars(
-                select(ExperienceOverride).where(
-                    ExperienceOverride.experience_id.in_(identifiers)
-                )
+                select(ExperienceOverride).where(ExperienceOverride.experience_id.in_(identifiers))
             )
         }
         prices = await _lead_prices(session, identifiers)
@@ -242,9 +240,7 @@ async def list_experiences(query: CatalogQuery) -> dict[str, Any]:
         }
 
 
-async def _lead_prices(
-    session: AsyncSession, identifiers: list[UUID]
-) -> dict[UUID, float]:
+async def _lead_prices(session: AsyncSession, identifiers: list[UUID]) -> dict[UUID, float]:
     """The cheapest adult price per experience: what the storefront shows."""
     if not identifiers:
         return {}
@@ -360,9 +356,7 @@ def _validate(changes: dict[str, Any], allowed: dict[str, Any]) -> dict[str, Any
         if expected is None:
             raise ApiError(422, "Invalid edit", f"'{field}' is not editable", "invalid-edit")
         if not isinstance(value, expected):
-            raise ApiError(
-                422, "Invalid edit", f"'{field}' has the wrong type", "invalid-edit"
-            )
+            raise ApiError(422, "Invalid edit", f"'{field}' has the wrong type", "invalid-edit")
         cleaned[field] = value
     if "indoor_outdoor" in cleaned and cleaned["indoor_outdoor"] not in INDOOR_OUTDOOR:
         raise ApiError(
@@ -441,9 +435,7 @@ async def update_experience(
     return await get_experience(experience_id)
 
 
-async def clear_override(
-    experience_id: UUID, field: str, principal: Principal
-) -> dict[str, Any]:
+async def clear_override(experience_id: UUID, field: str, principal: Principal) -> dict[str, Any]:
     """Hand a field back to the supplier feed.
 
     Without this an override is a one-way door: the moment an operator fixes a
@@ -460,9 +452,7 @@ async def clear_override(
         override = await session.get(ExperienceOverride, experience.id)
         held = dict(override.fields) if override is not None else {}
         if field not in held:
-            raise ApiError(
-                404, "No override", f"{field!r} is not overridden", "override-not-found"
-            )
+            raise ApiError(404, "No override", f"{field!r} is not overridden", "override-not-found")
         del held[field]
         assert override is not None
         override.fields = held
@@ -533,9 +523,7 @@ async def set_status(
             entity_type="experience",
             entity_id=experience.id,
             summary=f"Set '{experience.title}' to {status}" + (f": {note}" if note else ""),
-            changes=audit.diff(
-                before, {"status": status, "needs_review": experience.needs_review}
-            ),
+            changes=audit.diff(before, {"status": status, "needs_review": experience.needs_review}),
         )
     return await get_experience(experience_id)
 

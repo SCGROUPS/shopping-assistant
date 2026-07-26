@@ -32,7 +32,17 @@ param postgresAdminPassword string
 param adminBootstrapKey string = ''
 
 param chatDeployment string = 'gpt-5.4-mini'
-param intentDeployment string = 'gpt-5-nano'
+// Intent extraction shares the chat model. Nano's output wandered between
+// identical calls - inventing categories this catalogue does not stock, and
+// moving the destination in and out of the hard constraints - which showed up
+// as a search that returned nothing about half the time. Its capacity was also
+// 10 against the chat model's 300.
+param intentDeployment string = 'gpt-5.4-mini'
+
+// Declared so the deployment is managed rather than drifting. Nothing points
+// at it today - intent moved to the chat model - but it exists in the account
+// and infrastructure that does not describe reality is worse than none.
+param nanoDeployment string = 'gpt-5.4-nano'
 param embeddingDeployment string = 'text-embedding-3-small'
 param imageDeployment string = 'gpt-image-1-mini'
 
@@ -81,7 +91,7 @@ module aiIntegration 'ai-integration.bicep' = {
   params: {
     aiAccountName: aiAccount.outputs.accountName
     chatDeployment: chatDeployment
-    intentDeployment: intentDeployment
+    nanoDeployment: nanoDeployment
     embeddingDeployment: embeddingDeployment
     imageDeployment: imageDeployment
   }

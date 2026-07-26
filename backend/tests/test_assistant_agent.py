@@ -254,9 +254,7 @@ async def test_the_agent_cannot_prepare_and_confirm_in_one_turn(store: DemoStore
                 )
                 return AgentAnswer(message="added")
             self.prepared = await execute("prepare_checkout", {})
-            self.outcome = await execute(
-                "confirm_simulated_checkout", {"shopper_confirmed": True}
-            )
+            self.outcome = await execute("confirm_simulated_checkout", {"shopper_confirmed": True})
             return AgentAnswer(message="done")
 
     agent = PrepareThenConfirm()
@@ -300,9 +298,7 @@ async def test_a_confirmation_in_a_later_turn_is_honoured(store: DemoStore) -> N
             if text == "checkout":
                 self.prepared = await execute("prepare_checkout", {})
                 return AgentAnswer(message="here is your total")
-            self.outcome = await execute(
-                "confirm_simulated_checkout", {"shopper_confirmed": True}
-            )
+            self.outcome = await execute("confirm_simulated_checkout", {"shopper_confirmed": True})
             return AgentAnswer(message="booked")
 
     agent = Scripted()
@@ -553,6 +549,7 @@ async def test_a_declined_answer_does_not_replay_the_agent_s_tools(store: DemoSt
     time - the shopper's cart quietly holding two of everything, because we
     disliked the sentence the model wrote about the first one.
     """
+
     class DecliningProvider(DemoAIProvider):
         retried = False
         tool_result: dict = {}

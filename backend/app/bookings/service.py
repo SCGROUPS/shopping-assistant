@@ -56,9 +56,7 @@ class BookingService:
         factory = require_session_factory()
         async with factory() as db, db.begin():
             shopping_session = await ensure_session(db, session_id)
-            await lock_idempotency(
-                db, shopping_session.id, "checkout", idempotency_key
-            )
+            await lock_idempotency(db, shopping_session.id, "checkout", idempotency_key)
             repeated = await db.scalar(
                 select(IdempotencyRecord).where(
                     IdempotencyRecord.session_id == shopping_session.id,
@@ -72,9 +70,7 @@ class BookingService:
             cart, cart_view = await self.carts.validate_db(
                 db, shopping_session.id, locale=locale, lock_slots=True
             )
-            existing = await db.scalar(
-                select(Booking).where(Booking.cart_id == cart.id)
-            )
+            existing = await db.scalar(select(Booking).where(Booking.cart_id == cart.id))
             if existing:
                 response = await self._db_view(db, existing)
                 db.add(
@@ -127,11 +123,7 @@ class BookingService:
                 valid_until=valid_until,
             )
             db.add_all([booking, voucher])
-            items = (
-                await db.scalars(
-                    select(CartItem).where(CartItem.cart_id == cart.id)
-                )
-            ).all()
+            items = (await db.scalars(select(CartItem).where(CartItem.cart_id == cart.id))).all()
             for item in items:
                 if item.slot_id:
                     slot = await db.scalar(
@@ -180,9 +172,7 @@ class BookingService:
         return (await self.get(booking_id)).voucher
 
     async def _db_view(self, db, booking: Booking) -> BookingView:
-        voucher = await db.scalar(
-            select(Voucher).where(Voucher.booking_id == booking.id)
-        )
+        voucher = await db.scalar(select(Voucher).where(Voucher.booking_id == booking.id))
         if voucher is None:
             raise ApiError(
                 409,

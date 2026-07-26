@@ -62,16 +62,8 @@ async def lock_idempotency(
     idempotency_key: str,
 ) -> None:
     await db.execute(
-        text(
-            "SELECT pg_advisory_xact_lock("
-            "hashtextextended(:idempotency_scope, 0)"
-            ")"
-        ),
-        {
-            "idempotency_scope": (
-                f"{session_id}:{operation}:{idempotency_key}"
-            )
-        },
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:idempotency_scope, 0))"),
+        {"idempotency_scope": (f"{session_id}:{operation}:{idempotency_key}")},
     )
 
 
@@ -130,9 +122,7 @@ async def load_products(
         destinations[destination_id] = destination_name
     document_rows = await db.execute(
         select(ExperienceSearchDocument).where(
-            ExperienceSearchDocument.experience_id.in_(
-                {item.id for item in experiences}
-            ),
+            ExperienceSearchDocument.experience_id.in_({item.id for item in experiences}),
             # Explicit, not incidental. The document table is keyed by
             # (experience_id, locale), so without this filter a record with
             # several locales would contribute several rows and whichever the
@@ -144,9 +134,7 @@ async def load_products(
             ExperienceSearchDocument.locale == locale,
         )
     )
-    documents = {
-        item.experience_id: item for item in document_rows.scalars().all()
-    }
+    documents = {item.experience_id: item for item in document_rows.scalars().all()}
 
     resolved = await resolve_experience_text(db, experiences, locale)
 
@@ -174,16 +162,20 @@ def _product_dict(
     locale: str,
 ) -> dict[str, Any]:
     media = sorted(experience.media, key=lambda item: item.sort_order)
-    document_text = document.document_text if document else " ".join(
-        [
-            fields["title"].value,
-            destination,
-            experience.category,
-            *experience.subcategories,
-            *experience.interest_tags,
-            fields["short_description"].value,
-            fields["description"].value,
-        ]
+    document_text = (
+        document.document_text
+        if document
+        else " ".join(
+            [
+                fields["title"].value,
+                destination,
+                experience.category,
+                *experience.subcategories,
+                *experience.interest_tags,
+                fields["short_description"].value,
+                fields["description"].value,
+            ]
+        )
     )
     embedding = (
         list(document.embedding)

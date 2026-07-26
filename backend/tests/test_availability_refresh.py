@@ -371,9 +371,7 @@ async def test_refresh_covers_every_slot_when_it_has_to_chunk(factory, monkeypat
         assert await _capacity(factory, slot_id) == n
 
 
-async def test_refresh_cannot_overwrite_a_checkout_that_commits_while_it_runs(
-    factory, monkeypatch
-):
+async def test_refresh_cannot_overwrite_a_checkout_that_commits_while_it_runs(factory, monkeypatch):
     """Subtracting sold capacity is only honest if the total cannot move meanwhile.
 
     The refresh reads how much has been booked, then writes seed capacity minus

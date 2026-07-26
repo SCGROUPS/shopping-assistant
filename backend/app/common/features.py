@@ -137,9 +137,7 @@ def preference_fit(
     # thought to ask for them.
     signals.append(1.0 if product["instant_confirmation"] else 0.0)
     signals.append(
-        1.0
-        if any(option["free_cancellation_hours"] > 0 for option in product["options"])
-        else 0.0
+        1.0 if any(option["free_cancellation_hours"] > 0 for option in product["options"]) else 0.0
     )
     signals.append(min(1.0, len(product["languages"]) / 4))
     return sum(signals) / len(signals)

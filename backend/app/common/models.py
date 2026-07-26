@@ -112,6 +112,7 @@ class Experience(Base, TimestampMixin):
         a partner submission cannot disagree about how a record is tagged.
         """
         return (value or "en").strip().lower()
+
     # Incremented by mutations to the source and commerce state a partner sees
     # in its diff - text, options, prices, availability policy, media. Derived
     # state (translations, search documents, merchandising) is excluded, or
@@ -243,9 +244,7 @@ class ExperienceSearchDocument(Base):
     # time a translation lands, so a release cannot wait on it; this does not,
     # which is what lets a deploy ask "was everything built by my image?"
     # without also waiting on unrelated content work that will never finish.
-    index_recipe: Mapped[str] = mapped_column(
-        String(64), default="", server_default="", index=True
-    )
+    index_recipe: Mapped[str] = mapped_column(String(64), default="", server_default="", index=True)
     embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

@@ -445,8 +445,7 @@ class AssistantService:
             logger.warning("Agent answer declined; not retrying the turn")
             return AssistantResponse(
                 message=(
-                    "I could not put together a reply I can stand behind. "
-                    "Please ask me again."
+                    "I could not put together a reply I can stand behind. Please ask me again."
                 ),
                 message_code="assistant.msg.unavailable",
                 degraded=True,
@@ -665,8 +664,7 @@ class AssistantService:
         # client renders from the shopper's own dictionary. Naming it again here
         # would put untranslatable English back into the sentence.
         message_text = (
-            f"I found {len(products)} grounded options. "
-            "The first choices best match your request."
+            f"I found {len(products)} grounded options. The first choices best match your request."
         )
         # The model writes in the shopper's language; this sentence cannot. So
         # the code survives only while the model does not, and the client
@@ -686,7 +684,9 @@ class AssistantService:
                 else:
                     logger.warning("Enhanced prose named an offering not on the page; keeping code")
             elif enhanced:
-                logger.warning("Enhanced prose carried a contact channel; keeping the coded message")
+                logger.warning(
+                    "Enhanced prose carried a contact channel; keeping the coded message"
+                )
         except Exception:
             logger.exception("Grounded assistant prose enhancement failed")
         return AssistantResponse(

@@ -68,8 +68,7 @@ async def create_postgres_schema(engine, *, force: bool = False) -> None:
         database = connection.engine.url.database or ""
         if "test" not in database:
             raise RuntimeError(
-                f"Refusing to reset {database!r}: the test database name must "
-                "contain 'test'."
+                f"Refusing to reset {database!r}: the test database name must contain 'test'."
             )
         await connection.exec_driver_sql("DROP SCHEMA public CASCADE")
         await connection.exec_driver_sql("CREATE SCHEMA public")

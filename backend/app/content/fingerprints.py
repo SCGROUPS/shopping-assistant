@@ -37,9 +37,7 @@ def source_fingerprint(*, text: str, source_language: str, locale: str) -> str:
     return _digest(FINGERPRINT_VERSION, "source", source_language, locale, text)
 
 
-def recipe_fingerprint(
-    *, prompt_version: str, glossary_revision: int, model: str
-) -> str:
+def recipe_fingerprint(*, prompt_version: str, glossary_revision: int, model: str) -> str:
     """How a machine would render it.
 
     Hashes the glossary *revision number*, not its contents, so editing a term

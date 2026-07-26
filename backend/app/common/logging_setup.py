@@ -23,10 +23,29 @@ from typing import Any
 # from an `extra=`, and is the part worth reading.
 _BUILTIN = frozenset(
     {
-        "args", "asctime", "created", "exc_info", "exc_text", "filename",
-        "funcName", "levelname", "levelno", "lineno", "module", "msecs",
-        "message", "msg", "name", "pathname", "process", "processName",
-        "relativeCreated", "stack_info", "taskName", "thread", "threadName",
+        "args",
+        "asctime",
+        "created",
+        "exc_info",
+        "exc_text",
+        "filename",
+        "funcName",
+        "levelname",
+        "levelno",
+        "lineno",
+        "module",
+        "msecs",
+        "message",
+        "msg",
+        "name",
+        "pathname",
+        "process",
+        "processName",
+        "relativeCreated",
+        "stack_info",
+        "taskName",
+        "thread",
+        "threadName",
     }
 )
 
@@ -41,7 +60,9 @@ class JsonFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key in _BUILTIN or key.startswith("_"):
                 continue
-            payload[key] = value if isinstance(value, str | int | float | bool | None) else repr(value)
+            payload[key] = (
+                value if isinstance(value, str | int | float | bool | None) else repr(value)
+            )
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, default=str)

@@ -34,6 +34,7 @@ def exclusion_patterns(exclusions: list[str]) -> list[str]:
         patterns.append(rf"\m{body}(s|es)?\M")
     return patterns
 
+
 HYBRID_SEARCH_SQL = text(
     """
     WITH eligible AS (

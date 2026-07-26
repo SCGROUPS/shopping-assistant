@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # precisely stale.
 MODEL_PRICING: dict[str, tuple[float, float]] = {
     "gpt-5.4-mini": (0.25, 2.00),
-    "gpt-5-nano": (0.05, 0.40),
+    "gpt-5.4-nano": (0.05, 0.40),
     "gpt-5-mini": (0.25, 2.00),
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),

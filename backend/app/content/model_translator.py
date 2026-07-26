@@ -41,7 +41,9 @@ _SCHEMA = {
 def build_glossary_instruction(terms: list[TranslationGlossary]) -> str:
     keep = sorted(term.term for term in terms if term.do_not_translate)
     render = sorted(
-        (term.term, term.replacement) for term in terms if not term.do_not_translate and term.replacement
+        (term.term, term.replacement)
+        for term in terms
+        if not term.do_not_translate and term.replacement
     )
     lines: list[str] = []
     if keep:
@@ -104,9 +106,7 @@ def make_translator(provider: Any, session_factory: Any = None):
                 charged_day = await budget.reserve(session, budget_limit)
                 await session.commit()
             if charged_day is None:
-                raise BudgetExceeded(
-                    f"Daily translation budget of ${budget_limit:.2f} reached"
-                )
+                raise BudgetExceeded(f"Daily translation budget of ${budget_limit:.2f} reached")
         target = LOCALE_NAMES.get(job.locale, job.locale)
         system = _SYSTEM.format(target=target)
         instruction = build_glossary_instruction(glossary)

@@ -86,7 +86,7 @@ in-memory implementation so the app remains available when PostgreSQL is absent.
 DEMO_MODE=false
 AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
 AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-5.4-mini
-AZURE_OPENAI_INTENT_DEPLOYMENT=gpt-5-nano
+AZURE_OPENAI_INTENT_DEPLOYMENT=gpt-5.4-mini
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
 AZURE_OPENAI_IMAGE_DEPLOYMENT=gpt-image-1-mini
 OPENAI_EMBEDDING_DIMENSIONS=512
@@ -146,3 +146,33 @@ live option/slot availability, grounding reason, and per-product `CHECK_AVAILABI
 `ADD_TO_CART` actions. Azure may enhance prose or select a typed tool, but the server always builds
 and validates this structured payload. Checkout exposes `PREPARE_CHECKOUT`, followed by a
 confirmation-required `CONFIRM_SIMULATED_CHECKOUT` action.
+
+### Live model tests
+
+Every other suite stubs the provider, so the model's own behaviour is never
+under test. Both defects that reached production hid in that gap: the extractor
+invented categories the catalogue does not stock, and expressed the destination
+as a constraint nothing mapped. Neither is reachable with a deterministic stub.
+
+```bash
+export AZURE_OPENAI_ENDPOINT="https://<account>.openai.azure.com/"
+export AZURE_OPENAI_API_KEY=$(az cognitiveservices account keys list \
+  -g rg-vietra9c2f-poc -n <account> --query key1 -o tsv)
+export LIVE_DATABASE_URL=$(az containerapp secret show \
+  -g rg-vietra9c2f-poc -n ca-vietra9c2f-web --secret-name database-url \
+  --query value -o tsv | sed 's#^postgresql://#postgresql+psycopg://#')
+LIVE_LLM_TESTS=1 .venv/bin/python -m pytest tests/test_live_intent.py -q
+```
+
+Reaching the live database needs a firewall rule for your address:
+
+```bash
+az postgres flexible-server firewall-rule create \
+  -g rg-vietra9c2f-poc -n vietra9c2f-centralus-pg \
+  --rule-name dev-$USER --start-ip-address $(curl -s https://api.ipify.org) \
+  --end-ip-address $(curl -s https://api.ipify.org)
+```
+
+The model is non-deterministic, so each query runs five times and the invariant
+has to hold on every one. A single green pass proves nothing about a failure
+that shows up half the time.

@@ -94,9 +94,7 @@ async def seed_database(
             destination_name = product["destination"]
             if destination_name in destinations:
                 continue
-            matching = [
-                item for item in catalog if item["destination"] == destination_name
-            ]
+            matching = [item for item in catalog if item["destination"] == destination_name]
             latitude = sum(item["latitude"] for item in matching) / len(matching)
             longitude = sum(item["longitude"] for item in matching) / len(matching)
             destination = Destination(
@@ -113,9 +111,7 @@ async def seed_database(
 
         await session.flush()
 
-        for product, document, embedding in zip(
-            catalog, documents, embeddings, strict=True
-        ):
+        for product, document, embedding in zip(catalog, documents, embeddings, strict=True):
             experience = Experience(
                 id=product["id"],
                 external_id=product["external_id"],
@@ -285,17 +281,13 @@ async def refresh_availability() -> dict[str, int]:
             )
         ).all()
         booked: dict[uuid.UUID, int] = {
-            slot_id: int(quantity)
-            for slot_id, quantity in booked_rows
-            if slot_id is not None
+            slot_id: int(quantity) for slot_id, quantity in booked_rows if slot_id is not None
         }
 
         existing = set(
             (
                 await session.scalars(
-                    select(AvailabilitySlot.id).where(
-                        AvailabilitySlot.id.in_(list(seeded))
-                    )
+                    select(AvailabilitySlot.id).where(AvailabilitySlot.id.in_(list(seeded)))
                 )
             ).all()
         )
@@ -307,9 +299,7 @@ async def refresh_availability() -> dict[str, int]:
                 "starts_at": slot["starts_at"],
                 "ends_at": slot["ends_at"],
                 "capacity_total": slot["capacity_total"],
-                "capacity_remaining": max(
-                    0, slot["capacity_remaining"] - booked.get(slot_id, 0)
-                ),
+                "capacity_remaining": max(0, slot["capacity_remaining"] - booked.get(slot_id, 0)),
                 "status": slot["status"],
                 "price_override": None,
             }

@@ -374,9 +374,7 @@ async def test_the_console_endpoints_answer_end_to_end(factory):
             json={"status": "PUBLISHED", "note": "ready"},
         )
         assert refused.status_code == 409
-        assert "stale-index" in {
-            blocker["code"] for blocker in refused.json()["blockers"]
-        }
+        assert "stale-index" in {blocker["code"] for blocker in refused.json()["blockers"]}
 
         from app.catalog import indexing
 
@@ -1087,9 +1085,7 @@ async def test_reconciliation_covers_a_catalogue_larger_than_one_page(factory, m
 
     async with factory() as db:
         queued = await db.scalar(
-            select(func.count())
-            .select_from(IndexWorkItem)
-            .where(IndexWorkItem.status == "queued")
+            select(func.count()).select_from(IndexWorkItem).where(IndexWorkItem.status == "queued")
         )
         experiences = await db.scalar(select(func.count()).select_from(Experience))
 
@@ -1301,9 +1297,7 @@ async def test_the_production_reconcile_path_commits_every_page(factory, monkeyp
 
     async with factory() as db:
         queued = await db.scalar(
-            select(func.count())
-            .select_from(IndexWorkItem)
-            .where(IndexWorkItem.status == "queued")
+            select(func.count()).select_from(IndexWorkItem).where(IndexWorkItem.status == "queued")
         )
 
     # Seven products at two per page is four pages plus the empty one that ends
@@ -1314,7 +1308,7 @@ async def test_the_production_reconcile_path_commits_every_page(factory, monkeyp
 
 
 async def test_a_drain_that_builds_nothing_still_reports_its_backlog(factory, monkeypatch):
-    """"The queue stopped producing" is not "the queue is empty".
+    """ "The queue stopped producing" is not "the queue is empty".
 
     A round in which every item fails transiently returns them all to `queued`
     and builds none, which ends the drain. Without a backlog report the repair
@@ -1710,9 +1704,7 @@ async def test_a_timeout_during_the_batch_request_hands_every_lease_back(factory
             raise asyncio.CancelledError
 
     with pytest.raises(asyncio.CancelledError):
-        await indexing.process_index_work(
-            factory, _Cancelling(), limit=indexing.DRAIN_BATCH
-        )
+        await indexing.process_index_work(factory, _Cancelling(), limit=indexing.DRAIN_BATCH)
 
     async with factory() as db:
         rows = list(
@@ -1759,9 +1751,7 @@ async def test_a_refused_batch_is_not_retried_one_document_at_a_time(factory):
 
     throttled.embed_many = refuse  # type: ignore[method-assign]
 
-    completed = await indexing.process_index_work(
-        factory, throttled, limit=indexing.DRAIN_BATCH
-    )
+    completed = await indexing.process_index_work(factory, throttled, limit=indexing.DRAIN_BATCH)
 
     assert completed == 0
     assert throttled.batches == 1
@@ -1835,9 +1825,7 @@ async def test_re_enqueueing_unchanged_content_creates_no_work_at_all(factory):
         assert row is not None
         for locale in SUPPORTED_LOCALES:
             text = await resolved_document_text(db, row[0], row[1], locale)
-            await enqueue_reindex(
-                db, experience.id, locale, index_fingerprint(text, locale)
-            )
+            await enqueue_reindex(db, experience.id, locale, index_fingerprint(text, locale))
         await db.commit()
 
     async with factory() as db:
@@ -1855,9 +1843,7 @@ async def test_re_enqueueing_unchanged_content_creates_no_work_at_all(factory):
 
     provider.calls = 0
     await process_index_work(factory, provider, limit=50)
-    assert provider.calls == 0, (
-        f"re-indexing unchanged text cost {provider.calls} embedding calls"
-    )
+    assert provider.calls == 0, f"re-indexing unchanged text cost {provider.calls} embedding calls"
 
 
 async def test_a_real_edit_still_re_embeds(factory):

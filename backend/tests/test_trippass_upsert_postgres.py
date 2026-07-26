@@ -64,6 +64,7 @@ FACETS = {
     "needs_review": False,
 }
 
+
 @pytest.fixture
 async def factory(monkeypatch):
     engine = create_async_engine(DATABASE_URL or "", pool_pre_ping=True)
@@ -74,6 +75,7 @@ async def factory(monkeypatch):
     yield session_factory
     await engine.dispose()
 
+
 async def _import(variants: list[dict] | None = None) -> dict[str, int]:
     raw = dict(RAW, variants=variants) if variants else RAW
     return await upsert_catalog(
@@ -81,6 +83,7 @@ async def _import(variants: list[dict] | None = None) -> dict[str, int]:
         supplier_external_id="TRIPPASS",
         supplier_name="Trippass",
     )
+
 
 async def _add_to_cart(session_factory) -> tuple:
     async with session_factory() as db, db.begin():
@@ -110,6 +113,7 @@ async def _add_to_cart(session_factory) -> tuple:
             )
         )
         return experience.id, option.id, slot.id
+
 
 async def test_reimport_refreshes_supply_without_dropping_a_live_cart(factory):
     """The deploy job re-imports on every release while shoppers hold carts.
@@ -150,6 +154,7 @@ async def test_reimport_refreshes_supply_without_dropping_a_live_cart(factory):
         assert await db.scalar(select(func.count()).select_from(ExperienceOption)) == 3
         assert await db.scalar(select(func.count()).select_from(Experience)) == 1
 
+
 async def test_reimport_is_idempotent(factory):
     await _import()
     async with factory() as db:
@@ -182,9 +187,7 @@ async def test_reimport_never_resurrects_sold_capacity(factory):
     await _import()
     async with factory() as db:
         remaining = await db.scalar(
-            select(AvailabilitySlot.capacity_remaining).where(
-                AvailabilitySlot.id == sold_slot_id
-            )
+            select(AvailabilitySlot.capacity_remaining).where(AvailabilitySlot.id == sold_slot_id)
         )
     assert remaining == 1
 

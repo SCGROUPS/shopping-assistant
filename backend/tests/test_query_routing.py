@@ -148,16 +148,12 @@ class TestDatesSurviveTheLanguageTheyWereWrittenIn:
         and no way to discover which of their words we ignored. So every refusal
         leaves a code behind, and the storefront says it in their language.
         """
-        unverified = sanitize_intent(
-            "hoi an lantern tour", self._intent_with_date("next weekend")
-        )
+        unverified = sanitize_intent("hoi an lantern tour", self._intent_with_date("next weekend"))
         assert unverified.dropped_constraints == ["date_unverified"]
 
         implausible = SearchIntent(
             search_text="tour",
-            hard_constraints=[
-                {"field": "visit_start", "operator": "gte", "value": "1999-01-01"}
-            ],
+            hard_constraints=[{"field": "visit_start", "operator": "gte", "value": "1999-01-01"}],
             date_phrase="tomorrow",
         )
         result = sanitize_intent("hoi an tour tomorrow", implausible)

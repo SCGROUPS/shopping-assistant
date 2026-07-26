@@ -70,23 +70,18 @@ def _surface(event: dict[str, Any]) -> str:
 
 async def funnel_report(data: DemoStore = store) -> dict[str, Any]:
     """Stage counts per surface, plus assistant-touched vs. control conversion."""
-    by_surface: dict[str, dict[str, int]] = defaultdict(
-        lambda: dict.fromkeys(FUNNEL_STAGES, 0)
-    )
+    by_surface: dict[str, dict[str, int]] = defaultdict(lambda: dict.fromkeys(FUNNEL_STAGES, 0))
     touched_sessions: set[str] = set()
     booked_sessions: set[str] = set()
     all_sessions: set[str] = set()
-    nudges: dict[str, dict[str, int]] = defaultdict(
-        lambda: dict.fromkeys(NUDGE_EVENTS.values(), 0)
-    )
+    nudges: dict[str, dict[str, int]] = defaultdict(lambda: dict.fromkeys(NUDGE_EVENTS.values(), 0))
     searches = 0
     zero_results = 0
     relaxed_recoveries = 0
 
     if not database_mode():
         session_names = {
-            session["id"]: anonymous_id
-            for anonymous_id, session in data.sessions.items()
+            session["id"]: anonymous_id for anonymous_id, session in data.sessions.items()
         }
         for event in data.events:
             anonymous_id = session_names.get(event["session_id"], str(event["session_id"]))
@@ -125,11 +120,7 @@ async def funnel_report(data: DemoStore = store) -> dict[str, Any]:
             session_rows = await db.execute(
                 select(ShoppingSession.anonymous_id, BehaviorEvent.event_type)
                 .join(BehaviorEvent, BehaviorEvent.session_id == ShoppingSession.id)
-                .where(
-                    BehaviorEvent.event_type.in_(
-                        [*ASSISTANT_TOUCH_EVENTS, "booking_completed"]
-                    )
-                )
+                .where(BehaviorEvent.event_type.in_([*ASSISTANT_TOUCH_EVENTS, "booking_completed"]))
             )
             for anonymous_id, event_type in session_rows.all():
                 all_sessions.add(anonymous_id)
@@ -171,12 +162,9 @@ async def funnel_report(data: DemoStore = store) -> dict[str, Any]:
 
     untouched = all_sessions - touched_sessions
     return {
-        "surfaces": {
-            surface: dict(stages) for surface, stages in sorted(by_surface.items())
-        },
+        "surfaces": {surface: dict(stages) for surface, stages in sorted(by_surface.items())},
         "totals": {
-            stage: sum(stages[stage] for stages in by_surface.values())
-            for stage in FUNNEL_STAGES
+            stage: sum(stages[stage] for stages in by_surface.values()) for stage in FUNNEL_STAGES
         },
         "assistant": {
             "touched_sessions": len(touched_sessions),
@@ -189,9 +177,7 @@ async def funnel_report(data: DemoStore = store) -> dict[str, Any]:
             trigger: {
                 **counts,
                 "accept_rate": (
-                    round(counts["accepted"] / counts["shown"], 4)
-                    if counts["shown"]
-                    else None
+                    round(counts["accepted"] / counts["shown"], 4) if counts["shown"] else None
                 ),
             }
             for trigger, counts in sorted(nudges.items())

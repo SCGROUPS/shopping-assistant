@@ -14,9 +14,7 @@ def test_normalization_folds_trivially_different_queries():
     """Case and whitespace differences must not cost a second embedding call."""
     assert normalize("  Hoi An   Lantern Tour ") == "hoi an lantern tour"
     model = "text-embedding-3-small"
-    assert cache_key("Hoi An  lantern tour", model) == cache_key(
-        "hoi an lantern tour", model
-    )
+    assert cache_key("Hoi An  lantern tour", model) == cache_key("hoi an lantern tour", model)
     assert cache_key("hoi an lantern tour", model) != cache_key(
         "hoi an lantern tour", "text-embedding-3-large"
     )

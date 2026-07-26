@@ -52,7 +52,6 @@ PROSE = FieldPolicy(requires_review=False, serve_stale=True)
 DIRECTIONS = FieldPolicy(requires_review=True, serve_stale=False)
 
 
-
 _EXPERIENCE_FIELDS: dict[tuple[str, str], FieldPolicy] = {
     (ENTITY_EXPERIENCE, "title"): PROSE,
     (ENTITY_EXPERIENCE, "short_description"): PROSE,

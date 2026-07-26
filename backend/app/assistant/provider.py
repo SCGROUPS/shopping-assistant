@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
@@ -15,6 +15,28 @@ from app.assistant.tlds import TOP_LEVEL_DOMAINS
 from app.common.config import Settings, get_settings
 from app.common.llm_cost import BudgetExceeded, ledger
 from app.common.ranking import deterministic_embedding
+
+# The names the model is permitted to use for a hard constraint. Every one of
+# these must be a key of `CONSTRAINT_FIELDS` in the search service, or the model
+# can satisfy the schema and still produce a constraint nothing maps - which is
+# the empty grid again, by a different route. The service cannot be imported
+# here (it imports this module), so `test_every_offered_constraint_field_is_mapped`
+# pins the two together instead.
+HARD_CONSTRAINT_FIELDS = [
+    "accessibility",
+    "currency",
+    "destination",
+    "family_friendly",
+    "free_cancellation",
+    "indoor_outdoor",
+    "instant_confirmation",
+    "language",
+    "max_duration_minutes",
+    "max_total_price",
+    "rating",
+    "visit_end",
+    "visit_start",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +259,9 @@ class AIProvider(Protocol):
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]: ...
 
-    async def extract_intent(self, text: str) -> SearchIntent: ...
+    async def extract_intent(
+        self, text: str, *, categories: Sequence[str] | None = None
+    ) -> SearchIntent: ...
 
     async def plan_action(self, text: str, state: dict[str, Any]) -> ToolPlan | None: ...
 
@@ -478,17 +502,13 @@ def _build_answer(arguments: dict[str, Any], offered: set[str]) -> AgentAnswer:
     message = str(arguments.get("message", "")).strip()
     clarification = arguments.get("clarification")
     clarification_text = (
-        clarification.strip()
-        if isinstance(clarification, str) and clarification.strip()
-        else None
+        clarification.strip() if isinstance(clarification, str) and clarification.strip() else None
     )
     # Every field the shopper reads, not just the ones that look like prose.
     # `reason` is free-form model text rendered beside the card, so checking the
     # message alone left the easiest surface open: a real, bookable experience
     # with "pay at ..." printed underneath it.
-    prose = "\n".join(
-        [message, clarification_text or "", *(item.reason for item in selections)]
-    )
+    prose = "\n".join([message, clarification_text or "", *(item.reason for item in selections)])
 
     if carries_injected_channel(prose):
         logger.warning("Agent prose carried a contact channel no tool returned; declining")
@@ -513,7 +533,9 @@ class DemoAIProvider:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         return [deterministic_embedding(text) for text in texts]
 
-    async def extract_intent(self, text: str) -> SearchIntent:
+    async def extract_intent(
+        self, text: str, *, categories: Sequence[str] | None = None
+    ) -> SearchIntent:
         return deterministic_intent(text)
 
     async def plan_action(self, text: str, state: dict[str, Any]) -> ToolPlan | None:
@@ -613,7 +635,9 @@ class AzureOpenAIProvider:
         self._record(response, model, "catalog_embedding")
         return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
 
-    async def extract_intent(self, text: str) -> SearchIntent:
+    async def extract_intent(
+        self, text: str, *, categories: Sequence[str] | None = None
+    ) -> SearchIntent:
         self._guard("intent extraction")
         constraint_value = {
             "anyOf": [
@@ -641,7 +665,17 @@ class AzureOpenAIProvider:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "field": {"type": "string"},
+                            # An enum rather than a free string, because the
+                            # prompt has always listed the permitted names and
+                            # the model emitted others anyway - `destination`
+                            # among them, on about a quarter of production
+                            # calls. Under `strict` the schema decides instead
+                            # of the prose. An unmapped field reaches
+                            # `merge_filters` as an unresolved constraint, which
+                            # forces the empty grid, so this is the difference
+                            # between a request being answered and being handed
+                            # back to the shopper to restate.
+                            "field": {"type": "string", "enum": HARD_CONSTRAINT_FIELDS},
                             "operator": {"type": "string"},
                             "value": constraint_value,
                         },
@@ -662,6 +696,15 @@ class AzureOpenAIProvider:
                         "additionalProperties": False,
                     },
                 },
+                # The catalogue's own vocabulary, as an enum. This was a free
+                # string inside `hard_constraints`, and every model tried so far
+                # invents values for it - "attractions", "tourist attraction",
+                # "sightseeing or lantern festival" - none of which the
+                # catalogue stocks. The filter is an exact match, so each one
+                # emptied the grid. Prose telling the model not to invent did
+                # not work on nano or mini; a `strict` enum removes the
+                # possibility rather than discouraging it.
+                "category": {"type": ["string", "null"], "enum": [*(categories or []), None]},
                 "exclusions": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -674,6 +717,7 @@ class AzureOpenAIProvider:
             "required": [
                 "search_text",
                 "destination",
+                "category",
                 "hard_constraints",
                 "soft_preferences",
                 "exclusions",
@@ -712,10 +756,8 @@ class AzureOpenAIProvider:
                         "must, only, or required. Do not request clarification merely because an "
                         "optional destination, date, budget, language, or accessibility filter was "
                         "omitted. Preserve destination names. Use ISO 8601 for "
-                        "visit_start and visit_end. Use only these hard-constraint field names: "
-                        "visit_start, visit_end, max_total_price, currency, category, rating, "
-                        "max_duration_minutes, accessibility, indoor_outdoor, language, "
-                        "instant_confirmation, free_cancellation, family_friendly. Return only "
+                        "visit_start and visit_end. The hard-constraint field names are fixed "
+                        "by the schema. Return only "
                         "JSON matching the supplied schema."
                     ),
                 },
@@ -729,13 +771,32 @@ class AzureOpenAIProvider:
                     "schema": schema,
                 }
             },
-            reasoning={"effort": "minimal"},
+            # The floor this model offers - "minimal" is nano's word and mini
+            # rejects it outright. Extraction is a transcription job against a
+            # strict schema, so there is nothing here worth spending reasoning
+            # tokens on.
+            reasoning={"effort": "none"},
             max_output_tokens=800,
         )
         self._record(response, self.settings.azure_openai_intent_deployment, "intent")
         if not response.output_text:
             return deterministic_intent(text)
-        return SearchIntent.model_validate_json(response.output_text)
+        payload = json.loads(response.output_text)
+        # Folded back into the constraint list the service already understands,
+        # so the enum changes what the model may say without changing what
+        # anything downstream has to read.
+        category = payload.pop("category", None)
+        intent = SearchIntent.model_validate(payload)
+        if category:
+            return intent.model_copy(
+                update={
+                    "hard_constraints": [
+                        *intent.hard_constraints,
+                        {"field": "category", "operator": "eq", "value": category},
+                    ]
+                }
+            )
+        return intent
 
     async def plan_action(self, text: str, state: dict[str, Any]) -> ToolPlan | None:
         """Let the agent choose a tool and fill its parameters itself.

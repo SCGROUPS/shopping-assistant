@@ -26,12 +26,8 @@ async def test_responses_vary_on_the_headers_that_change_them(
 async def test_the_same_url_in_two_languages_is_not_one_cache_entry(
     client: AsyncClient,
 ):
-    english = await client.get(
-        "/api/v1/experiences", headers={"Accept-Language": "en"}
-    )
-    vietnamese = await client.get(
-        "/api/v1/experiences", headers={"Accept-Language": "vi"}
-    )
+    english = await client.get("/api/v1/experiences", headers={"Accept-Language": "en"})
+    vietnamese = await client.get("/api/v1/experiences", headers={"Accept-Language": "vi"})
     # Both must advertise Vary regardless of whether the bodies happen to
     # differ today: with only `en` enabled they resolve identically, and a test
     # that compared bodies would pass for the wrong reason and stop passing the
@@ -41,9 +37,7 @@ async def test_the_same_url_in_two_languages_is_not_one_cache_entry(
 
 
 async def test_correlation_and_hardening_headers_survive(client: AsyncClient):
-    response = await client.get(
-        "/api/v1/experiences", headers={"X-Correlation-ID": "trace-me"}
-    )
+    response = await client.get("/api/v1/experiences", headers={"X-Correlation-ID": "trace-me"})
     assert response.headers["x-correlation-id"] == "trace-me"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["referrer-policy"] == "no-referrer"
@@ -56,9 +50,7 @@ async def test_vary_does_not_trample_the_cors_origin_entry(client: AsyncClient):
     exists to fix: it lets one origin's credentialed response be reused for
     another.
     """
-    response = await client.get(
-        "/api/v1/experiences", headers={"Origin": "http://localhost:5173"}
-    )
+    response = await client.get("/api/v1/experiences", headers={"Origin": "http://localhost:5173"})
     vary = {part.strip().lower() for part in response.headers["vary"].split(",")}
     assert "origin" in vary
     assert "accept-language" in vary
@@ -66,8 +58,6 @@ async def test_vary_does_not_trample_the_cors_origin_entry(client: AsyncClient):
 
 
 async def test_vary_entries_are_not_duplicated(client: AsyncClient):
-    response = await client.get(
-        "/api/v1/experiences", headers={"Origin": "http://localhost:5173"}
-    )
+    response = await client.get("/api/v1/experiences", headers={"Origin": "http://localhost:5173"})
     parts = [p.strip().lower() for p in response.headers["vary"].split(",")]
     assert len(parts) == len(set(parts))

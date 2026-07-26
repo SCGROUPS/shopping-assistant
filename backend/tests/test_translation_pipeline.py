@@ -600,9 +600,7 @@ async def test_a_late_worker_cannot_clear_a_newer_lease(factory):
 
     # And the current holder can still publish.
     async with factory() as session:
-        assert await commit_translation(
-            session, second, translated="Dạo bộ", requires_review=False
-        )
+        assert await commit_translation(session, second, translated="Dạo bộ", requires_review=False)
         await session.commit()
 
 
@@ -850,9 +848,7 @@ async def test_a_source_edit_and_a_glossary_bump_cannot_erase_each_other(factory
     async with factory() as session:
         experience = await session.get(Experience, EXPERIENCE_ID)
         expected = desired_fingerprint(
-            source=source_fingerprint(
-                text=experience.title, source_language="en", locale="ja"
-            ),
+            source=source_fingerprint(text=experience.title, source_language="en", locale="ja"),
             recipe=recipe_fingerprint(
                 prompt_version=get_settings().translation_prompt_version,
                 glossary_revision=9,
@@ -865,9 +861,7 @@ async def test_a_source_edit_and_a_glossary_bump_cannot_erase_each_other(factory
     assert row.desired_fingerprint == expected
     # And a job exists for exactly that pair, or the work is invisible.
     jobs = await _jobs(factory, field="title", locale="ja")
-    assert any(
-        job.fingerprint == expected and job.generation == row.generation for job in jobs
-    )
+    assert any(job.fingerprint == expected and job.generation == row.generation for job in jobs)
 
 
 async def test_a_deterministic_failure_is_not_revived_every_two_hours(factory):
@@ -900,9 +894,7 @@ async def test_a_deterministic_failure_is_not_revived_every_two_hours(factory):
             "GlossaryViolation: missing 'Hoi An'",
             kind=classify(GlossaryViolation("missing")),
         )
-        await fail_job(
-            session, flaky, "TimeoutError: read timeout", kind=classify(TimeoutError())
-        )
+        await fail_job(session, flaky, "TimeoutError: read timeout", kind=classify(TimeoutError()))
         await session.commit()
 
     async with factory() as session:
@@ -931,9 +923,7 @@ async def test_an_unclassified_failure_is_left_where_it_is(factory):
     async with factory() as session:
         await fail_job(session, job, "boom")
         await session.execute(
-            update(TranslationJob)
-            .where(TranslationJob.id == job.job_id)
-            .values(failure_kind=None)
+            update(TranslationJob).where(TranslationJob.id == job.job_id).values(failure_kind=None)
         )
         await session.commit()
 
@@ -1027,7 +1017,7 @@ async def test_a_swept_job_does_not_strand_its_field(factory):
 
 
 async def test_an_unrecognised_failure_is_not_retried_on_a_schedule(factory):
-    """"I do not know what this is" must not mean "try it again in two hours".
+    """ "I do not know what this is" must not mean "try it again in two hours".
 
     A wrong deployment name, an expired credential or an AttributeError in our
     own code all fail identically every time. Under a permanent-denylist they
@@ -1110,9 +1100,7 @@ async def test_a_settlement_cannot_credit_a_day_it_never_charged(factory):
     yesterday = date.today() - timedelta(days=1)
     async with factory() as session:
         await session.execute(
-            text(
-                "INSERT INTO translation_spend (day, amount) VALUES (:day, :amount)"
-            ),
+            text("INSERT INTO translation_spend (day, amount) VALUES (:day, :amount)"),
             {"day": yesterday, "amount": Decimal("0.01")},
         )
         await spend.settle(session, yesterday, spend.ESTIMATE, Decimal("0.05"))
@@ -1287,9 +1275,7 @@ async def test_a_permanently_throttled_run_ends_itself_without_spending_attempts
 async def test_a_deadline_that_has_not_passed_does_not_interfere(factory):
     """The deadline must only fire when it has actually been reached."""
     await _enqueue(factory, locales=["vi"])
-    counts = await drain(
-        factory, _echo, limit=4, deadline=asyncio.get_running_loop().time() + 300
-    )
+    counts = await drain(factory, _echo, limit=4, deadline=asyncio.get_running_loop().time() + 300)
     assert counts["published"] == 4 and counts["deferred"] == 0
 
 

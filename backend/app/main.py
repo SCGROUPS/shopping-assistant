@@ -81,11 +81,7 @@ async def correlation_id(request: Request, call_next):
     # Merged, not assigned. CORSMiddleware sets `Vary: Origin` on credentialed
     # responses, and overwriting it makes one origin's preflight answer
     # cacheable for another - trading a caching bug for a security one.
-    varies = [
-        part.strip()
-        for part in response.headers.get("Vary", "").split(",")
-        if part.strip()
-    ]
+    varies = [part.strip() for part in response.headers.get("Vary", "").split(",") if part.strip()]
     seen = {part.lower() for part in varies}
     for header in ("Accept-Language", "X-Session-ID"):
         if header.lower() not in seen:

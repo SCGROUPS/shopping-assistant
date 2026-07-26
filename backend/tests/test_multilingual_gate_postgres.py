@@ -138,24 +138,22 @@ async def test_multilingual_cases_against_the_seeded_catalogue(seeded):
     outcomes: dict[str, list[str]] = {}
     for case in CASES:
         response = await service.search(_multilingual_request(case))
-        products = [
-            {**item.model_dump(mode="json"), "id": str(item.id)} for item in response.items
-        ]
+        products = [{**item.model_dump(mode="json"), "id": str(item.id)} for item in response.items]
         outcomes[case["id"]] = [str(v) for v in run_checks(products, case.get("expect", {}))]
 
     report = "\n".join(
         f"  {'PASS' if not v else 'FAIL'}  {case_id}: {'; '.join(v) or 'ok'}"
         for case_id, v in outcomes.items()
     )
-    print(f"\nMultilingual gate ({sum(1 for v in outcomes.values() if not v)}/{len(outcomes)}):\n{report}")
+    print(
+        f"\nMultilingual gate ({sum(1 for v in outcomes.values() if not v)}/{len(outcomes)}):\n{report}"
+    )
 
     must_pass = {c: v for c, v in outcomes.items() if c in EXPECTED_TO_PASS and v}
     assert not must_pass, f"cases that must pass today are failing: {must_pass}"
 
     unexpectedly_passing = [
-        case_id
-        for case_id, v in outcomes.items()
-        if case_id not in EXPECTED_TO_PASS and not v
+        case_id for case_id, v in outcomes.items() if case_id not in EXPECTED_TO_PASS and not v
     ]
     if unexpectedly_passing:
         pytest.fail(

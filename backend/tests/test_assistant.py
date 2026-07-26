@@ -166,7 +166,7 @@ class AzureLikeProvider:
     async def embed(self, text: str) -> list[float]:
         return deterministic_embedding(text)
 
-    async def extract_intent(self, text: str):
+    async def extract_intent(self, text: str, **_):
         return deterministic_intent(text)
 
     async def plan_action(self, text: str, state: dict):
@@ -206,7 +206,7 @@ async def test_the_plan_decides_the_tool(client: AsyncClient):
         async def embed(self, text):
             return deterministic_embedding(text)
 
-        async def extract_intent(self, text):
+        async def extract_intent(self, text, **_):
             return deterministic_intent(text)
 
     service = AssistantService(store, PlannerProvider())
@@ -233,7 +233,7 @@ async def test_planner_alone_cannot_confirm_a_booking(client: AsyncClient):
         async def embed(self, text):
             return deterministic_embedding(text)
 
-        async def extract_intent(self, text):
+        async def extract_intent(self, text, **_):
             return deterministic_intent(text)
 
     service = AssistantService(store, ConfirmingProvider())

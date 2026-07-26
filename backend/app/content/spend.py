@@ -30,9 +30,7 @@ ESTIMATE = Decimal("0.01")
 UNMETERED = date.min
 
 
-async def reserve(
-    session: AsyncSession, budget: float, amount: Decimal = ESTIMATE
-) -> date | None:
+async def reserve(session: AsyncSession, budget: float, amount: Decimal = ESTIMATE) -> date | None:
     """Claim `amount` of today's budget, returning the day charged, or None.
 
     One statement. The `WHERE` runs against the row as it exists at write time,
@@ -101,9 +99,6 @@ async def settle(
 
 async def spent_today(session: AsyncSession) -> Decimal:
     value = await session.scalar(
-        text(
-            "SELECT amount FROM translation_spend "
-            "WHERE day = (now() AT TIME ZONE 'utc')::date"
-        )
+        text("SELECT amount FROM translation_spend WHERE day = (now() AT TIME ZONE 'utc')::date")
     )
     return Decimal(value or 0)

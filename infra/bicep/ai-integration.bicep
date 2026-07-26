@@ -2,7 +2,7 @@ targetScope = 'resourceGroup'
 
 param aiAccountName string
 param chatDeployment string
-param intentDeployment string
+param nanoDeployment string
 param embeddingDeployment string
 param imageDeployment string
 
@@ -34,18 +34,18 @@ resource chatModelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2
   }
 }
 
-resource intentModelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
+resource nanoModelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
   parent: aiAccount
-  name: intentDeployment
+  name: nanoDeployment
   sku: {
     name: 'GlobalStandard'
-    capacity: 10
+    capacity: 3200
   }
   properties: {
     model: {
       format: 'OpenAI'
-      name: 'gpt-5-nano'
-      version: '2025-08-07'
+      name: 'gpt-5.4-nano'
+      version: '2026-03-17'
     }
     raiPolicyName: 'Microsoft.Default'
     versionUpgradeOption: 'OnceNewDefaultVersionAvailable'
@@ -72,7 +72,7 @@ resource embeddingModelDeployment 'Microsoft.CognitiveServices/accounts/deployme
     versionUpgradeOption: 'OnceNewDefaultVersionAvailable'
   }
   dependsOn: [
-    intentModelDeployment
+    nanoModelDeployment
   ]
 }
 

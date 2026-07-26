@@ -174,7 +174,12 @@ async def test_every_reason_is_reported_not_just_the_first(factory):
         )
 
     codes = await _codes(factory, experience.id)
-    assert {"missing-description", "missing-meeting-point", "missing-duration-minutes", "no-image"} <= codes
+    assert {
+        "missing-description",
+        "missing-meeting-point",
+        "missing-duration-minutes",
+        "no-image",
+    } <= codes
 
     with pytest.raises(ApiError) as raised:
         await catalog_ops.set_status(experience.id, "PUBLISHED", OPERATOR)
@@ -229,15 +234,11 @@ async def test_a_listing_with_no_options_is_told_to_add_one(factory):
     async with factory() as db, db.begin():
         option_ids = (
             await db.scalars(
-                select(ExperienceOption.id).where(
-                    ExperienceOption.experience_id == experience.id
-                )
+                select(ExperienceOption.id).where(ExperienceOption.experience_id == experience.id)
             )
         ).all()
         await db.execute(delete(OptionPrice).where(OptionPrice.option_id.in_(option_ids)))
-        await db.execute(
-            delete(AvailabilitySlot).where(AvailabilitySlot.option_id.in_(option_ids))
-        )
+        await db.execute(delete(AvailabilitySlot).where(AvailabilitySlot.option_id.in_(option_ids)))
         await db.execute(
             delete(ExperienceOption).where(ExperienceOption.experience_id == experience.id)
         )
@@ -506,7 +507,7 @@ class FailingEmbeddingProvider:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         raise RuntimeError("embedding provider is down")
 
-    async def extract_intent(self, text: str):
+    async def extract_intent(self, text: str, **_):
         raise NotImplementedError
 
     async def plan_action(self, text: str, state: dict) -> str | None:
@@ -544,7 +545,11 @@ async def test_an_import_that_falls_back_to_a_placeholder_vector_is_held(factory
 async def test_a_held_import_is_counted_for_the_operator(factory):
     """An import that quietly holds half the feed is an import nobody trusts."""
     result = await upsert_catalog(
-        [to_catalog_product({**RAW, "description": ""}, {**FACETS, "short_description": ""}, days=3)],
+        [
+            to_catalog_product(
+                {**RAW, "description": ""}, {**FACETS, "short_description": ""}, days=3
+            )
+        ],
         supplier_external_id="TRIPPASS",
         supplier_name="Trippass",
     )
@@ -564,7 +569,11 @@ async def test_an_operators_published_ruling_survives_a_later_import(factory):
     await catalog_ops.set_status(experience.id, "PUBLISHED", OPERATOR, "checked by hand")
 
     await upsert_catalog(
-        [to_catalog_product({**RAW, "description": ""}, {**FACETS, "short_description": ""}, days=3)],
+        [
+            to_catalog_product(
+                {**RAW, "description": ""}, {**FACETS, "short_description": ""}, days=3
+            )
+        ],
         supplier_external_id="TRIPPASS",
         supplier_name="Trippass",
     )

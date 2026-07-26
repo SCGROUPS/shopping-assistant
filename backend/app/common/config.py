@@ -25,7 +25,13 @@ class Settings(BaseSettings):
     # gives up before the lease it is holding expires underneath it.
     azure_openai_timeout_seconds: float = 60.0
     azure_openai_chat_deployment: str = "gpt-5.4-mini"
-    azure_openai_intent_deployment: str = "gpt-5-nano"
+    # Intent extraction runs on the same mini model as chat rather than nano.
+    # Nano's output wandered between calls - the same query produced a category
+    # this catalogue does not stock on roughly half of them, and the place
+    # sometimes arrived as a hard constraint instead of a destination - and its
+    # deployment cap is 10 against mini's 300, so it was also the tightest
+    # throughput in the system.
+    azure_openai_intent_deployment: str = "gpt-5.4-mini"
     azure_openai_embedding_deployment: str = "text-embedding-3-small"
     azure_openai_image_deployment: str = "gpt-image-1-mini"
     openai_embedding_dimensions: int = 512

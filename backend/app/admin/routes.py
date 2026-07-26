@@ -317,6 +317,7 @@ async def edit_translation(principal: CatalogPublish, body: TranslationEdit) -> 
 async def read_settings(principal: ReadAccess) -> dict[str, Any]:
     return await settings_ops.describe()
 
+
 @router.put("/settings/{key}")
 async def write_setting(
     key: str, principal: Configure, body: Annotated[dict[str, Any], Body()]

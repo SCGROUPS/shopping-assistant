@@ -42,6 +42,7 @@ def _bootstrap_key() -> str | None:
         return settings.admin_bootstrap_key
     return DEMO_BOOTSTRAP_KEY if settings.demo_mode else None
 
+
 # Roles are ordered by breadth, and each implies everything a narrower role can
 # do. Keeping this as data means an endpoint declares the capability it needs
 # rather than enumerating the roles that happen to have it today.
@@ -129,7 +130,9 @@ async def authenticate(api_key: str | None) -> Principal:
         if not verify_key(api_key, operator.key_salt, operator.key_hash):
             raise ApiError(401, "Unauthorized", "Unknown or invalid API key", "unauthorized")
         if not operator.active:
-            raise ApiError(403, "Forbidden", "This operator account is disabled", "operator-disabled")
+            raise ApiError(
+                403, "Forbidden", "This operator account is disabled", "operator-disabled"
+            )
         operator.last_seen_at = datetime.now(UTC)
         await session.commit()
         return Principal(

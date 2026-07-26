@@ -30,7 +30,7 @@ class HallucinatedCountryProvider:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         return [deterministic_embedding(text) for text in texts]
 
-    async def extract_intent(self, text: str) -> SearchIntent:
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
         return SearchIntent(
             search_text=text,
             destination=IntentValue(name="Vietnam", confidence=0.92),
@@ -60,12 +60,63 @@ class InventedCategoryProvider:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         return [deterministic_embedding(text) for text in texts]
 
-    async def extract_intent(self, text: str) -> SearchIntent:
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
         return SearchIntent(
             search_text=text,
             hard_constraints=[
                 {"field": "category", "operator": "eq", "value": "sightseeing or lantern festival"}
             ],
+        )
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None
+
+
+class DestinationAsConstraintProvider:
+    """The place expressed as a hard constraint instead of `intent.destination`.
+
+    A reasonable reading - the destination *is* a hard constraint - and the
+    model used it on about a quarter of production calls. `CONSTRAINT_FIELDS`
+    had no mapping for it, so it landed in `unresolved` and forced the early
+    return: the shopper named a real city and got an empty grid asking them to
+    clarify the thing they had just been specific about.
+    """
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
+        return SearchIntent(
+            search_text=text,
+            hard_constraints=[{"field": "destination", "operator": "eq", "value": "Hoi An"}],
+        )
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None
+
+
+class InventedDestinationConstraintProvider:
+    """The same shape, naming a place the catalogue does not sell."""
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
+        return SearchIntent(
+            search_text=text,
+            hard_constraints=[{"field": "destination", "operator": "eq", "value": "Reykjavik"}],
         )
 
     async def plan_action(self, text: str, state: dict) -> str | None:
@@ -90,7 +141,7 @@ class FamilyIndoorIntentProvider:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         return [deterministic_embedding(text) for text in texts]
 
-    async def extract_intent(self, text: str) -> SearchIntent:
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
         return SearchIntent(
             search_text=text,
             interaction_mode="grid",
@@ -145,6 +196,56 @@ async def test_an_invented_category_does_not_empty_the_results():
     assert result.items
     assert result.effective_filters.category is None
     assert "category_unmatched" in result.unresolved_constraints
+
+
+def test_every_offered_constraint_field_is_mapped():
+    """The schema and the mapping must not drift apart.
+
+    `HARD_CONSTRAINT_FIELDS` is the enum the model picks from, and it lives in
+    the provider because the search service imports that module and not the
+    other way round. Nothing at runtime checks the two agree, so a name offered
+    to the model but missing from `CONSTRAINT_FIELDS` would satisfy the schema,
+    reach `merge_filters` unmapped, and force the empty grid - which is exactly
+    what `destination` did in production.
+    """
+    from app.assistant.provider import HARD_CONSTRAINT_FIELDS
+    from app.search.service import CONSTRAINT_FIELDS
+
+    unmapped = [field for field in HARD_CONSTRAINT_FIELDS if field not in CONSTRAINT_FIELDS]
+    assert unmapped == []
+
+
+async def test_a_destination_stated_as_a_constraint_still_searches():
+    """The second half of the production coin toss.
+
+    Nothing about this request is unclear, so nothing about the response may
+    ask the shopper to clarify it.
+    """
+    result = await SearchService(ai_provider=DestinationAsConstraintProvider()).search(
+        SearchRequest(query="hoi an lantern")
+    )
+
+    assert result.items
+    assert result.effective_filters.destination == "Hoi An"
+    assert all(item.destination == "Hoi An" for item in result.items)
+    assert result.unresolved_constraints == []
+    assert result.intent.needs_clarification is False
+
+
+async def test_an_invented_destination_constraint_does_not_empty_the_results():
+    """Mapping the field must not become a way in for an invented city.
+
+    The guard on `intent.destination` has always cleared a place the catalogue
+    does not sell. A destination arriving as a constraint has to face the same
+    check, or the fix above would trade one empty grid for another.
+    """
+    result = await SearchService(ai_provider=InventedDestinationConstraintProvider()).search(
+        SearchRequest(query="reykjavik lantern")
+    )
+
+    assert result.items
+    assert result.effective_filters.destination is None
+    assert "destination_unmatched" in result.unresolved_constraints
 
 
 def test_intent_constraints_map_without_silent_relaxation():

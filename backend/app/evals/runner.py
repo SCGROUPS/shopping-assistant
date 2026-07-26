@@ -177,9 +177,7 @@ async def run_assistant_suite(
                 response = await assistant.respond(
                     conversation_id,
                     session_id,
-                    MessageRequest(
-                        message=turn["message"], context=AssistantContext()
-                    ),
+                    MessageRequest(message=turn["message"], context=AssistantContext()),
                 )
                 products = [_card_dict(item) for item in response.products]
                 violations = run_checks(
@@ -287,9 +285,7 @@ def compare(baseline: dict[str, Any], report: SuiteReport) -> list[str]:
     An overall pass rate can hold steady while the suite trades one fixed
     case for one broken one, which is exactly the change worth blocking.
     """
-    was_passing = {
-        case["id"] for case in baseline.get("cases", []) if case.get("passed")
-    }
+    was_passing = {case["id"] for case in baseline.get("cases", []) if case.get("passed")}
     now: dict[str, bool] = {result.case_id: result.passed for result in report.results}
     return sorted(case for case in was_passing if now.get(case) is False)
 

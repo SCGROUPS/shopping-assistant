@@ -60,6 +60,12 @@ CONSTRAINT_FIELDS = {
     "category": "category",
     "currency": "currency",
     "date": "visit_start",
+    # The model is free to express the place as a hard constraint rather than
+    # in `intent.destination`, and it does, on roughly a quarter of calls.
+    # Without a mapping that reading landed in `unresolved`, which forces the
+    # early return - so the shopper who named a real city got an empty grid and
+    # a request to clarify the thing they had just been specific about.
+    "destination": "destination",
     "duration": "max_duration_minutes",
     "end_date": "visit_end",
     "family_friendly": "family_friendly",
@@ -211,6 +217,15 @@ def _constraint_value(field: str, value: Any) -> Any:
             return False
         raise ValueError(f"{field} constraint must be boolean")
     return str(value)
+
+
+def _matches_destination(value: str, known: set[str]) -> bool:
+    """Whether the catalogue sells anything in this place.
+
+    Substring either way, because the model writes "Hoi An" for `hoi an` and
+    "Da Nang City" for `da nang`, and neither is a mistake worth refusing.
+    """
+    return any(value in destination or destination in value for destination in known)
 
 
 def merge_filters(explicit: SearchFilters, intent: SearchIntent) -> tuple[SearchFilters, list[str]]:
@@ -564,9 +579,12 @@ class SearchService:
         # words that found them.
         locale = normalize_locale(request.locale)
         available_products = await catalog_products(self.data, locale=locale)
+        # Sorted so the schema, and therefore the prompt cache, is stable
+        # between calls that see the same catalogue.
+        categories = sorted({product["category"] for product in available_products})
         if should_extract_intent(request):
             try:
-                intent = await self.ai.extract_intent(request.query)
+                intent = await self.ai.extract_intent(request.query, categories=categories)
             except Exception:
                 logger.exception("Intent extraction failed; using deterministic parsing")
                 intent = deterministic_intent(request.query)
@@ -581,15 +599,10 @@ class SearchService:
                 interaction_mode="undetermined",
             )
         intent = sanitize_intent(request.query, intent)
+        known = {product["destination"].casefold() for product in available_products}
         if intent.destination.name:
             inferred = intent.destination.name.casefold()
-            known_destinations = {
-                product["destination"].casefold() for product in available_products
-            }
-            if not any(
-                inferred in destination or destination in inferred
-                for destination in known_destinations
-            ):
+            if not _matches_destination(inferred, known):
                 intent = intent.model_copy(
                     update={
                         "destination": intent.destination.model_copy(
@@ -610,11 +623,17 @@ class SearchService:
         kept: list[dict[str, Any]] = []
         unmatched: list[str] = []
         for constraint in intent.hard_constraints:
-            if str(constraint.get("field", "")).casefold() == "category":
-                inferred = str(constraint.get("value", "")).casefold()
-                if inferred and inferred not in known_categories:
-                    unmatched.append("category_unmatched")
-                    continue
+            field = str(constraint.get("field", "")).casefold()
+            value = str(constraint.get("value", "")).casefold()
+            if field == "category" and value and value not in known_categories:
+                unmatched.append("category_unmatched")
+                continue
+            # A destination arriving this way has to face the same check the
+            # one above faces, or the mapping that stops the empty grid becomes
+            # a way for an invented city to filter the catalogue to nothing.
+            if field == "destination" and value and not _matches_destination(value, known):
+                unmatched.append("destination_unmatched")
+                continue
             kept.append(constraint)
         if unmatched:
             intent = intent.model_copy(

@@ -66,9 +66,7 @@ class CartService:
         factory = require_session_factory()
         async with factory() as db, db.begin():
             shopping_session = await ensure_session(db, session_id)
-            await lock_idempotency(
-                db, shopping_session.id, "cart-add", idempotency_key
-            )
+            await lock_idempotency(db, shopping_session.id, "cart-add", idempotency_key)
             repeated = await self._idempotent_response(
                 db, shopping_session.id, "cart-add", idempotency_key
             )
@@ -107,9 +105,7 @@ class CartService:
             prices = {
                 price.participant_type: price
                 for price in (
-                    await db.scalars(
-                        select(OptionPrice).where(OptionPrice.option_id == option.id)
-                    )
+                    await db.scalars(select(OptionPrice).where(OptionPrice.option_id == option.id))
                 ).all()
             }
             selected_prices: list[dict[str, Any]] = []
@@ -157,13 +153,9 @@ class CartService:
                     AvailabilitySlot.starts_at > datetime.now(UTC),
                 )
                 if request.slot_id:
-                    slot_query = slot_query.where(
-                        AvailabilitySlot.id == request.slot_id
-                    )
+                    slot_query = slot_query.where(AvailabilitySlot.id == request.slot_id)
                 else:
-                    slot_query = slot_query.order_by(
-                        AvailabilitySlot.starts_at
-                    ).limit(1)
+                    slot_query = slot_query.order_by(AvailabilitySlot.starts_at).limit(1)
                 slot = await db.scalar(slot_query.with_for_update())
                 if slot is None:
                     raise ApiError(
@@ -196,9 +188,7 @@ class CartService:
                     experience_id=experience.id,
                     option_id=option.id,
                     slot_id=slot.id if slot else None,
-                    participants=[
-                        participant.model_dump() for participant in request.participants
-                    ],
+                    participants=[participant.model_dump() for participant in request.participants],
                     unit_prices=selected_prices,
                     quantity=quantity,
                     quoted_total=quoted_total,
@@ -230,9 +220,7 @@ class CartService:
         factory = require_session_factory()
         async with factory() as db, db.begin():
             shopping_session = await ensure_session(db, session_id)
-            await lock_idempotency(
-                db, shopping_session.id, "cart-remove", idempotency_key
-            )
+            await lock_idempotency(db, shopping_session.id, "cart-remove", idempotency_key)
             repeated = await self._idempotent_response(
                 db, shopping_session.id, "cart-remove", idempotency_key
             )
@@ -247,9 +235,7 @@ class CartService:
                     "cart-not-found",
                 )
             item = await db.scalar(
-                select(CartItem).where(
-                    CartItem.id == item_id, CartItem.cart_id == cart.id
-                )
+                select(CartItem).where(CartItem.id == item_id, CartItem.cart_id == cart.id)
             )
             if item is None:
                 raise ApiError(
@@ -295,16 +281,10 @@ class CartService:
         """
         cart = await self._active_cart(db, shopping_session_id)
         if cart is None:
-            raise ApiError(
-                409, "Empty cart", "Add an experience before checkout", "empty-cart"
-            )
-        items = (
-            await db.scalars(select(CartItem).where(CartItem.cart_id == cart.id))
-        ).all()
+            raise ApiError(409, "Empty cart", "Add an experience before checkout", "empty-cart")
+        items = (await db.scalars(select(CartItem).where(CartItem.cart_id == cart.id))).all()
         if not items:
-            raise ApiError(
-                409, "Empty cart", "Add an experience before checkout", "empty-cart"
-            )
+            raise ApiError(409, "Empty cart", "Add an experience before checkout", "empty-cart")
         now = datetime.now(UTC)
         for item in items:
             if item.quote_expires_at <= now:
@@ -315,9 +295,7 @@ class CartService:
                     "quote-expired",
                 )
             if item.slot_id:
-                statement = select(AvailabilitySlot).where(
-                    AvailabilitySlot.id == item.slot_id
-                )
+                statement = select(AvailabilitySlot).where(AvailabilitySlot.id == item.slot_id)
                 if lock_slots:
                     statement = statement.with_for_update()
                 slot = await db.scalar(statement)
@@ -396,12 +374,9 @@ class CartService:
                     else None
                 ),
                 participants=[
-                    Participant.model_validate(participant)
-                    for participant in item.participants
+                    Participant.model_validate(participant) for participant in item.participants
                 ],
-                unit_prices=[
-                    PriceView.model_validate(price) for price in item.unit_prices
-                ],
+                unit_prices=[PriceView.model_validate(price) for price in item.unit_prices],
                 quantity=item.quantity,
                 quoted_total=float(item.quoted_total),
             )
@@ -538,9 +513,7 @@ class CartService:
         self.data.idempotency[cache_key] = response
         return response
 
-    def _demo_remove_item(
-        self, session_id: str, item_id: UUID, idempotency_key: str
-    ) -> CartView:
+    def _demo_remove_item(self, session_id: str, item_id: UUID, idempotency_key: str) -> CartView:
         cache_key = (session_id, "cart-remove", idempotency_key)
         if cache_key in self.data.idempotency:
             return self.data.idempotency[cache_key]

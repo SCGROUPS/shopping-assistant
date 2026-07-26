@@ -245,8 +245,12 @@ class RecommendationService:
                 reason_code = "AVAILABLE_ON_DATE"
                 reason = "Available with instant confirmation."
             candidates.append(
-                (product, score * merchandising_multiplier(product, boost_ceiling),
-                 reason_code, reason)
+                (
+                    product,
+                    score * merchandising_multiplier(product, boost_ceiling),
+                    reason_code,
+                    reason,
+                )
             )
 
         if not candidates:
@@ -286,12 +290,8 @@ class RecommendationService:
         return RecommendationResponse(items=items, locale=locale)
 
 
-async def session_interest_tags(
-    session_id: str, data: DemoStore = store
-) -> list[str]:
-    products = {
-        product["id"]: product for product in await catalog_products(data)
-    }
+async def session_interest_tags(session_id: str, data: DemoStore = store) -> list[str]:
+    products = {product["id"]: product for product in await catalog_products(data)}
     tags = Counter(
         tag
         for _, product_id, _occurred_at in await event_history(session_id, data=data)

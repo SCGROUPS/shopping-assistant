@@ -102,9 +102,7 @@ def test_supplier_collection_never_becomes_a_destination():
 
 def test_every_variant_keeps_its_own_price():
     product = to_catalog_product(RAW_MUSEUM, FACETS)
-    prices = {
-        option["name"]: option["prices"][0]["amount"] for option in product["options"]
-    }
+    prices = {option["name"]: option["prices"][0]["amount"] for option in product["options"]}
     assert prices == {"Adult": 135000.0, "Child": 70000.0}
     assert all(option["prices"][0]["currency"] == "VND" for option in product["options"])
 

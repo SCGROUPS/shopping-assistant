@@ -103,13 +103,15 @@ def product_card(
         free_cancellation_hours=int(free_hours or 0),
         display_price=(
             fx.convert(price, currency, display_currency)
-            if display_currency and fx.supported(display_currency)
+            if display_currency
+            and fx.supported(display_currency)
             and display_currency.upper() != currency.upper()
             else None
         ),
         display_currency=(
             display_currency.upper()
-            if display_currency and fx.supported(display_currency)
+            if display_currency
+            and fx.supported(display_currency)
             and display_currency.upper() != currency.upper()
             else None
         ),

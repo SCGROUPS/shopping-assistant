@@ -121,16 +121,12 @@ async def test_postgres_catalog_conversation_and_checkout_persist():
         assert replayed.json() == confirmed.json()
         booking_id = confirmed.json()["id"]
         fetched = await client.get(f"/api/v1/bookings/{booking_id}")
-        assert fetched.json()["voucher"]["qr_image_data_url"].startswith(
-            "data:image/png;base64,"
-        )
+        assert fetched.json()["voucher"]["qr_image_data_url"].startswith("data:image/png;base64,")
 
     assert session_factory is not None
     async with session_factory() as db:
         shopping_session = await db.scalar(
-            select(ShoppingSession).where(
-                ShoppingSession.anonymous_id == session_id
-            )
+            select(ShoppingSession).where(ShoppingSession.anonymous_id == session_id)
         )
         assert shopping_session is not None
         event_count = await db.scalar(

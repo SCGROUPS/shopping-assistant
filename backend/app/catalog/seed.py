@@ -842,9 +842,7 @@ def generated_sources(target_count: int) -> list[dict]:
             focus = destination["focus"][
                 (template_index + destination_index) % len(destination["focus"])
             ]
-            rng = random.Random(
-                f"{destination['name']}:{focus}:{template['key']}"
-            )
+            rng = random.Random(f"{destination['name']}:{focus}:{template['key']}")
             title = f"{focus} {template['title']}"
             price_multiplier = 0.86 + rng.random() * 0.35
             price = int(round(template["price"] * price_multiplier / 10000) * 10000)

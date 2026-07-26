@@ -68,12 +68,8 @@ def test_social_proof_is_silent_without_real_demand():
 
 
 def test_social_proof_prefers_the_strongest_honest_signal():
-    assert social_proof({"bookings": 12, "views": 900}) == (
-        "12 travellers booked this recently"
-    )
-    assert social_proof({"bookings": 0, "cart_adds": 9}) == (
-        "In 9 travellers' plans right now"
-    )
+    assert social_proof({"bookings": 12, "views": 900}) == ("12 travellers booked this recently")
+    assert social_proof({"bookings": 0, "cart_adds": 9}) == ("In 9 travellers' plans right now")
     assert social_proof({"views": 40}) == "Viewed 40 times recently"
 
 
@@ -131,9 +127,7 @@ async def test_social_proof_appears_once_demand_is_real(client: AsyncClient):
         )
 
     again = await client.post("/api/v1/search", json={"query": "Hoi An"})
-    refreshed = next(
-        item for item in again.json()["items"] if item["id"] == target["id"]
-    )
+    refreshed = next(item for item in again.json()["items"] if item["id"] == target["id"])
     assert refreshed["social_proof"] == "8 travellers booked this recently"
 
 
