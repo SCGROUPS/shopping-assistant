@@ -41,6 +41,15 @@ VOCABULARY_TIMEOUT_SECONDS = 3.0
 # the mechanism.
 PROBE_DEADLINE_SECONDS = 25.0
 
+# Deliberately module scope rather than a local in `_run_intent_probe`.
+# `asyncio.wait_for` *cancels* that coroutine at the deadline, so anything it
+# knows dies with it - including the fact that the deployment already rejected
+# us. A rejection seen at 11s and a hang at 26s would then be recorded as
+# "unverified", which readiness treats as ready: the fail-open again, by the one
+# route left open. This outlives the cancellation so the supervisor can still
+# see the evidence.
+_pending_rejection: str | None = None
+
 
 async def _probe_vocabulary() -> tuple[list[str], list[str]]:
     """The enums to probe with, preferring the real catalogue.
@@ -110,6 +119,9 @@ async def _run_intent_probe() -> None:
         )
         return
 
+    global _pending_rejection
+
+    _pending_rejection = None
     categories, destinations = await _probe_vocabulary()
     detail = "the intent probe never completed"
     rejection: str | None = None
@@ -131,6 +143,9 @@ async def _run_intent_probe() -> None:
             if result.rejected:
                 rejections += 1
                 rejection = result.detail
+                # Recorded before the confirmation threshold is met, because
+                # the deadline can cancel us before a second attempt lands.
+                _pending_rejection = result.detail
                 logger.error("Intent probe attempt %s was rejected: %s", attempt, result.detail)
                 if rejections >= REJECTIONS_TO_CONFIRM:
                     intent_health.record_probe(ok=False, detail=result.detail)
@@ -165,18 +180,34 @@ async def _supervise_intent_probe() -> None:
     Timing out is recorded as unverified, never as a rejection, and never over
     the top of a verdict already reached.
     """
+    global _pending_rejection
+
+    # Cleared here rather than only inside the probe, so that one supervised run
+    # means one fresh verdict even if the probe is cancelled before it starts.
+    _pending_rejection = None
     try:
         await asyncio.wait_for(_run_intent_probe(), timeout=PROBE_DEADLINE_SECONDS)
     except TimeoutError:
         if intent_health.probe() is None:
             logger.error("Intent probe did not answer within %ss", PROBE_DEADLINE_SECONDS)
-            intent_health.record_probe(
-                ok=True, detail=f"unverified: no answer within {PROBE_DEADLINE_SECONDS}s"
-            )
+            _record_unverified(f"unverified: no answer within {PROBE_DEADLINE_SECONDS}s")
     except Exception as error:  # noqa: BLE001 - a probe that crashes must still answer
         if intent_health.probe() is None:
             logger.exception("Intent probe crashed")
-            intent_health.record_probe(ok=True, detail=f"unverified: probe crashed: {error}")
+            _record_unverified(f"unverified: probe crashed: {error}")
+
+
+def _record_unverified(detail: str) -> None:
+    """Answer for a probe that was cut short, without discarding what it saw.
+
+    "We never got an answer" and "we were told no, then lost contact" are not
+    the same state, and only the first of them is safe to serve.
+    """
+    if _pending_rejection is not None:
+        logger.error("Intent probe was rejected before it was cut short: %s", _pending_rejection)
+        intent_health.record_probe(ok=False, detail=_pending_rejection)
+        return
+    intent_health.record_probe(ok=True, detail=detail)
 
 
 @asynccontextmanager

@@ -340,3 +340,116 @@ async def test_a_provider_that_cannot_reject_is_not_recorded_as_a_pass(monkeypat
         "but nothing was ever asked, because there is no deployment"
     )
     intent_health.reset()
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_survives_the_probe_being_cut_short(monkeypatch):
+    """The fail-open the deadline reopened after the retry loop closed it.
+
+    Review constructed this: attempt one is a real rejection, which on its own
+    is below the confirmation threshold and records nothing; attempt two hangs
+    past the deadline. `asyncio.wait_for` *cancels* the probe, so a rejection
+    remembered in a coroutine local dies with it, the supervisor sees no
+    verdict, and records "unverified" - which readiness treats as ready.
+
+    The evidence therefore has to outlive the cancellation. This is the same
+    blocker as `probe is None or probe.ok`, reached by a different route, and
+    it fails in exactly the case the probe exists for: a deployment that
+    rejects us while something else is slow.
+    """
+    import app.main as main
+
+    intent_health.reset()
+    _pretend_azure_is_configured(monkeypatch, main)
+    monkeypatch.setattr(main, "PROBE_ATTEMPTS", 3)
+    monkeypatch.setattr(main, "PROBE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(main, "PROBE_DEADLINE_SECONDS", 0.2)
+
+    class _Hangs:
+        async def extract_intent(self, *args, **kwargs):
+            await asyncio.sleep(30)
+
+    answers = [RejectingProvider("'none' is not supported"), _Hangs(), _Hangs()]
+    monkeypatch.setattr("app.assistant.provider.build_ai_provider", lambda: answers.pop(0))
+
+    await main._supervise_intent_probe()
+
+    probe = intent_health.probe()
+    assert probe is not None, "readiness would have stayed 503 forever"
+    assert not probe.ok, (
+        f"recorded {probe.detail!r} as servable; the deployment had already rejected the "
+        "probe and the verdict was lost when the deadline cancelled the coroutine holding it"
+    )
+    intent_health.reset()
+
+
+@pytest.mark.asyncio
+async def test_rejections_too_slow_to_be_confirmed_still_darken_the_revision(monkeypatch):
+    """The second route review found: real rejections, none of them fast.
+
+    Every attempt is a genuine rejection, but each takes long enough that the
+    deadline lands before the confirmation threshold is reached. Requiring two
+    rejections must not become a way for a slow upstream to convert a definite
+    "no" into a pass.
+    """
+    import app.main as main
+
+    intent_health.reset()
+    _pretend_azure_is_configured(monkeypatch, main)
+    monkeypatch.setattr(main, "PROBE_ATTEMPTS", 3)
+    monkeypatch.setattr(main, "PROBE_RETRY_SECONDS", 0.05)
+    monkeypatch.setattr(main, "PROBE_DEADLINE_SECONDS", 0.25)
+
+    class _SlowlyRejects:
+        async def extract_intent(self, *args, **kwargs):
+            await asyncio.sleep(0.15)
+            raise _Rejected("'none' is not supported")
+
+    monkeypatch.setattr("app.assistant.provider.build_ai_provider", lambda: _SlowlyRejects())
+
+    await main._supervise_intent_probe()
+
+    probe = intent_health.probe()
+    assert probe is not None and not probe.ok, (
+        f"recorded {probe.detail if probe else None!r}; the deployment rejected every "
+        "request it was sent, and slowness alone turned that into a pass"
+    )
+    intent_health.reset()
+
+
+@pytest.mark.asyncio
+async def test_a_new_probe_does_not_inherit_the_previous_one_s_rejection(monkeypatch):
+    """The cost of moving the evidence out of the coroutine.
+
+    Rejection state that outlives a cancellation also outlives the whole probe,
+    so a later run on a repaired deployment must not be condemned by what an
+    earlier one saw. Otherwise fixing the deployment would never clear the
+    verdict and the revision could not recover.
+    """
+    import app.main as main
+
+    intent_health.reset()
+    _pretend_azure_is_configured(monkeypatch, main)
+    monkeypatch.setattr(main, "PROBE_ATTEMPTS", 1)
+    monkeypatch.setattr(main, "PROBE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(main, "PROBE_DEADLINE_SECONDS", 0.2)
+
+    class _Hangs:
+        async def extract_intent(self, *args, **kwargs):
+            await asyncio.sleep(30)
+
+    answers = [RejectingProvider("'none' is not supported")]
+    monkeypatch.setattr("app.assistant.provider.build_ai_provider", lambda: answers.pop(0))
+    await main._supervise_intent_probe()
+    assert main._pending_rejection is not None
+
+    intent_health.reset()
+    monkeypatch.setattr("app.assistant.provider.build_ai_provider", lambda: WorkingProvider())
+    await main._supervise_intent_probe()
+
+    probe = intent_health.probe()
+    assert probe is not None and probe.ok, (
+        f"recorded {probe.detail if probe else None!r}; the deployment now accepts our "
+        "requests and the revision is still being held down by an older verdict"
+    )
+    intent_health.reset()
