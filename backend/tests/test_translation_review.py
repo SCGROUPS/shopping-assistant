@@ -378,13 +378,17 @@ class TestRejectionLeavesTheFieldRecoverable:
         assert state.reviewed_by == "ops@vietra.test"
         assert state.published_fingerprint is None
 
-    async def test_a_reviewer_can_write_the_right_answer(self, factory):
-        """Without this, one rejection holds the field on English forever.
+    async def test_a_reviewer_can_find_a_rejected_field_and_fix_it(self, factory):
+        """The recovery has to be reachable the way an operator reaches it.
 
-        Rejection deliberately does not re-enqueue - the same source and recipe
-        produce the same wrong address - so the only way out is a human typing
-        it, and the person who spotted the error is usually the person who
-        knows what it should say.
+        An earlier version of this test rejected a candidate and then called
+        `edit_translation` directly, and passed - while the console listed only
+        `needs_review`, so the rejected field was invisible and the escape
+        hatch it certified could not be opened by the person it exists for.
+        That is the defect of this whole subsystem repeated one layer up, in
+        the test written to prove the subsystem was fixed.
+
+        So this goes through the queue.
         """
         await _held(factory)
         async with factory() as session:
@@ -400,13 +404,26 @@ class TestRejectionLeavesTheFieldRecoverable:
             await session.commit()
 
         async with factory() as session:
+            recoverable = await review_queue(session, state="rejected")
+
+        assert recoverable.total == 1, "a rejected field the console cannot list is stranded"
+        item = recoverable.items[0]
+        assert item.status == "rejected"
+        assert item.reviewed_by == "ops@vietra.test"
+        # The source is what the reviewer translates from, so it must be here.
+        assert item.source_text == "Japanese Bridge"
+        # Nothing to approve; the only way forward is to write it.
+        assert item.answers_current_source is False
+
+        async with factory() as session:
             await edit_translation(
                 session,
                 experience_id=EXPERIENCE_ID,
-                field="meeting_point",
-                locale="vi",
+                field=item.field,
+                locale=item.locale,
                 reviewer="ops@vietra.test",
                 value="Chân cầu Chùa Cầu, phía đường Trần Phú",
+                expected_generation=item.generation,
             )
             await session.commit()
 
@@ -418,7 +435,41 @@ class TestRejectionLeavesTheFieldRecoverable:
         assert state.published_fingerprint == state.desired_fingerprint
         assert "vi" in await _reindex_locales(factory)
 
-    async def test_a_rejected_field_is_out_of_the_queue(self, factory):
+        # And it leaves the recoverable list, or the operator works it forever.
+        async with factory() as session:
+            assert (await review_queue(session, state="rejected")).total == 0
+
+    async def test_an_edit_against_a_moved_source_is_refused(self, factory):
+        """The reviewer translates the source on their screen.
+
+        If an operator moves the tour to a different bridge while that screen
+        is open, the sentence being typed is a faithful translation of
+        directions to the wrong place - and publishing it as `manual` then
+        protects it from ever being corrected by the machine.
+        """
+        await _held(factory)
+        async with factory() as session:
+            row = await _state(factory)
+            row.generation = 3
+            await session.merge(row)
+            await session.commit()
+
+        async with factory() as session:
+            with pytest.raises(ReviewConflict) as caught:
+                await edit_translation(
+                    session,
+                    experience_id=EXPERIENCE_ID,
+                    field="meeting_point",
+                    locale="vi",
+                    reviewer="ops@vietra.test",
+                    value="Chân cầu Chùa Cầu",
+                    expected_generation=0,
+                )
+        assert caught.value.reason == "source_changed"
+        assert await _served(factory) is None
+
+    async def test_a_rejected_field_is_not_offered_for_approval(self, factory):
+        """Out of the approval queue, but not out of sight - see above."""
         await _held(factory)
         async with factory() as session:
             await reject_candidate(

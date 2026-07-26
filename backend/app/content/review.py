@@ -64,12 +64,14 @@ class ReviewItem:
     title: str
     field: str
     locale: str
+    status: str
     source_text: str
     source_language: str
     candidate_value: str
     candidate_fingerprint: str
     desired_fingerprint: str
     generation: int
+    reviewed_by: str
     updated_at: datetime
 
     @property
@@ -79,8 +81,14 @@ class ReviewItem:
         False means the source was edited after the machine translated it. The
         candidate is then a translation of text nobody will read, and approving
         it publishes an address for a version of the product that is gone.
+
+        Always False for a rejected field, which has no candidate left. That is
+        the right answer to the question the console asks with it - "may this
+        be approved?" - because there is nothing there to approve.
         """
-        return self.candidate_fingerprint == self.desired_fingerprint
+        return bool(self.candidate_fingerprint) and (
+            self.candidate_fingerprint == self.desired_fingerprint
+        )
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -88,12 +96,14 @@ class ReviewItem:
             "title": self.title,
             "field": self.field,
             "locale": self.locale,
+            "status": self.status,
             "source_text": self.source_text,
             "source_language": self.source_language,
             "candidate_value": self.candidate_value,
             "candidate_fingerprint": self.candidate_fingerprint,
             "generation": self.generation,
             "answers_current_source": self.answers_current_source,
+            "reviewed_by": self.reviewed_by,
             "updated_at": self.updated_at.isoformat(),
         }
 
@@ -112,15 +122,25 @@ class ReviewQueue:
         }
 
 
+# The two states a human still owes something to. `rejected` belongs here even
+# though a human has already looked at it: rejecting says "not this text", not
+# "leave it in English forever". Rejection deliberately does not re-enqueue, so
+# if the console cannot list rejected fields, the edit path that is supposed to
+# rescue them is unreachable and the rejection is permanent - which is the
+# original defect of this whole subsystem, one layer up.
+REVIEW_STATES = ("needs_review", "rejected")
+
+
 async def review_queue(
     session: AsyncSession,
     *,
     locale: str | None = None,
     field: str | None = None,
+    state: str = "needs_review",
     limit: int = 50,
     offset: int = 0,
 ) -> ReviewQueue:
-    """Candidates awaiting a human decision, oldest first.
+    """Fields still owing a human decision, oldest first.
 
     Oldest first because a queue worked newest-first starves its own tail, and
     the tail here is the product nobody has edited in months - which is exactly
@@ -130,11 +150,14 @@ async def review_queue(
     approves ten of fifty needs to see forty remaining; a page-sized count would
     tell them they were done.
     """
+    if state not in REVIEW_STATES:
+        raise ValueError(f"unknown review state: {state}")
     conditions = [
         TranslationField.entity_type == ENTITY_EXPERIENCE,
-        TranslationField.status == "needs_review",
-        TranslationField.candidate_value.is_not(None),
+        TranslationField.status == state,
     ]
+    if state == "needs_review":
+        conditions.append(TranslationField.candidate_value.is_not(None))
     if locale is not None:
         conditions.append(TranslationField.locale == locale)
     if field is not None:
@@ -162,19 +185,21 @@ async def review_queue(
 
     items = [
         ReviewItem(
-            experience_id=state.entity_id,
+            experience_id=row.entity_id,
             title=experience.title,
-            field=state.field,
-            locale=state.locale,
-            source_text=getattr(experience, state.field, "") or "",
+            field=row.field,
+            locale=row.locale,
+            status=row.status,
+            source_text=getattr(experience, row.field, "") or "",
             source_language=experience.source_language,
-            candidate_value=state.candidate_value or "",
-            candidate_fingerprint=state.candidate_fingerprint or "",
-            desired_fingerprint=state.desired_fingerprint,
-            generation=state.generation,
-            updated_at=state.updated_at,
+            candidate_value=row.candidate_value or "",
+            candidate_fingerprint=row.candidate_fingerprint or "",
+            desired_fingerprint=row.desired_fingerprint,
+            generation=row.generation,
+            reviewed_by=row.reviewed_by or "",
+            updated_at=row.updated_at,
         )
-        for state, experience in rows.all()
+        for row, experience in rows.all()
     ]
     return ReviewQueue(items=items, total=int(total or 0), by_locale=by_locale)
 
@@ -323,6 +348,7 @@ async def edit_translation(
     locale: str,
     reviewer: str,
     value: str,
+    expected_generation: int,
 ) -> None:
     """Publish a translation a human wrote, and hand them ownership of it.
 
@@ -333,12 +359,33 @@ async def edit_translation(
     the source text. The reviewer who knows it is wrong is generally the person
     who knows what it should say.
 
+    Pinned to the generation for the same reason approval is, and it is not a
+    weaker case: a human translating a meeting point is translating the source
+    text on their screen. If an operator moves the tour to a different bridge
+    while that screen is open, the sentence they are typing is a faithful
+    translation of directions to the wrong place - and because it is published
+    as `manual`, the pipeline will now protect it from being corrected by the
+    machine. This path was the one that let that through.
+
     `mark_manual_translation` sets provenance to manual, which is checked by
     the worker's conditional update: a machine translation already in flight
     loses its commit rather than overwriting this.
     """
     if not value.strip():
         raise ReviewConflict("empty", "a translation cannot be empty")
+
+    existing = await session.get(
+        TranslationField,
+        (ENTITY_EXPERIENCE, experience_id, field, locale),
+        with_for_update=True,
+    )
+    if existing is None:
+        raise ReviewConflict("not_found", f"no translation state for {field}/{locale}")
+    if existing.generation != expected_generation:
+        raise ReviewConflict(
+            "source_changed",
+            "the source text changed while you were writing; re-read it before publishing",
+        )
 
     await mark_manual_translation(
         session,

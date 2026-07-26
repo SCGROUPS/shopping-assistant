@@ -43,6 +43,7 @@ import type {
   TranslationCandidate,
   TranslationReviewQueue,
   LocaleCoverage,
+  ReviewState,
 } from '../lib/adminApi'
 
 type Tab = 'review' | 'catalog' | 'translations' | 'settings' | 'audit' | 'insight'
@@ -602,6 +603,7 @@ function Translations({ can }: { can: (capability: Capability) => boolean }) {
   const [queue, setQueue] = useState<TranslationReviewQueue | null>(null)
   const [coverage, setCoverage] = useState<LocaleCoverage[]>([])
   const [locale, setLocale] = useState<string>('')
+  const [state, setState] = useState<ReviewState>('needs_review')
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState<string | null>(null)
@@ -615,7 +617,7 @@ function Translations({ can }: { can: (capability: Capability) => boolean }) {
     setError(null)
     try {
       const [next, cover] = await Promise.all([
-        fetchTranslationQueue(locale || undefined),
+        fetchTranslationQueue(locale || undefined, state),
         fetchTranslationCoverage(),
       ])
       setQueue(next)
@@ -623,7 +625,7 @@ function Translations({ can }: { can: (capability: Capability) => boolean }) {
     } catch (problem) {
       setError(problem instanceof Error ? problem.message : 'Could not load the queue')
     }
-  }, [locale])
+  }, [locale, state])
 
   useEffect(() => {
     void load()
@@ -689,6 +691,17 @@ function Translations({ can }: { can: (capability: Capability) => boolean }) {
       </table>
 
       <div className="ops-filters">
+        {/* Rejected fields must be reachable. Rejecting deliberately does not
+            re-enqueue, so a console that lists only `needs_review` strands
+            every rejection on English permanently - which is the defect this
+            whole screen exists to fix, one layer up. */}
+        <select
+          value={state}
+          onChange={(event) => setState(event.target.value as ReviewState)}
+        >
+          <option value="needs_review">Awaiting a decision</option>
+          <option value="rejected">Rejected, needs writing</option>
+        </select>
         <select value={locale} onChange={(event) => setLocale(event.target.value)}>
           <option value="">Every language</option>
           {Object.entries(queue?.by_locale ?? {}).map(([code, count]) => (
@@ -726,8 +739,19 @@ function Translations({ can }: { can: (capability: Capability) => boolean }) {
                 <p>{item.source_text}</p>
               </div>
               <div>
-                <span className="ops-sub">Proposed ({item.locale})</span>
-                <p lang={item.locale}>{item.candidate_value}</p>
+                <span className="ops-sub">
+                  {item.status === 'rejected'
+                    ? `Rejected by ${item.reviewed_by || 'an operator'}`
+                    : `Proposed (${item.locale})`}
+                </span>
+                <p lang={item.locale}>
+                  {item.candidate_value || (
+                    <em>
+                      Nothing is published in this language. Write the
+                      translation, or shoppers keep seeing the English.
+                    </em>
+                  )}
+                </p>
               </div>
             </div>
             {!item.answers_current_source ? (
@@ -757,20 +781,24 @@ function Translations({ can }: { can: (capability: Capability) => boolean }) {
               </div>
             ) : (
               <div className="ops-candidate-actions">
-                <button
-                  type="button"
-                  disabled={!mayPublish || busy === key || !item.answers_current_source}
-                  onClick={() => void act(item, 'approve')}
-                >
-                  Approve
-                </button>
-                <button
-                  type="button"
-                  disabled={!mayPublish || busy === key}
-                  onClick={() => void act(item, 'reject')}
-                >
-                  Reject
-                </button>
+                {item.status === 'needs_review' ? (
+                  <>
+                    <button
+                      type="button"
+                      disabled={!mayPublish || busy === key || !item.answers_current_source}
+                      onClick={() => void act(item, 'approve')}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!mayPublish || busy === key}
+                      onClick={() => void act(item, 'reject')}
+                    >
+                      Reject
+                    </button>
+                  </>
+                ) : null}
                 <button
                   type="button"
                   disabled={!mayPublish || busy === key}
@@ -779,7 +807,7 @@ function Translations({ can }: { can: (capability: Capability) => boolean }) {
                     setDraft(item.candidate_value)
                   }}
                 >
-                  Edit
+                  {item.status === 'rejected' ? 'Write the translation' : 'Edit'}
                 </button>
               </div>
             )}
@@ -788,7 +816,11 @@ function Translations({ can }: { can: (capability: Capability) => boolean }) {
       })}
 
       {queue && queue.items.length === 0 ? (
-        <p className="ops-sub">Nothing is waiting for a decision.</p>
+        <p className="ops-sub">
+          {state === 'rejected'
+            ? 'Nothing has been rejected.'
+            : 'Nothing is waiting for a decision.'}
+        </p>
       ) : null}
     </div>
   )

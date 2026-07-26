@@ -131,6 +131,8 @@ test.describe('translation review', () => {
     candidate_fingerprint: 'abc123',
     generation: 7,
     answers_current_source: true,
+    status: 'needs_review',
+    reviewed_by: '',
     updated_at: '2026-07-26T00:00:00Z',
   }
 
@@ -228,5 +230,73 @@ test.describe('translation review', () => {
     // Both ways out stay open, or the field is stuck.
     await expect(candidate.getByRole('button', { name: 'Reject' })).toBeEnabled()
     await expect(candidate.getByRole('button', { name: 'Edit' })).toBeEnabled()
+  })
+
+  test('a rejected translation stays reachable so it can be written', async ({ page }) => {
+    // Rejecting deliberately does not re-enqueue, because the same source and
+    // the same recipe produce the same wrong address forever. A console that
+    // lists only `needs_review` therefore strands every rejection on English
+    // permanently - which is the defect this whole screen exists to fix, one
+    // layer up. The first version of this feature had exactly that bug.
+    let posted: Record<string, unknown> | null = null
+
+    await page.route('**/api/v1/admin/translations/review?*', async (route) => {
+      const rejected = new URL(route.request().url()).searchParams.get('state') === 'rejected'
+      await route.fulfill({
+        json: rejected
+          ? {
+              items: [
+                {
+                  ...CANDIDATE,
+                  status: 'rejected',
+                  reviewed_by: 'ops@vietra.test',
+                  candidate_value: '',
+                  candidate_fingerprint: '',
+                  answers_current_source: false,
+                },
+              ],
+              total: 1,
+              by_locale: { vi: 1 },
+            }
+          : { items: [], total: 0, by_locale: {} },
+      })
+    })
+    await page.route('**/api/v1/admin/translations', async (route) => {
+      await route.fulfill({ json: { locales: [] } })
+    })
+    await page.route('**/api/v1/admin/translations/edit', async (route) => {
+      posted = route.request().postDataJSON()
+      await route.fulfill({ json: { status: 'current', provenance: 'manual' } })
+    })
+
+    await page.goto('/admin')
+    await page.getByLabel('Operator key').fill(KEY)
+    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.getByRole('button', { name: 'Languages' }).click()
+
+    await expect(page.getByText('Nothing is waiting for a decision.')).toBeVisible()
+
+    await page.locator('.ops-filters select').first().selectOption('rejected')
+
+    const candidate = page.locator('.ops-candidate').first()
+    await expect(candidate).toBeVisible()
+    await expect(candidate.getByText(/Rejected by ops@vietra.test/)).toBeVisible()
+    // The source must be here: it is what the reviewer translates from.
+    await expect(candidate.getByText('Japanese Bridge, old town')).toBeVisible()
+    // Nothing to approve, so approval is not offered at all.
+    await expect(candidate.getByRole('button', { name: 'Approve' })).toHaveCount(0)
+
+    await candidate.getByRole('button', { name: 'Write the translation' }).click()
+    await candidate.locator('textarea').fill('Chân cầu Chùa Cầu')
+    await candidate.getByRole('button', { name: 'Publish my version' }).click()
+
+    await expect.poll(() => posted).not.toBeNull()
+    // Pinned to the source version the reviewer read, like every other write.
+    expect(posted).toMatchObject({
+      experience_id: CANDIDATE.experience_id,
+      locale: 'vi',
+      value: 'Chân cầu Chùa Cầu',
+      generation: 7,
+    })
   })
 })

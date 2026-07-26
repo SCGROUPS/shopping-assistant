@@ -181,6 +181,11 @@ class TranslationEdit(BaseModel):
     field: str
     locale: str
     value: str = Field(min_length=1, max_length=4000)
+    # Required, like the decision fields. A human translating a meeting point
+    # is translating the source on their screen; if it moved while they typed,
+    # they have faithfully translated directions to the wrong place - and
+    # publishing it as `manual` then protects it from machine correction.
+    generation: int
 
 
 @router.get("/translations/review")
@@ -188,6 +193,7 @@ async def translation_review_queue(
     principal: ReadAccess,
     locale: str | None = None,
     field: str | None = None,
+    state: Annotated[str, Query(pattern="^(needs_review|rejected)$")] = "needs_review",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict[str, Any]:
@@ -203,7 +209,7 @@ async def translation_review_queue(
         raise ApiError(503, "Unavailable", "Database is not configured", "review-unavailable")
     async with session_factory() as session:
         queue = await review.review_queue(
-            session, locale=locale, field=field, limit=limit, offset=offset
+            session, locale=locale, field=field, state=state, limit=limit, offset=offset
         )
     return queue.as_dict()
 
@@ -286,6 +292,7 @@ async def edit_translation(principal: CatalogPublish, body: TranslationEdit) -> 
                 locale=body.locale,
                 reviewer=principal.email,
                 value=body.value,
+                expected_generation=body.generation,
             )
         except review.ReviewConflict as conflict:
             raise ApiError(409, "Review conflict", conflict.detail, conflict.reason) from conflict

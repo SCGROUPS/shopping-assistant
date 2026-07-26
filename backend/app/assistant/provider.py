@@ -329,6 +329,14 @@ def _offered_ids(result: dict[str, Any]) -> set[str]:
 # by typing the same host in Cyrillic.
 _LABEL = r"[^\W_](?:[^\W_]|-)*"
 
+# The characters UTS-46 maps to a full stop, which is to say: the characters a
+# browser treats as a label separator. `pay。example。com` is not a lookalike of
+# `pay.example.com` - it *is* that host, and typing it resolves. Matching only
+# ASCII `.` meant no host candidate was found at all, so the careful suffix
+# normalisation underneath was never even reached.
+_DOT = r"[.\u3002\uff0e\uff61]"
+_DOTS = "\u3002\uff0e\uff61"
+
 # A last label containing at least one letter. Without it a price written
 # `1.500.000/khach` and a time written `16.30/person` both read as links.
 _ALPHA_LAST_LABEL = rf"(?=(?:[^\W_]|-)*[^\W\d_]){_LABEL}"
@@ -342,12 +350,12 @@ _ALPHA_LAST_LABEL = rf"(?=(?:[^\W_]|-)*[^\W\d_]){_LABEL}"
 _INJECTED_CHANNEL = re.compile(
     rf"""(?xi)
     https?://
-  | www\.{_LABEL}\.{_ALPHA_LAST_LABEL}
-  | [^\W_][\w.%+-]*@{_LABEL}(?:\.{_LABEL})*\.{_ALPHA_LAST_LABEL}
+  | www{_DOT}{_LABEL}{_DOT}{_ALPHA_LAST_LABEL}
+  | [^\W_][\w.%+-]*@{_LABEL}(?:{_DOT}{_LABEL})*{_DOT}{_ALPHA_LAST_LABEL}
     # A host followed by a path is link-shaped whatever its suffix is. This is
     # what catches `.example`, which is reserved by RFC 2606 and therefore
     # absent from IANA's list of delegated domains.
-  | \b{_LABEL}(?:\.{_LABEL})*\.{_ALPHA_LAST_LABEL}/\S
+  | \b{_LABEL}(?:{_DOT}{_LABEL})*{_DOT}{_ALPHA_LAST_LABEL}/\S
     """
 )
 
@@ -361,7 +369,10 @@ _INJECTED_CHANNEL = re.compile(
 # refusing ordinary prose that had lost the space after a full stop, in
 # languages whose sentences are not reliably capitalised at all. The suffix is
 # the only part of a host that is defined rather than guessed.
-_HOST_CANDIDATE = re.compile(rf"\b{_LABEL}(?:\.{_LABEL})+", re.I)
+_HOST_CANDIDATE = re.compile(rf"\b{_LABEL}(?:{_DOT}{_LABEL})+", re.I)
+
+
+_DOT_TO_STOP = str.maketrans({character: "." for character in _DOTS})
 
 
 def _suffix_is_delegated(host: str) -> bool:
@@ -375,7 +386,8 @@ def _suffix_is_delegated(host: str) -> bool:
     UTS-46 mapping is what a browser applies to a typed host, so it is what
     decides whether this text would reach that server if somebody pasted it.
     """
-    suffix = host.rsplit(".", 1)[-1].lower()
+    # Fold the separators a browser folds, so the last label is the last label.
+    suffix = host.translate(_DOT_TO_STOP).rsplit(".", 1)[-1].lower()
     if suffix in TOP_LEVEL_DOMAINS:
         return True
     if suffix.isascii():

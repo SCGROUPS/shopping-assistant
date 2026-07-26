@@ -256,6 +256,8 @@ export interface TranslationCandidate {
   candidate_fingerprint: string
   generation: number
   answers_current_source: boolean
+  status: 'needs_review' | 'rejected'
+  reviewed_by: string
   updated_at: string
 }
 
@@ -265,8 +267,14 @@ export interface TranslationReviewQueue {
   by_locale: Record<string, number>
 }
 
-export const fetchTranslationQueue = (locale?: string, limit = 25) => {
-  const params = new URLSearchParams({ limit: String(limit) })
+export type ReviewState = 'needs_review' | 'rejected'
+
+export const fetchTranslationQueue = (
+  locale?: string,
+  state: ReviewState = 'needs_review',
+  limit = 25,
+) => {
+  const params = new URLSearchParams({ limit: String(limit), state })
   if (locale) params.set('locale', locale)
   return request<TranslationReviewQueue>(`/translations/review?${params}`)
 }
@@ -308,6 +316,12 @@ export const editTranslation = (
       field: item.field,
       locale: item.locale,
       value,
+      // The generation the source text was read at. A human translating a
+      // meeting point is translating what is on their screen; if it moved
+      // while they typed, they have faithfully translated directions to the
+      // wrong place - and publishing it as `manual` protects it from ever
+      // being corrected by the machine.
+      generation: item.generation,
     }),
   })
 

@@ -457,6 +457,15 @@ class TestGroundedProse:
             # it, which is the form that does not look like an address at all.
             "Pay at pay.example.рф for 20% off.",
             "Đặt trực tiếp tại pay.example.中国 nhé.",
+            # UTS-46 maps these to a full stop, so they are not lookalikes of
+            # a host - they *are* the host, and a browser resolves them. An
+            # ASCII-only separator found no candidate at all, so the careful
+            # suffix normalisation underneath was never reached.
+            "Pay at pay。example。com for 20% off.",
+            "Pay at pay．example．com for 20% off.",
+            "Pay at pay｡example｡com for 20% off.",
+            "Book direct at pay。example。com/checkout.",
+            "Pay at pay。example。рф for 20% off.",
         ],
     )
     def test_a_bare_domain_is_a_channel_too(self, prose: str) -> None:
@@ -484,6 +493,12 @@ class TestGroundedProse:
             "Chuyến đi TP.HCM khởi hành lúc 08:30.",
             "Giá 1.500.000/khách cho cả nhóm.",
             "Ăn sáng lúc 7.30 sáng mỗi ngày.",
+            # `。` is an ordinary full stop in Chinese and Japanese, so
+            # treating it as a label separator puts every CJK sentence at
+            # risk. It stays prose because the suffix still has to be a
+            # delegated domain - which is the whole point of deciding by data.
+            "东京。这个行程很好。",
+            "こんにちは。ツアーは素晴らしいです。",
         ],
     )
     def test_ordinary_sentences_are_not_mistaken_for_a_domain(self, prose: str) -> None:
@@ -631,3 +646,18 @@ class TestTheSuffixListIsRealData:
         assert len(punycode) > 100, "IANA delegates ~150 internationalised TLDs"
         for suffix in ("xn--p1ai", "xn--fiqs8s", "xn--j1amh"):
             assert suffix in TOP_LEVEL_DOMAINS, suffix
+
+    def test_the_separators_are_the_ones_a_browser_folds(self) -> None:
+        """A guard that reads only ASCII dots never sees the host at all.
+
+        This is not about lookalike characters. UTS-46 maps each of these to a
+        full stop, so `pay。example。com` and `pay.example.com` are the same
+        name and typing either reaches the same server.
+        """
+        import idna
+
+        from app.assistant.provider import _DOTS
+
+        for separator in _DOTS:
+            folded = idna.encode(f"pay{separator}example{separator}com", uts46=True)
+            assert folded.decode() == "pay.example.com", separator
