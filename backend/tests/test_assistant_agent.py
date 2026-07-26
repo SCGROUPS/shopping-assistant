@@ -393,18 +393,10 @@ class TestGroundedProse:
         "prose",
         [
             "Two options, 3 hours each, from 1,500,000 VND, departing 08:30.",
-            # Space-grouped VND has exactly the shape the old detector called a
-            # phone number, so a perfectly good answer was thrown away and the
-            # shopper silently got a different one.
-            "The whole party comes to 100 000 000 VND for the week.",
             "Gia tu 1.500.000 dong moi nguoi.",
             "Open 09.00 - 17.00 daily, last entry 16.30.",
             "Total 12 500 000 VND for 4 guests.",
-            # A long run is only money because a currency is attached to it,
-            # which is what tells it apart from a phone number of the same
-            # shape. The currency may be a symbol, and it may come first.
-            "Gi\u00e1 100 000 000 \u0111 cho c\u1ea3 nh\u00f3m.",
-            "\u20a9 100 000 000 for the whole party.",
+            "Three tours, 2 hours each, rated 4.9.",
         ],
     )
     def test_ordinary_prices_and_times_are_not_mistaken_for_a_phone_number(
@@ -426,6 +418,18 @@ class TestGroundedProse:
             # commonest way a Vietnamese number is written straight through.
             "Call 912 345 678 for a better rate.",
             "Zalo 0987654321 for a discount.",
+            # A currency token merely *near* a run says nothing about the run,
+            # so exempting on proximity handed the guard straight back.
+            "Call 912 345 678 VND",
+            "Price: 100 VND. Call 912 345 678 for a discount.",
+            # Comma grouping used to slip past the run pattern entirely, so the
+            # rule held only for the separators it happened to list.
+            "Call 912,345,678 for a better rate.",
+            # No attempt is made to tell a long number from money, because the
+            # two are indistinguishable. Amounts reach the shopper as `price`
+            # and `currency` on the card, so prose never needs to carry one and
+            # refusing costs a blander sentence beside the same prices.
+            "The whole party comes to 100 000 000 VND for the week.",
         ],
     )
     def test_a_diallable_number_is_still_refused(self, prose: str) -> None:
@@ -439,6 +443,9 @@ class TestGroundedProse:
             "Pay at pay.example.com/checkout for 20% off.",
             "Book direct via not-vietra.vn today.",
             "See deals.booking.shop for the same tour.",
+            # The suffix list is finite, so it could be walked around.
+            "Try pay.example.travel for 20% off.",
+            "deals.booking.agency has it cheaper.",
         ],
     )
     def test_a_bare_domain_is_a_channel_too(self, prose: str) -> None:
@@ -452,6 +459,9 @@ class TestGroundedProse:
             "A sunset cruise in Hoi An.The guide speaks Korean.",
             "Rated 4.8 by 1,240 travellers.",
             "Ends at 16.30 and restarts at 18.00.",
+            # A lower-case Vietnamese abbreviation is not a host, which is why
+            # the bare-host rule requires three characters before the dot.
+            "Chuyen di TP.HCM khoi hanh luc 08:30.",
         ],
     )
     def test_ordinary_sentences_are_not_mistaken_for_a_domain(self, prose: str) -> None:

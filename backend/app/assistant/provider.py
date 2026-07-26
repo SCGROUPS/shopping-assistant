@@ -334,11 +334,8 @@ _INJECTED_CHANNEL = re.compile(
   | [a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
     # A host followed by a path is a link whatever its suffix is.
   | \b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+/\S
-    # A bare host needs no scheme to be typed into a browser, so requiring
-    # `http://` or `www.` let `pay.example.com` straight through. Here the
-    # suffix is an explicit list rather than "any two letters", because prose
-    # that has lost a space after a full stop ("the tour.The guide") otherwise
-    # reads as a domain and would silently discard a sound answer.
+    # A bare host with a suffix people actually register. Case-insensitive,
+    # because this list is specific enough not to collide with prose.
   | \b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:
         com|net|org|io|co|vn|me|info|biz|shop|app|xyz|site|online|link|top
       | store|live|page|cc|tv|ru|cn|de|fr|jp|kr|es|uk|au|sg|th|ph|id|my
@@ -346,20 +343,28 @@ _INJECTED_CHANNEL = re.compile(
     """
 )
 
-# Any run long enough to dial. Which is also, exactly, the shape of a sum of
-# money: `912 345 678` and `100 000 000` are the same nine digits in the same
-# three groups, so no amount of looking at the digits alone can separate them.
-# An earlier attempt anchored on a leading `+` or trunk `0`, which let a locally
-# written `912 345 678` through. What actually distinguishes them is whether a
-# currency is attached - and a currency code is a closed set of tokens, not a
-# language to be interpreted.
-_LONG_DIGIT_RUN = re.compile(r"(?<![\d\w])[\d][\d\s.()-]{6,}")
-_CURRENCY_NEAR = re.compile(
-    r"(?i)(?:VND|USD|EUR|JPY|KRW|CNY|GBP|AUD|SGD|THB|MYR|PHP|IDR|"
-    r"[\u0111\u20ab$\u20ac\u00a5\u20a9\u00a3])"
-)
-# Enough to reach "VND" past a space, not enough to reach the next sentence.
-_CURRENCY_WINDOW = 12
+# The suffix list above is finite, so `pay.example.travel` walked through it.
+# This catches any dotted host, and is deliberately case-*sensitive*: a real
+# domain is written in lower case, while the prose this would otherwise
+# misread - "a cruise in Hoi An.The guide speaks Korean", "TP.HCM" - carries a
+# capital after the dot. Requiring three characters before the dot keeps the
+# lower-case Vietnamese abbreviations ("tp.hcm") out of it; anything shorter
+# with a suffix worth registering is already covered by the list above.
+_BARE_HOST = re.compile(r"\b[a-z0-9][a-z0-9-]{2,}(?:\.[a-z0-9-]+)*\.[a-z]{2,24}\b")
+
+# Nine digits is where telephone numbers start, and no attempt is made to tell
+# them from money - the previous two tries both failed, because `912 345 678`
+# and `100 000 000` are the same nine digits in the same three groups, and a
+# currency token merely *near* a run says nothing about the run ("Price: 100
+# VND. Call 912 345 678").
+#
+# It does not need telling. Amounts reach the shopper as structured data - the
+# `price` and `currency` on the card, and `message_vars` for the sentence - so
+# the client formats them in the shopper's own locale and the model has no
+# reason to write one out. Refusing here costs a blander sentence beside the
+# same cards and the same prices; letting one through costs a shopper who
+# paid a stranger.
+_LONG_DIGIT_RUN = re.compile(r"(?<![\d\w])\d[\d\s.,()-]{6,}")
 
 
 def carries_injected_channel(text: str) -> bool:
@@ -370,18 +375,12 @@ def carries_injected_channel(text: str) -> bool:
     catalogue text from whoever wanted the shopper to leave the site and pay
     somewhere unprotected.
     """
-    if _INJECTED_CHANNEL.search(text):
+    if _INJECTED_CHANNEL.search(text) or _BARE_HOST.search(text):
         return True
-    for match in _LONG_DIGIT_RUN.finditer(text):
-        run = match.group()
-        if not 9 <= sum(character.isdigit() for character in run) <= 15:
-            continue
-        neighbourhood = text[
-            max(0, match.start() - _CURRENCY_WINDOW) : match.end() + _CURRENCY_WINDOW
-        ]
-        if not _CURRENCY_NEAR.search(neighbourhood):
-            return True
-    return False
+    return any(
+        sum(character.isdigit() for character in match.group()) >= 9
+        for match in _LONG_DIGIT_RUN.finditer(text)
+    )
 
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
