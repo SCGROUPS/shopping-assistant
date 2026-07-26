@@ -244,3 +244,85 @@ export const fetchFunnel = async () => {
   }
   return (await response.json()) as FunnelView
 }
+
+export interface TranslationCandidate {
+  experience_id: string
+  title: string
+  field: string
+  locale: string
+  source_text: string
+  source_language: string
+  candidate_value: string
+  candidate_fingerprint: string
+  generation: number
+  answers_current_source: boolean
+  updated_at: string
+}
+
+export interface TranslationReviewQueue {
+  items: TranslationCandidate[]
+  total: number
+  by_locale: Record<string, number>
+}
+
+export const fetchTranslationQueue = (locale?: string, limit = 25) => {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (locale) params.set('locale', locale)
+  return request<TranslationReviewQueue>(`/translations/review?${params}`)
+}
+
+/**
+ * The fingerprint and generation are the ones the reviewer was shown, not the
+ * current ones. Re-reading them here would defeat the check entirely: the
+ * server would compare the state against itself and approve whatever it found,
+ * which is exactly the race that publishes a string nobody read.
+ */
+const decision = (item: TranslationCandidate) => ({
+  experience_id: item.experience_id,
+  field: item.field,
+  locale: item.locale,
+  candidate_fingerprint: item.candidate_fingerprint,
+  generation: item.generation,
+})
+
+export const approveTranslation = (item: TranslationCandidate) =>
+  request<{ status: string; value: string }>('/translations/review/approve', {
+    method: 'POST',
+    body: JSON.stringify(decision(item)),
+  })
+
+export const rejectTranslation = (item: TranslationCandidate) =>
+  request<{ status: string; value: string }>('/translations/review/reject', {
+    method: 'POST',
+    body: JSON.stringify(decision(item)),
+  })
+
+export const editTranslation = (
+  item: TranslationCandidate,
+  value: string,
+) =>
+  request<{ status: string }>('/translations/edit', {
+    method: 'POST',
+    body: JSON.stringify({
+      experience_id: item.experience_id,
+      field: item.field,
+      locale: item.locale,
+      value,
+    }),
+  })
+
+export interface LocaleCoverage {
+  locale: string
+  enabled: boolean
+  percent: number
+  needs_review: number
+  fallback: number
+  missing: number
+  fields: Record<
+    string,
+    { total: number; translated: number; fallback: number; missing: number; percent: number }
+  >
+}
+
+export const fetchTranslationCoverage = () =>
+  request<{ locales: LocaleCoverage[] }>('/translations')

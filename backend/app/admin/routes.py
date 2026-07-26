@@ -34,6 +34,7 @@ from app.common.errors import ApiError
 from app.common.models import Operator
 from app.common.runtime_config import get_value
 from app.content import coverage as translation_coverage
+from app.content import review
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
 
@@ -159,10 +160,153 @@ async def translation_coverage_report(
     return {"locales": [item.as_dict() for item in reports], "spend": spend}
 
 
+class ReviewDecision(BaseModel):
+    """What the reviewer saw, so the server can refuse if it has changed.
+
+    Both are required and neither has a default. A default would let a caller
+    omit the check and have the server publish whatever is currently there,
+    which is the exact race the fields exist to prevent - and omitting a field
+    is a much easier mistake to make than sending a wrong one.
+    """
+
+    experience_id: UUID
+    field: str
+    locale: str
+    candidate_fingerprint: str
+    generation: int
+
+
+class TranslationEdit(BaseModel):
+    experience_id: UUID
+    field: str
+    locale: str
+    value: str = Field(min_length=1, max_length=4000)
+
+
+@router.get("/translations/review")
+async def translation_review_queue(
+    principal: ReadAccess,
+    locale: str | None = None,
+    field: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    """Machine translations held back from the storefront awaiting a human.
+
+    §6.5 holds `meeting_point` because a mistranslated address sends a
+    traveller to the wrong place. The worker implemented that faithfully and
+    nothing ever read the queue, so `needs_review` was a terminal state and
+    every locale sat permanently at one unpublished field per experience while
+    the coverage report described it as a backlog somebody could work.
+    """
+    if session_factory is None:
+        raise ApiError(503, "Unavailable", "Database is not configured", "review-unavailable")
+    async with session_factory() as session:
+        queue = await review.review_queue(
+            session, locale=locale, field=field, limit=limit, offset=offset
+        )
+    return queue.as_dict()
+
+
+async def _decide(
+    decision: ReviewDecision,
+    principal: Any,
+    *,
+    approve: bool,
+) -> dict[str, Any]:
+    if session_factory is None:
+        raise ApiError(503, "Unavailable", "Database is not configured", "review-unavailable")
+    act = review.approve_candidate if approve else review.reject_candidate
+    async with session_factory() as session:
+        try:
+            value = await act(
+                session,
+                experience_id=decision.experience_id,
+                field=decision.field,
+                locale=decision.locale,
+                reviewer=principal.email,
+                expected_fingerprint=decision.candidate_fingerprint,
+                expected_generation=decision.generation,
+            )
+        except review.ReviewConflict as conflict:
+            # 409, not 422: the request was well-formed and was correct when it
+            # was rendered. The reviewer needs to re-read, not to fix a typo.
+            raise ApiError(409, "Review conflict", conflict.detail, conflict.reason) from conflict
+        record(
+            session,
+            principal,
+            action="translation.approve" if approve else "translation.reject",
+            entity_type="experience",
+            entity_id=decision.experience_id,
+            summary=f"{decision.field} ({decision.locale})",
+            # The text itself, because "approved" without it cannot answer the
+            # only question an audit of a wrong address ever asks.
+            changes={"field": decision.field, "locale": decision.locale, "value": value},
+        )
+        await session.commit()
+    return {"status": "current" if approve else "rejected", "value": value}
+
+
+@router.post("/translations/review/approve")
+async def approve_translation(
+    principal: CatalogPublish, decision: ReviewDecision
+) -> dict[str, Any]:
+    """Publish one candidate. Deliberately one, and deliberately not a list.
+
+    Bulk approval is not compatible with `requires_review=True`: one click over
+    379 distinct sets of directions is not review, it is the auto-publish this
+    field is specifically excluded from, with an operator's name attached to
+    it.
+    """
+    return await _decide(decision, principal, approve=True)
+
+
+@router.post("/translations/review/reject")
+async def reject_translation(principal: CatalogPublish, decision: ReviewDecision) -> dict[str, Any]:
+    return await _decide(decision, principal, approve=False)
+
+
+@router.post("/translations/edit")
+async def edit_translation(principal: CatalogPublish, body: TranslationEdit) -> dict[str, Any]:
+    """Publish a translation the reviewer wrote themselves.
+
+    This is what stops a rejection being permanent. Rejecting does not
+    re-enqueue - the same source and recipe produce the same wrong address
+    forever - so without this the field would sit on English until somebody
+    happened to edit the source text.
+    """
+    if session_factory is None:
+        raise ApiError(503, "Unavailable", "Database is not configured", "review-unavailable")
+    async with session_factory() as session:
+        try:
+            await review.edit_translation(
+                session,
+                experience_id=body.experience_id,
+                field=body.field,
+                locale=body.locale,
+                reviewer=principal.email,
+                value=body.value,
+            )
+        except review.ReviewConflict as conflict:
+            raise ApiError(409, "Review conflict", conflict.detail, conflict.reason) from conflict
+        except ValueError as error:
+            raise ApiError(404, "Not found", str(error), "experience-not-found") from error
+        record(
+            session,
+            principal,
+            action="translation.edit",
+            entity_type="experience",
+            entity_id=body.experience_id,
+            summary=f"{body.field} ({body.locale})",
+            changes={"field": body.field, "locale": body.locale, "value": body.value},
+        )
+        await session.commit()
+    return {"status": "current", "provenance": "manual"}
+
+
 @router.get("/settings")
 async def read_settings(principal: ReadAccess) -> dict[str, Any]:
     return await settings_ops.describe()
-
 
 @router.put("/settings/{key}")
 async def write_setting(

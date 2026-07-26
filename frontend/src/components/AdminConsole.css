@@ -507,3 +507,73 @@
 .ops-funnel strong {
   text-align: right;
 }
+
+/* The translation review queue.
+   Source and proposal sit side by side because the reviewer's job is to judge
+   a pair, not to read a sentence. Stacking them turns the comparison into a
+   memory test, which is how a wrong address gets approved. */
+.ops-translations {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.ops-coverage td:last-child:not(:empty) {
+  font-variant-numeric: tabular-nums;
+}
+
+.ops-candidate {
+  border: 1px solid var(--ops-border, #d8dee6);
+  border-radius: 6px;
+  padding: 0.85rem 1rem;
+  background: #fff;
+}
+
+.ops-candidate header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 0.6rem;
+}
+
+.ops-candidate-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.ops-candidate-pair p {
+  margin: 0.2rem 0 0;
+  /* Directions are the field held for review, and they wrap badly: a line
+     break inside an address is exactly where a reviewer stops reading. */
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .ops-candidate-pair {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ops-candidate-actions,
+.ops-candidate-edit {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  align-items: flex-start;
+}
+
+.ops-candidate-edit textarea {
+  flex: 1;
+  font: inherit;
+  padding: 0.4rem;
+}
+
+.ops-warning {
+  margin: 0.6rem 0 0;
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid #b8860b;
+  background: #fdf6e3;
+  font-size: 0.9rem;
+}

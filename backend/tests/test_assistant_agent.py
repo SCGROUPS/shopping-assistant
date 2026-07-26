@@ -449,6 +449,14 @@ class TestGroundedProse:
             # DNS is case-insensitive, so capitalisation cannot be the boundary.
             "Pay at pay.Example.travel for 20% off.",
             "PAY.EXAMPLE.COM has the same tour.",
+            # An internationalised domain reaches DNS as its A-label, so a list
+            # of only the alphabetic suffixes lets every one of them through.
+            "Pay at pay.example.xn--p1ai for 20% off.",
+            "Book direct at pay.example.xn--p1ai/checkout.",
+            # And the same host written the way a shopper would actually see
+            # it, which is the form that does not look like an address at all.
+            "Pay at pay.example.рф for 20% off.",
+            "Đặt trực tiếp tại pay.example.中国 nhé.",
         ],
     )
     def test_a_bare_domain_is_a_channel_too(self, prose: str) -> None:
@@ -470,6 +478,12 @@ class TestGroundedProse:
             "the tour.the guide speaks Korean",
             "Gia 1.500.000/khach cho ca nhom.",
             "Mo cua 16.30/person moi ngay.",
+            # Accented prose must survive the guard becoming Unicode-aware:
+            # allowing non-ASCII host labels also makes every Vietnamese word a
+            # possible label, so ordinary sentences are the thing most at risk.
+            "Chuyến đi TP.HCM khởi hành lúc 08:30.",
+            "Giá 1.500.000/khách cho cả nhóm.",
+            "Ăn sáng lúc 7.30 sáng mỗi ngày.",
         ],
     )
     def test_ordinary_sentences_are_not_mistaken_for_a_domain(self, prose: str) -> None:
@@ -590,7 +604,30 @@ class TestTheSuffixListIsRealData:
             assert word not in TOP_LEVEL_DOMAINS, word
 
     def test_every_entry_is_normalised(self) -> None:
-        """Membership is tested against a lower-cased suffix, so the data must be."""
+        """Membership is tested against a lower-cased suffix, so the data must be.
+
+        Deliberately does *not* assert `isalpha()`. The first version of this
+        test did, and that single word is what silently deleted all 151
+        punycode entries from the vendored data: the generator filtered the
+        list to satisfy the test, `pay.example.xn--p1ai` sailed through the
+        guard, and the test suite reported the data was faithful to IANA while
+        making faithful IANA data impossible to hold.
+        """
         from app.assistant.tlds import TOP_LEVEL_DOMAINS
 
-        assert all(entry == entry.lower() and entry.isalpha() for entry in TOP_LEVEL_DOMAINS)
+        assert all(entry == entry.lower() for entry in TOP_LEVEL_DOMAINS)
+        assert all(entry.isascii() and entry.strip() == entry for entry in TOP_LEVEL_DOMAINS)
+
+    def test_internationalised_domains_are_present(self) -> None:
+        """An IDN reaches DNS as its A-label, so the A-labels must be in here.
+
+        `.рф` is a real top-level domain that a shopper's browser resolves. A
+        set built from only the alphabetic entries omits every one of them, and
+        omits them invisibly - the count still looks like a thousand-odd.
+        """
+        from app.assistant.tlds import TOP_LEVEL_DOMAINS
+
+        punycode = {entry for entry in TOP_LEVEL_DOMAINS if entry.startswith("xn--")}
+        assert len(punycode) > 100, "IANA delegates ~150 internationalised TLDs"
+        for suffix in ("xn--p1ai", "xn--fiqs8s", "xn--j1amh"):
+            assert suffix in TOP_LEVEL_DOMAINS, suffix

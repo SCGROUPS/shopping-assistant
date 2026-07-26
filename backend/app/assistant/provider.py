@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
+import idna
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AsyncAzureOpenAI
 
@@ -322,6 +323,16 @@ def _offered_ids(result: dict[str, Any]) -> set[str]:
     return found
 
 
+# A label of a hostname: alphanumeric, hyphens inside. `[^\W_]` rather than
+# `[a-z0-9]` because an internationalised domain is written in its own script,
+# and a guard that only understands ASCII is a guard an attacker writes around
+# by typing the same host in Cyrillic.
+_LABEL = r"[^\W_](?:[^\W_]|-)*"
+
+# A last label containing at least one letter. Without it a price written
+# `1.500.000/khach` and a time written `16.30/person` both read as links.
+_ALPHA_LAST_LABEL = rf"(?=(?:[^\W_]|-)*[^\W\d_]){_LABEL}"
+
 # A link, an address or a phone number in the assistant's prose did not come
 # from a tool: no tool returns any of these. It came from the model, and the
 # most likely author is catalogue text written by whoever wanted the shopper to
@@ -329,14 +340,14 @@ def _offered_ids(result: dict[str, Any]) -> set[str]:
 # answer we cannot verify by id, so it is checked for the things that are never
 # legitimate in it.
 _INJECTED_CHANNEL = re.compile(
-    r"""(?xi)
+    rf"""(?xi)
     https?://
-  | www\.[a-z0-9-]+\.[a-z]{2,}
-  | [a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
-    # A host followed by a path is link-shaped whatever its suffix is. The
-    # final label must contain letters, or a price written `1.500.000/khach`
-    # and a time written `16.30/person` would both read as one.
-  | \b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.[a-z]{2,}/\S
+  | www\.{_LABEL}\.{_ALPHA_LAST_LABEL}
+  | [^\W_][\w.%+-]*@{_LABEL}(?:\.{_LABEL})*\.{_ALPHA_LAST_LABEL}
+    # A host followed by a path is link-shaped whatever its suffix is. This is
+    # what catches `.example`, which is reserved by RFC 2606 and therefore
+    # absent from IANA's list of delegated domains.
+  | \b{_LABEL}(?:\.{_LABEL})*\.{_ALPHA_LAST_LABEL}/\S
     """
 )
 
@@ -350,7 +361,31 @@ _INJECTED_CHANNEL = re.compile(
 # refusing ordinary prose that had lost the space after a full stop, in
 # languages whose sentences are not reliably capitalised at all. The suffix is
 # the only part of a host that is defined rather than guessed.
-_HOST_CANDIDATE = re.compile(r"\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+\b", re.I)
+_HOST_CANDIDATE = re.compile(rf"\b{_LABEL}(?:\.{_LABEL})+", re.I)
+
+
+def _suffix_is_delegated(host: str) -> bool:
+    """Whether the last label of `host` is a top-level domain IANA delegates.
+
+    The lookup is done on the A-label, because that is the form IANA publishes
+    and the form that reaches DNS. A shopper-facing string carrying
+    `pay.example.рф` and one carrying `pay.example.xn--p1ai` name the same
+    server, and only one of them looks like a domain to a naive reader.
+
+    UTS-46 mapping is what a browser applies to a typed host, so it is what
+    decides whether this text would reach that server if somebody pasted it.
+    """
+    suffix = host.rsplit(".", 1)[-1].lower()
+    if suffix in TOP_LEVEL_DOMAINS:
+        return True
+    if suffix.isascii():
+        return False
+    try:
+        return idna.encode(suffix, uts46=True).decode("ascii") in TOP_LEVEL_DOMAINS
+    except (idna.IDNAError, UnicodeError):
+        # Not encodable as a hostname, so not reachable as one.
+        return False
+
 
 # Nine digits is where telephone numbers start, and no attempt is made to tell
 # them from money - three tries all failed, because `912 345 678` and
@@ -377,10 +412,7 @@ def carries_injected_channel(text: str) -> bool:
     """
     if _INJECTED_CHANNEL.search(text):
         return True
-    if any(
-        match.group().rsplit(".", 1)[-1].lower() in TOP_LEVEL_DOMAINS
-        for match in _HOST_CANDIDATE.finditer(text)
-    ):
+    if any(_suffix_is_delegated(match.group()) for match in _HOST_CANDIDATE.finditer(text)):
         return True
     return any(
         sum(character.isdigit() for character in match.group()) >= 9

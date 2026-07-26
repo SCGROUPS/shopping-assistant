@@ -32,10 +32,8 @@ from datetime import UTC, datetime
 from openai import APIConnectionError, RateLimitError
 from sqlalchemy import and_, func, select, text, tuple_, update
 from sqlalchemy import exc as sa_exc
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.catalog.indexing import enqueue_experience_reindex
 from app.common.config import get_settings
 from app.common.llm_cost import BudgetExceeded
 from app.common.models import (
@@ -52,6 +50,7 @@ from app.content.enqueue import (
 from app.content.enqueue import (
     requires_review as field_requires_review,
 )
+from app.content.publish import publish_experience_translation
 
 logger = logging.getLogger(__name__)
 
@@ -341,28 +340,18 @@ async def commit_translation(
         return False
 
     if not requires_review:
-        column = _WIDE_COLUMNS[job.field]
-        await session.execute(
-            pg_insert(ExperienceTranslation)
-            .values(
-                experience_id=job.entity_id,
-                locale=job.locale,
-                **{job.field: translated},
-            )
-            .on_conflict_do_update(
-                index_elements=[
-                    ExperienceTranslation.experience_id,
-                    ExperienceTranslation.locale,
-                ],
-                # One column. Naming all four would have two workers write each
-                # other's column back to whatever they loaded.
-                set_={column.key: translated, "updated_at": datetime.now(UTC)},
-            )
+        # Shared with review approval and manual editing. Three call sites once
+        # carried their own copy of "write the column, then enqueue the
+        # reindex", and the reindex is the half that goes missing without
+        # anything failing: the field reads correctly on the product page while
+        # the search document for that locale still holds the old text.
+        await publish_experience_translation(
+            session,
+            experience_id=job.entity_id,
+            field=job.field,
+            locale=job.locale,
+            value=translated,
         )
-        # The document for this locale is now built from different text, so it
-        # has to be rebuilt. Same transaction: a published translation that is
-        # not searchable is a translation nobody will ever read.
-        await enqueue_experience_reindex(session, job.entity_id, locales=[job.locale])
 
     await session.execute(
         update(TranslationJob)

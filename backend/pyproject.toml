@@ -10,6 +10,10 @@ dependencies = [
   "azure-identity>=1.19,<2",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
+  # Direct, not incidental: the assistant's channel guard folds internationalised
+  # hostnames to the A-label form IANA publishes. Arrived transitively via httpx,
+  # which is not a promise that it stays.
+  "idna>=3.6,<4",
   "openai>=1.60,<3",
   "pgvector>=0.3,<1",
   "pillow>=11,<13",
