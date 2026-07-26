@@ -120,7 +120,11 @@ export function VoiceInputButton({
       }
       const normalized = transcript.trim()
       if (normalized) onTranscriptRef.current(normalized, final)
-      setStatus(final ? `Heard: ${normalized}` : `Listening: ${normalized}`)
+      setStatus(
+        final
+          ? t('voice.heard', { transcript: normalized })
+          : t('voice.hearing', { transcript: normalized }),
+      )
     }
     recognition.onerror = (event) => {
       setStatus(recognitionErrorMessage(event.error, t))

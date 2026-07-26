@@ -45,6 +45,19 @@ const en = {
   'checkout.total': 'Total',
 
   'product.from': 'From',
+  'badge.instant_confirmation': 'Instant confirmation',
+  'badge.family_friendly': 'Family friendly',
+  'badge.free_cancellation': 'Free cancellation',
+  'badge.free_cancellation_hours': 'Free cancellation {hours}h',
+  'badge.available': 'Available',
+  'badge.sold_out': 'Sold out',
+  'product.duration.minutes': '{minutes} min',
+  'product.duration.hours_one': '{hours} hour',
+  'product.duration.hours_other': '{hours} hours',
+  'product.duration.hoursMinutes': '{hours}h {minutes}m',
+  'assistant.askAbout': 'Tell me more about {title}.',
+  'voice.heard': 'Heard: {transcript}',
+  'voice.hearing': 'Listening: {transcript}',
 
   'app.tagline': 'Vietnam, beautifully planned',
   'app.nav.discover': 'Discover',
@@ -365,6 +378,18 @@ type DictionaryKey = MessageKey | PluralKey
 type Dictionary = Partial<Record<DictionaryKey, string>>
 
 const vi: Dictionary = {
+  'badge.instant_confirmation': 'Xác nhận tức thì',
+  'badge.family_friendly': 'Phù hợp gia đình',
+  'badge.free_cancellation': 'Miễn phí hủy',
+  'badge.free_cancellation_hours': 'Miễn phí hủy trước {hours} giờ',
+  'badge.available': 'Còn chỗ',
+  'badge.sold_out': 'Hết chỗ',
+  'product.duration.minutes': '{minutes} phút',
+  'product.duration.hours_other': '{hours} giờ',
+  'product.duration.hoursMinutes': '{hours} giờ {minutes} phút',
+  'assistant.askAbout': 'Cho tôi biết thêm về {title}.',
+  'voice.heard': 'Đã nghe: {transcript}',
+  'voice.hearing': 'Đang nghe: {transcript}',
   'nav.experiences': 'Trải nghiệm',
   'nav.cart.open': 'Mở giỏ hàng',
   'nav.language': 'Ngôn ngữ',

@@ -55,7 +55,8 @@ async def test_natural_language_search_applies_hard_filters(client: AsyncClient)
     assert payload["intent"]["destination"]["name"] == "Hoi An"
     assert payload["effective_filters"]["destination"] == "Hoi An"
     assert all(item["destination"] == "Hoi An" for item in payload["items"])
-    assert all("Family friendly" in item["badges"] for item in payload["items"])
+    assert all(item["family_friendly"] for item in payload["items"])
+    assert all("family_friendly" in item["badges"] for item in payload["items"])
     assert all(item["options"] for item in payload["items"])
 
 

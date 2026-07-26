@@ -17,7 +17,6 @@ from app.assistant.provider import AIProvider, build_ai_provider, deterministic_
 from app.catalog.service import product_card, starting_price
 from app.common.config import get_settings
 from app.common.database import session_factory
-from app.common.query_shape import looks_conversational
 from app.common.embedding_cache import embedding_cache
 from app.common.features import (
     availability_fit,
@@ -95,26 +94,34 @@ DATE_CONSTRAINT_FIELDS = {
 
 
 def should_extract_intent(request: SearchRequest) -> bool:
-    """Whether a query is worth spending a model call on."""
-    return looks_conversational(request.query)
+    """Whether there is anything here for the model to interpret.
+
+    This used to be a judgement about *shape* - English function words, then
+    word and character counts - and it doubled as the routing decision. Both
+    versions were proxies for meaning that behaved as proxies for language, so
+    whether a shopper could reach the assistant depended on which language they
+    wrote in. The only thing left that can be decided without reading the
+    request is whether there is a request at all.
+    """
+    return bool(request.query.strip())
 
 
 def sanitize_intent(query: str, intent: SearchIntent) -> SearchIntent:
-    mentions_date = bool(
-        re.search(
-            r"\b("
-            r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}|"
-            r"\d{1,2}[/-]\d{1,2}[/-](?:20)?\d{2}|"
-            r"january|february|march|april|may|june|july|august|"
-            r"september|october|november|december|"
-            r"today|tomorrow|tonight|"
-            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
-            r"next week|this week|weekend"
-            r")\b",
-            query,
-            re.I,
-        )
-    )
+    """Drop constraints the shopper did not actually ask for.
+
+    The date guard here used to be a regex of English month names, weekdays and
+    words like `tomorrow`. It ran against the shopper's raw text, so a request
+    written in Vietnamese or Japanese never matched, and any date the model had
+    correctly understood was thrown away - the shopper typed a date, saw it
+    ignored, and nothing anywhere reported a problem.
+
+    The model now quotes the words it read the date from, and the only thing
+    checked here is that those words really occur in the request. That still
+    stops an invented date, because an invented one has no source text to
+    quote, and it does so without the guard needing to know the language.
+    """
+    quoted = (intent.date_phrase or "").strip().casefold()
+    mentions_date = bool(quoted) and quoted in query.casefold()
     constraints: list[dict[str, Any]] = []
     for constraint in intent.hard_constraints:
         field = str(constraint.get("field", "")).casefold()
@@ -474,9 +481,9 @@ class SearchService:
             # every language this catalogue serves.
             intent = SearchIntent(
                 search_text=request.query,
-                interaction_mode=(
-                    "assistant" if looks_conversational(request.query) else "grid"
-                ),
+                # Nothing here read the request, so nothing here may claim to
+                # know how it should be answered.
+                interaction_mode="undetermined",
             )
         intent = sanitize_intent(request.query, intent)
         if intent.destination.name:

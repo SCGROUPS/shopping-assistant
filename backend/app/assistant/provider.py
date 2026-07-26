@@ -12,7 +12,6 @@ from openai import AsyncAzureOpenAI
 from app.api.schemas import IntentValue, SearchIntent
 from app.common.config import Settings, get_settings
 from app.common.llm_cost import BudgetExceeded, ledger
-from app.common.query_shape import looks_conversational
 from app.common.ranking import deterministic_embedding
 
 logger = logging.getLogger(__name__)
@@ -320,13 +319,12 @@ def deterministic_intent(text: str) -> SearchIntent:
         hard_constraints=hard,
         soft_preferences=soft,
         exclusions=exclusions,
-        # The patterns above are English, but they only ever add filters. The
-        # routing judgement must not inherit their bias, so it uses the same
-        # language-neutral shape test that decided this query was worth
-        # interpreting in the first place. Without this, a model outage would
-        # silently route every stated need that lacks a question mark to the
-        # keyword grid - the queries that need the assistant most.
-        interaction_mode="assistant" if looks_conversational(text) else "grid",
+        # This function is English pattern-matching used when the model cannot
+        # be reached. It has no way to tell a lookup from a plea for help in a
+        # language it does not contain, so it declines to guess: every rule
+        # tried here was a proxy for meaning that turned out to be a proxy for
+        # language, and a wrong guess is worse than a reported absence.
+        interaction_mode="undetermined",
     )
 
 
@@ -562,6 +560,7 @@ class AzureOpenAIProvider:
                 "needs_clarification": {"type": "boolean"},
                 "clarification_question": {"type": ["string", "null"]},
                 "interaction_mode": {"type": "string", "enum": ["assistant", "grid"]},
+                "date_phrase": {"type": ["string", "null"]},
             },
             "required": [
                 "search_text",
@@ -572,6 +571,7 @@ class AzureOpenAIProvider:
                 "needs_clarification",
                 "clarification_question",
                 "interaction_mode",
+                "date_phrase",
             ],
             "additionalProperties": False,
         }
@@ -589,12 +589,14 @@ class AzureOpenAIProvider:
                         "in whatever language they wrote it - not from the words used. "
                         f"Today is {datetime.now(UTC):%Y-%m-%d}. "
                         "Only emit visit_start or visit_end when the user explicitly states a "
-                        "calendar date or relative date phrase such as today, tomorrow, next "
-                        "week, or this weekend. The current date is provided only to resolve "
-                        "those explicit relative phrases; never infer a visit date from the "
-                        "destination, interests, party, or general request. If there is no date "
-                        "phrase, omit both date constraints. For one date, emit visit_start only, "
-                        "and never emit visit_end earlier than visit_start. "
+                        "calendar date or a relative date phrase, in any language. The current "
+                        "date is provided only to resolve those explicit relative phrases; never "
+                        "infer a visit date from the destination, interests, party, or general "
+                        "request. If there is no date phrase, omit both date constraints. For one "
+                        "date, emit visit_start only, and never emit visit_end earlier than "
+                        "visit_start. Set date_phrase to the exact words from the user's message "
+                        "that state the date, copied character for character, and null when they "
+                        "state no date. "
                         "Treat explicit indoor/outdoor, accessibility, date, budget, language, "
                         "and exclusion statements as hard constraints. Categories, interests, "
                         "and general family suitability are soft preferences unless the user says "

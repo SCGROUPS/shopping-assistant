@@ -21,6 +21,7 @@ import type {
 import { hasReviews } from '../lib/rating'
 import { VoiceInputButton } from './VoiceInputButton'
 import { useLocale, useT } from '../lib/useLocale'
+import { badgeLabels } from '../lib/badges'
 import { bcp47, formatMoney } from '../lib/format'
 import { resolveText } from '../lib/i18n'
 
@@ -216,7 +217,7 @@ export function AssistantPanel({
                                 }
                               }}
                             />
-                            {product.badges[0] && <i>{product.badges[0]}</i>}
+                            {badgeLabels(product, t)[0] && <i>{badgeLabels(product, t)[0]}</i>}
                           </span>
                           <span className="assistant-product-copy">
                             <strong>{product.title}</strong>

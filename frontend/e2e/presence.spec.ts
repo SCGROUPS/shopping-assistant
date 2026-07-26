@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { routeSearchAs } from './routing'
 
 // Assistant presence rules — docs/SYSTEM_DESIGN.md §8.
 // "Ambient, not interruptive. Earned, never automatic."
@@ -18,11 +19,12 @@ test('the assistant never auto-opens on page load', async ({ page }) => {
 test('a keyword query stays in the grid, a conversational query hands off', async ({
   page,
 }) => {
+  await routeSearchAs(page, 'grid')
   await page.goto('/')
   const assistant = page.getByRole('dialog', {
     name: 'Mai shopping assistant',
   })
-  const search = page.getByLabel('What would make this trip memorable?')
+  const search = page.getByTestId('trip-search')
 
   await search.fill('hoi an cooking class')
   await search.press('Enter')
@@ -31,9 +33,30 @@ test('a keyword query stays in the grid, a conversational query hands off', asyn
   })
   await expect(assistant).toBeHidden()
 
+  await routeSearchAs(page, 'assistant')
   await search.fill('What can we do with a toddler and a wheelchair in Hoi An?')
   await search.press('Enter')
   await expect(assistant).toBeVisible({ timeout: 120_000 })
+})
+
+test('an undetermined routing decision never opens the assistant by itself', async ({
+  page,
+}) => {
+  // `undetermined` means the model could not be reached. Treating it as a
+  // request for the assistant would put a dialog in front of every shopper
+  // during an outage; treating it as `grid` would make the outage invisible.
+  // It renders as a grid, and it is reported.
+  await routeSearchAs(page, 'undetermined')
+  await page.goto('/')
+  const assistant = page.getByRole('dialog', {
+    name: 'Mai shopping assistant',
+  })
+  await page.getByTestId('trip-search').fill('something calm for my parents')
+  await page.getByTestId('trip-search').press('Enter')
+  await expect(page.locator('.product-grid .product-card').first()).toBeVisible({
+    timeout: 60_000,
+  })
+  await expect(assistant).toBeHidden()
 })
 
 test('asking about a card carries the product as the subject', async ({
@@ -77,7 +100,7 @@ test('the launcher offers to widen dates when nothing matches', async ({
     })
   })
 
-  const search = page.getByLabel('What would make this trip memorable?')
+  const search = page.getByTestId('trip-search')
   await search.fill('snowboarding')
   await search.press('Enter')
 

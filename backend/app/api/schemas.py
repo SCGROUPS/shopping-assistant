@@ -61,15 +61,29 @@ class IntentValue(BaseModel):
 class SearchIntent(BaseModel):
     search_text: str
     # Whether this request is better answered by a conversation than by a grid.
-    # The model decides, because deciding it here meant matching English
-    # function words: a Vietnamese shopper's request scored zero and could
-    # never reach the assistant, so the guided path was English-only and
-    # language became a hidden variable in every assistant conversion figure.
-    interaction_mode: Literal["assistant", "grid"] = "grid"
+    # Only the model decides. Every rule tried here was a proxy for meaning
+    # that turned out to be a proxy for language: first English function words,
+    # then sentence length. Length is no better - Vietnamese writes syllables
+    # as separate words, so `ve cap treo Ba Na Hills` is a six-word lookup,
+    # while a real need like `can cho cho xe lan` is five words and shorter
+    # than the threshold. The heuristic sent Vietnamese keyword searches to the
+    # assistant and Vietnamese cries for help to the grid.
+    #
+    # `undetermined` is what an unreachable model returns. It exists so that
+    # not knowing is a state the storefront can see and report, rather than
+    # being spelled `grid` and quietly indistinguishable from a decision.
+    interaction_mode: Literal["assistant", "grid", "undetermined"] = "undetermined"
     destination: IntentValue = Field(default_factory=IntentValue)
     hard_constraints: list[dict[str, Any]] = Field(default_factory=list)
     soft_preferences: list[dict[str, Any]] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
+    # The shopper's own words that state the date, quoted back verbatim, or
+    # None if they named no date. This exists so a date can be verified without
+    # reading the language: the guard used to be a regex listing English month
+    # and weekday names, so a Vietnamese "ngày mai" was extracted correctly by
+    # the model and then silently deleted here. Checking that the quote really
+    # occurs in the request catches an invented date in any language.
+    date_phrase: str | None = None
     needs_clarification: bool = False
     clarification_question: str | None = None
 
@@ -138,7 +152,17 @@ class ExperienceCard(BaseModel):
     price: float
     currency: str
     tags: list[str]
+    # Stable codes - `instant_confirmation`, `available` - never sentences.
+    # These were English prose, and the only carrier of the four facts below,
+    # so the client recovered the facts by matching English words in them:
+    # translating a badge would have silently turned the fact off. The client
+    # renders a code from its own dictionary, so the text is always in the
+    # shopper's language and can never disagree with the fact.
     badges: list[str]
+    available: bool
+    instant_confirmation: bool
+    family_friendly: bool
+    free_cancellation_hours: int
     # Display-only conversion; `price`/`currency` stay authoritative for money.
     display_price: float | None = None
     display_currency: str | None = None
@@ -191,7 +215,10 @@ class SearchResponse(BaseModel):
     relaxed_preferences: list[str] = Field(default_factory=list)
     # Lifted out of `intent` onto the envelope: the client needs it on every
     # response, including the ones where intent extraction never ran.
-    interaction_mode: Literal["assistant", "grid"] = "grid"
+    # Required, with no default: a response that cannot say how it should be
+    # shown is a broken response, and defaulting it to `grid` is how a stale
+    # backend silently reverts the storefront to keyword-only behaviour.
+    interaction_mode: Literal["assistant", "grid", "undetermined"]
     # On the envelope, not only on the cards. Zero results is exactly the case
     # where a client most needs to know which corpus was searched, and exactly
     # the case where there is no card to carry it.

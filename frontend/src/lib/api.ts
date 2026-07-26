@@ -181,6 +181,29 @@ const normalizeAssistantAction = (
   slot_id: action.slot_id ? String(action.slot_id) : undefined,
 })
 
+// A field the server was supposed to send and did not, or sent in a shape this
+// build does not understand. Recorded rather than swallowed: every silent
+// coercion in this file has eventually turned into a defect nobody could see,
+// because the coerced value was indistinguishable from a real answer.
+const reportContractViolation = (field: string, value: unknown): void => {
+  console.error(`[contract] ${field} was ${JSON.stringify(value)}`)
+  api.track('api_contract_violation', { field, value: String(value) })
+}
+
+// How the server said this answer should be shown. An unrecognised value is
+// reported rather than coerced: the storefront can render a grid safely while
+// still making it visible that routing was never decided, which is the whole
+// difference between a stale deployment and a silent regression.
+const readInteractionMode = (
+  value: unknown,
+): 'assistant' | 'grid' | 'undetermined' => {
+  if (value === 'assistant' || value === 'grid' || value === 'undetermined') {
+    return value
+  }
+  reportContractViolation('interaction_mode', value)
+  return 'undetermined'
+}
+
 const normalizeContentMeta = (
   value: unknown,
 ): Record<string, ContentFieldMeta> | undefined => {
@@ -268,18 +291,15 @@ const normalizeExperience = (item: Record<string, unknown>): Experience => {
     reason: item.reason ? String(item.reason) : undefined,
     content_meta: normalizeContentMeta(item.content_meta),
     locale: item.locale ? String(item.locale) : undefined,
-    available:
-      item.availability === 'AVAILABLE' ||
-      badges.some((badge) => badge.toLowerCase() === 'available'),
-    instant_confirmation: badges.some((badge) =>
-      badge.toLowerCase().includes('instant'),
-    ),
-    free_cancellation: badges.some((badge) =>
-      badge.toLowerCase().includes('free cancellation'),
-    ),
-    family_friendly: badges.some((badge) =>
-      badge.toLowerCase().includes('family'),
-    ),
+    // Read, never inferred. These four facts used to be recovered by matching
+    // English words in the badge text, so a translated catalogue would have
+    // reported every experience as unavailable, non-refundable and unsuitable
+    // for families - silently, because the parse always "succeeded".
+    available: Boolean(item.available ?? item.availability === 'AVAILABLE'),
+    instant_confirmation: Boolean(item.instant_confirmation),
+    free_cancellation: Number(item.free_cancellation_hours ?? 0) > 0,
+    free_cancellation_hours: Number(item.free_cancellation_hours ?? 0),
+    family_friendly: Boolean(item.family_friendly),
     accessibility_features: Array.isArray(item.accessibility_features)
       ? item.accessibility_features.map(String)
       : [],
@@ -494,7 +514,15 @@ export const api = {
       headers: jsonHeaders(),
       body: JSON.stringify({ locale }),
     })
-    return (resolvedLocale = String(payload.locale ?? locale))
+    // `?? locale` here would have left the same hole the comment above
+    // describes, one layer further in: a 200 that omits the field would report
+    // the requested language as the agreed one. A response that does not name
+    // a locale has not confirmed anything.
+    const confirmed = payload.locale
+    if (typeof confirmed !== 'string' || !confirmed) {
+      throw new ApiRequestError('Locale change was not confirmed', 502)
+    }
+    return (resolvedLocale = confirmed)
   },
 
   async listExperiences(): Promise<Experience[]> {
@@ -518,7 +546,7 @@ export const api = {
     effectiveFilters: SearchFilters
     relaxedPreferences: string[]
     facets: Record<string, Record<string, number>>
-    interactionMode: 'assistant' | 'grid'
+    interactionMode: 'assistant' | 'grid' | 'undetermined'
   }> {
     try {
       const payload = await request<Record<string, unknown>>('/search', {
@@ -542,11 +570,11 @@ export const api = {
         facets:
           (payload.facets as Record<string, Record<string, number>>) ?? {},
         // The server decides whether this request wanted a conversation,
-        // because only it can read the shopper's language. `grid` when the
-        // field is absent: an older backend must not silently start opening
-        // the assistant over every search.
-        interactionMode:
-          payload.interaction_mode === 'assistant' ? 'assistant' : 'grid',
+        // because only it can read the shopper's language. A missing or
+        // unrecognised value is not quietly rewritten to `grid`: that is
+        // exactly how a stale backend would revert the storefront to
+        // keyword-only behaviour with nothing anywhere reporting it.
+        interactionMode: readInteractionMode(payload.interaction_mode),
       }
     } catch (error) {
       allowDemoFallbackOrThrow(error)
@@ -555,7 +583,8 @@ export const api = {
         effectiveFilters: filters,
         relaxedPreferences: [],
         facets: {},
-        interactionMode: 'grid',
+        // The demo catalogue is a fixture, not a judgement about the shopper.
+        interactionMode: 'undetermined',
       }
     }
   },

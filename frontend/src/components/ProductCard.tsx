@@ -15,6 +15,8 @@ import { useState } from 'react'
 import type { Experience } from '../types'
 import { NEW_LISTING_KEY, hasReviews } from '../lib/rating'
 import { useLocale } from '../lib/useLocale'
+import type { Translator } from '../lib/useLocale'
+import { badgeLabels } from '../lib/badges'
 import { formatCount, formatMoney } from '../lib/format'
 
 type ProductCardProps = {
@@ -25,11 +27,13 @@ type ProductCardProps = {
   onAsk?: (product: Experience) => void
 }
 
-const durationLabel = (minutes: number) => {
-  if (minutes < 60) return `${minutes} min`
+const durationLabel = (minutes: number, t: Translator) => {
+  if (minutes < 60) return t('product.duration.minutes', { minutes })
   const hours = Math.floor(minutes / 60)
   const remainder = minutes % 60
-  return remainder ? `${hours}h ${remainder}m` : `${hours} hours`
+  return remainder
+    ? t('product.duration.hoursMinutes', { hours, minutes: remainder })
+    : t.plural('product.duration.hours', hours, { hours })
 }
 
 export function ProductCard({
@@ -80,16 +84,14 @@ export function ProductCard({
 
       <div className="product-body">
         <div className="badge-row">
-          {product.badges.slice(0, 2).map((badge) => (
-            <span className="mini-badge" key={badge}>
-              {badge === 'Top pick' || badge === 'Guest favourite' ? (
-                <Sparkles size={11} />
-              ) : (
+          {badgeLabels(product, t)
+            .slice(0, 2)
+            .map((label) => (
+              <span className="mini-badge" key={label}>
                 <Check size={11} />
-              )}
-              {badge}
-            </span>
-          ))}
+                {label}
+              </span>
+            ))}
         </div>
         <button
           className="product-title-button"
@@ -132,7 +134,7 @@ export function ProductCard({
           )}
           <span>
             <Clock3 size={14} />
-            {durationLabel(product.duration_minutes)}
+            {durationLabel(product.duration_minutes, t)}
           </span>
         </div>
         <div className="product-footer">

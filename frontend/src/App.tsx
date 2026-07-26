@@ -622,6 +622,9 @@ function App() {
       api.track('search_submitted', {
         result_count: result.items.length,
         conversational: result.interactionMode === 'assistant',
+        // Reported so that a spell of unreachable routing is visible in the
+        // funnel rather than looking like shoppers who preferred the grid.
+        routing: result.interactionMode,
       })
       if (result.items.length === 0) api.track('search_zero_results', {})
       if (result.relaxedPreferences.length > 0) {
@@ -867,7 +870,7 @@ function App() {
   // so the assistant never has to ask "which one?".
   const askAboutProduct = (product: Experience) => {
     openAssistant()
-    void sendAssistantMessage(`Tell me more about ${product.title}.`, product)
+    void sendAssistantMessage(t('assistant.askAbout', { title: product.title }), product)
   }
 
   const checkMyPlan = () => {

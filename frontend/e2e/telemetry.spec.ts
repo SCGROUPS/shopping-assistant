@@ -21,7 +21,7 @@ test('search, view and cohort telemetry reach the backend', async ({
   const before = await (await request.get(funnel, asOperator)).json()
 
   await page.goto('/')
-  const search = page.getByLabel('What would make this trip memorable?')
+  const search = page.getByTestId('trip-search')
   await search.fill('hoi an cooking class')
   await search.press('Enter')
   await expect(page.locator('.product-grid .product-card').first()).toBeVisible({

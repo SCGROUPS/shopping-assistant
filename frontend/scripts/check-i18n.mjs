@@ -154,6 +154,33 @@ const isProse = (text) => {
   return words.length >= 2
 }
 
+// Whether a template builds a machine string rather than a sentence: a URL, a
+// path, a CSS dimension, a storage key. These interpolate values into text too,
+// but none of the text is language.
+const CSS_UNITS = /^(px|rem|em|%|vh|vw|vmin|vmax|ms|s|deg|fr|ch|pt)$/
+const isMachineryTemplate = (node) => {
+  const parts = [node.head, ...node.templateSpans.map((span) => span.literal)]
+  const joined = parts.map((part) => part.text).join(' ')
+  if (/^[/.]|:\/\//.test(joined.trim())) return true
+  // No whitespace in any part means the value is glued to a token rather than
+  // placed in a sentence: `VT-${n}`, `${day}T00:00:00Z`, `demo-${id}`. A
+  // sentence puts whitespace somewhere around the words it is made of.
+  //
+  // The limit of this rule is a language that does not use spaces, where a
+  // real sentence could look like a token. It holds here because the checker
+  // only ever reads English source; the translations live in the dictionary,
+  // which the checker does not walk.
+  if (!parts.some((part) => /\s/.test(part.text))) return true
+  const words = joined.split(/[^\p{Letter}%]+/u).filter(Boolean)
+  return words.length > 0 && words.every((word) => CSS_UNITS.test(word))
+}
+
+// What to print for a template, so the report shows the sentence rather than
+// the fragment that happened to trip the rule.
+const templateShape = (node) =>
+  node.head.text +
+  node.templateSpans.map((span) => '{}' + span.literal.text).join('')
+
 // Whether a literal is an argument or value in a position that is structurally
 // not language: a class list, a machinery-named property, or a DOM query.
 const inMachineryContext = (node) => {
@@ -163,7 +190,7 @@ const inMachineryContext = (node) => {
   // caller that shows something to a shopper catches and renders its own
   // translated message, so the thrown string never reaches a screen.
   if (ts.isNewExpression(parent) && ts.isIdentifier(parent.expression)) {
-    if (parent.expression.text === 'Error') return true
+    if (parent.expression.text.endsWith('Error')) return true
   }
   if (
     ts.isPropertyAssignment(parent) &&
@@ -213,6 +240,15 @@ const inMachineryContext = (node) => {
         ? callee.text
         : ''
     if (MACHINERY_CALLS.has(name)) return true
+    // Anything handed to `console.*` is written for whoever is reading the
+    // browser log, which is never the shopper.
+    if (
+      ts.isPropertyAccessExpression(callee) &&
+      ts.isIdentifier(callee.expression) &&
+      callee.expression.text === 'console'
+    ) {
+      return true
+    }
   }
   return false
 }
@@ -325,6 +361,25 @@ for (const file of walkFiles(SRC)) {
       !inMachineryContext(node)
     ) {
       report(node, node.text)
+    }
+
+    // A sentence assembled around a value: `Heard: ${text}`, `${n} min`.
+    //
+    // The prose rule above cannot see these. A template's text is split across
+    // its head and spans, so `${minutes} min` is never a multi-word literal in
+    // any single node - and `Tell me more about ${title}.` is a whole sentence
+    // the gate certified as translated. A template that interpolates a value
+    // into words is a sentence being built, so any letter-bearing part of it
+    // is display text, however short. `min` and `h` are exactly the words that
+    // must change for a Vietnamese shopper.
+    if (
+      ts.isTemplateExpression(node) &&
+      !inMachineryContext(node) &&
+      !isMachineryTemplate(node)
+    ) {
+      const parts = [node.head, ...node.templateSpans.map((span) => span.literal)]
+      const spoken = parts.find((part) => /\p{Letter}/u.test(part.text))
+      if (spoken) report(spoken, templateShape(node))
     }
 
     // Attribute values a shopper reads: aria-label="Close"

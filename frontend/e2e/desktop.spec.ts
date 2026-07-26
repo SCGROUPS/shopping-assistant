@@ -1,9 +1,11 @@
 import { expect, test } from '@playwright/test'
+import { routeSearchAs } from './routing'
 import { installVoiceMock } from './voice-mock'
 
 test('desktop voice discovery completes a real voucher purchase', async ({
   page,
 }) => {
+  await routeSearchAs(page, 'assistant')
   await installVoiceMock(page)
   await page.goto('/')
 
@@ -11,7 +13,7 @@ test('desktop voice discovery completes a real voucher purchase', async ({
     page.getByRole('heading', { name: /Find your own rhythm/i }),
   ).toBeVisible()
   await page.getByRole('button', { name: 'Search by voice' }).click()
-  await expect(page.getByLabel('What would make this trip memorable?')).toHaveValue(
+  await expect(page.getByTestId('trip-search')).toHaveValue(
     'A relaxed family day with food and culture',
   )
 

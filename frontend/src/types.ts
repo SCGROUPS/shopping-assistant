@@ -67,6 +67,7 @@ export type Experience = {
   available?: boolean
   instant_confirmation?: boolean
   free_cancellation?: boolean
+  free_cancellation_hours?: number
   family_friendly?: boolean
   accessibility_features?: string[]
   options?: ExperienceOption[]
