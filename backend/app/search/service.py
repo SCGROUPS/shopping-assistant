@@ -40,6 +40,7 @@ from app.common.ranking import (
     minmax,
     reciprocal_rank_fusion,
     smoothed_rate,
+    strip_accents,
     tokenize,
 )
 from app.common.runtime_config import get_config
@@ -222,10 +223,18 @@ def _constraint_value(field: str, value: Any) -> Any:
 def _matches_destination(value: str, known: set[str]) -> bool:
     """Whether the catalogue sells anything in this place.
 
-    Substring either way, because the model writes "Hoi An" for `hoi an` and
-    "Da Nang City" for `da nang`, and neither is a mistake worth refusing.
+    Substring either way, because "Da Nang City" and `da nang` are the same
+    request. Accents are folded on both sides for the same reason they are
+    folded everywhere else: the catalogue stores "Hoi An" and a Vietnamese
+    shopper writes "Hội An", and a guard that calls those different discards a
+    destination the model read perfectly.
     """
-    return any(value in destination or destination in value for destination in known)
+    folded = strip_accents(value).casefold()
+    return any(
+        folded in strip_accents(destination).casefold()
+        or strip_accents(destination).casefold() in folded
+        for destination in known
+    )
 
 
 def merge_filters(explicit: SearchFilters, intent: SearchIntent) -> tuple[SearchFilters, list[str]]:
@@ -316,9 +325,8 @@ def is_eligible(
         return False
     if filters.destination_id and product["destination_id"] != filters.destination_id:
         return False
-    if (
-        filters.destination
-        and filters.destination.casefold() not in product["destination"].casefold()
+    if filters.destination and not _matches_destination(
+        filters.destination, {product["destination"]}
     ):
         return False
     if filters.category and filters.category.casefold() != product["category"].casefold():
@@ -582,9 +590,12 @@ class SearchService:
         # Sorted so the schema, and therefore the prompt cache, is stable
         # between calls that see the same catalogue.
         categories = sorted({product["category"] for product in available_products})
+        destinations = sorted({product["destination"] for product in available_products})
         if should_extract_intent(request):
             try:
-                intent = await self.ai.extract_intent(request.query, categories=categories)
+                intent = await self.ai.extract_intent(
+                    request.query, categories=categories, destinations=destinations
+                )
             except Exception:
                 logger.exception("Intent extraction failed; using deterministic parsing")
                 intent = deterministic_intent(request.query)
@@ -599,10 +610,9 @@ class SearchService:
                 interaction_mode="undetermined",
             )
         intent = sanitize_intent(request.query, intent)
-        known = {product["destination"].casefold() for product in available_products}
+        known = {product["destination"] for product in available_products}
         if intent.destination.name:
-            inferred = intent.destination.name.casefold()
-            if not _matches_destination(inferred, known):
+            if not _matches_destination(intent.destination.name, known):
                 intent = intent.model_copy(
                     update={
                         "destination": intent.destination.model_copy(

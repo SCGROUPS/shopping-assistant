@@ -28,6 +28,7 @@ from openai import RateLimitError
 
 from app.assistant.provider import AIProvider, function_tool
 from app.catalog.seed import stable_id
+from app.catalog.vocabulary import CATEGORIES
 
 logger = logging.getLogger(__name__)
 
@@ -37,22 +38,6 @@ TRIPPASS_SUPPLIER_EXTERNAL_ID = "TRIPPASS"
 TRIPPASS_SUPPLIER_NAME = "Trippass (HeriStep)"
 
 # The facet vocabularies the storefront filters on. Imported supply has to speak
-# the same language as seeded supply or it drops out of every faceted search.
-CATEGORIES = [
-    "Activity or class",
-    "Cruise",
-    "Culture",
-    "Day trip",
-    "Entertainment experience",
-    "Family",
-    "Food",
-    "Guided tour",
-    "Nature",
-    "Open-dated voucher",
-    "Transport",
-    "Water",
-    "Wellness",
-]
 
 NORMALISE_TOOL = function_tool(
     "describe_experience",

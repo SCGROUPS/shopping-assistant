@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.assistant.provider import HARD_CONSTRAINT_FIELDS, AzureOpenAIProvider
 from app.common.config import get_settings
+from app.common.ranking import strip_accents
 from app.search.service import CONSTRAINT_FIELDS
 
 pytestmark = pytest.mark.skipif(
@@ -156,7 +157,11 @@ async def test_a_named_city_is_read_as_a_destination_we_sell():
     provider = _provider()
 
     for _ in range(RUNS):
-        intent = await provider.extract_intent("hoi an lantern", categories=sorted(_CATEGORIES))
+        intent = await provider.extract_intent(
+            "hoi an lantern",
+            categories=sorted(_CATEGORIES),
+            destinations=sorted(destinations),
+        )
         named = [intent.destination.name] if intent.destination.name else []
         named += [
             str(c.get("value", ""))
@@ -169,3 +174,40 @@ async def test_a_named_city_is_read_as_a_destination_we_sell():
             assert any(folded in known or known in folded for known in destinations), (
                 f"{value!r} is not a destination this catalogue sells"
             )
+
+
+@pytest.mark.parametrize(
+    ("query", "language"),
+    [
+        ("đi thuyền ở hội an", "Vietnamese, with the diacritics the city is actually spelled with"),
+        ("会安灯笼之旅", "Chinese, where the city has its own name entirely"),
+        ("Bootstour in Hoi An", "German"),
+        ("호이안 등불 투어", "Korean"),
+    ],
+)
+async def test_a_city_named_in_the_shoppers_language_still_resolves(query: str, language: str):
+    """The multilingual promise, checked against the model rather than assumed.
+
+    A shopper writing "会安" has named Hoi An perfectly; the catalogue stores
+    "Hoi An". No amount of string folding bridges that, so the resolution has to
+    happen where the language knowledge is - in the model - which is why
+    destination is an enum of real places rather than free text. Before that
+    change these queries returned the model's own spelling, the service could
+    not match it, and the destination was silently discarded: the shopper who
+    was most precise got the least useful page.
+    """
+    _CATEGORIES, destinations = await _catalogue_vocabulary()
+    provider = _provider()
+
+    for _ in range(RUNS):
+        intent = await provider.extract_intent(
+            query, categories=sorted(_CATEGORIES), destinations=sorted(destinations)
+        )
+        resolved = intent.destination.name or ""
+        # Compared the way the service compares. The enum constrains meaning,
+        # not letter case - the model answers "hoi an" as readily as "Hoi An" -
+        # and asserting the exact string would fail a request that works.
+        assert strip_accents(resolved).casefold() == "hoi an", (
+            f"{query!r} ({language}) resolved to {resolved!r}, which is not Hoi An. "
+            "The enum should let the model do the translating."
+        )

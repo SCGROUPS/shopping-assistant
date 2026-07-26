@@ -25,7 +25,6 @@ from app.common.ranking import deterministic_embedding
 HARD_CONSTRAINT_FIELDS = [
     "accessibility",
     "currency",
-    "destination",
     "family_friendly",
     "free_cancellation",
     "indoor_outdoor",
@@ -260,7 +259,11 @@ class AIProvider(Protocol):
     async def embed_many(self, texts: list[str]) -> list[list[float]]: ...
 
     async def extract_intent(
-        self, text: str, *, categories: Sequence[str] | None = None
+        self,
+        text: str,
+        *,
+        categories: Sequence[str] | None = None,
+        destinations: Sequence[str] | None = None,
     ) -> SearchIntent: ...
 
     async def plan_action(self, text: str, state: dict[str, Any]) -> ToolPlan | None: ...
@@ -534,7 +537,11 @@ class DemoAIProvider:
         return [deterministic_embedding(text) for text in texts]
 
     async def extract_intent(
-        self, text: str, *, categories: Sequence[str] | None = None
+        self,
+        text: str,
+        *,
+        categories: Sequence[str] | None = None,
+        destinations: Sequence[str] | None = None,
     ) -> SearchIntent:
         return deterministic_intent(text)
 
@@ -636,7 +643,11 @@ class AzureOpenAIProvider:
         return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
 
     async def extract_intent(
-        self, text: str, *, categories: Sequence[str] | None = None
+        self,
+        text: str,
+        *,
+        categories: Sequence[str] | None = None,
+        destinations: Sequence[str] | None = None,
     ) -> SearchIntent:
         self._guard("intent extraction")
         constraint_value = {
@@ -654,7 +665,16 @@ class AzureOpenAIProvider:
                 "destination": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": ["string", "null"]},
+                        # The catalogue's own place names, as an enum. Free text
+                        # here meant the model answered in the shopper's script
+                        # - "Hội An" for Vietnamese, "会安" for Chinese - which
+                        # are both *correct* readings that no exact match
+                        # against "Hoi An" could use. The guard then discarded
+                        # them, so a shopper who named the city perfectly in
+                        # their own language searched the whole country. An
+                        # enum makes the model do the resolving, which is the
+                        # one part of this it is actually good at.
+                        "name": {"type": ["string", "null"], "enum": [*(destinations or []), None]},
                         "confidence": {"type": "number"},
                     },
                     "required": ["name", "confidence"],

@@ -126,6 +126,76 @@ class InventedDestinationConstraintProvider:
         return None
 
 
+class VocabularyRecordingProvider:
+    """Captures what the service actually offered the model."""
+
+    def __init__(self) -> None:
+        self.categories: list[str] | None = None
+        self.destinations: list[str] | None = None
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str, *, categories=None, destinations=None) -> SearchIntent:
+        self.categories, self.destinations = categories, destinations
+        return SearchIntent(search_text=text)
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None
+
+
+async def test_the_service_offers_the_model_the_catalogues_own_words():
+    """Both vocabularies are enums, so omitting one silently empties it.
+
+    `enum: [*(destinations or []), None]` collapses to `[None]` when the
+    service forgets to pass the list, and the model then has exactly one legal
+    answer: no destination at all. That failure is invisible - no error, no
+    log, just a shopper who named a city and searched the whole country - so
+    the call site is pinned here rather than left to review.
+    """
+    provider = VocabularyRecordingProvider()
+    await SearchService(ai_provider=provider).search(SearchRequest(query="a boat trip somewhere"))
+
+    assert provider.categories, "the service offered the model no categories"
+    assert provider.destinations, "the service offered the model no destinations"
+    assert "Hoi An" in provider.destinations
+
+
+class VietnameseDestinationProvider:
+    """The model reads the city correctly, and writes it the way it was typed.
+
+    "Hội An" is not a mistake - it is the same place, spelled properly. The
+    guard compared it to the catalogue's "Hoi An" with `casefold` alone, which
+    does not fold diacritics, so a Vietnamese shopper who named the city
+    perfectly had the destination silently discarded and searched the whole
+    country instead.
+    """
+
+    async def embed(self, text: str) -> list[float]:
+        return deterministic_embedding(text)
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [deterministic_embedding(text) for text in texts]
+
+    async def extract_intent(self, text: str, **_) -> SearchIntent:
+        return SearchIntent(
+            search_text=text,
+            destination=IntentValue(name="Hội An", confidence=0.95),
+        )
+
+    async def plan_action(self, text: str, state: dict) -> str | None:
+        return None
+
+    async def enhance_assistant(self, prompt: str, facts: list[dict]) -> str | None:
+        return None
+
+
 class FamilyIndoorIntentProvider:
     """The intent a model would extract for a family indoor request.
 
@@ -196,6 +266,18 @@ async def test_an_invented_category_does_not_empty_the_results():
     assert result.items
     assert result.effective_filters.category is None
     assert "category_unmatched" in result.unresolved_constraints
+
+
+async def test_a_destination_written_with_its_own_diacritics_is_kept():
+    """Folding accents is what every other comparison in the codebase does."""
+    result = await SearchService(ai_provider=VietnameseDestinationProvider()).search(
+        SearchRequest(query="đi thuyền ở hội an")
+    )
+
+    assert result.items
+    assert result.effective_filters.destination == "Hội An"
+    assert all(item.destination == "Hoi An" for item in result.items)
+    assert "destination_unmatched" not in result.unresolved_constraints
 
 
 def test_every_offered_constraint_field_is_mapped():
