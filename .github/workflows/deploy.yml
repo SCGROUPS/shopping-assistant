@@ -24,9 +24,19 @@ on:
 permissions:
   contents: read
 
+# Two groups, not one. A single `production-deployment` group serialised pull
+# request validation behind production deploys, so opening a PR while main was
+# deploying meant waiting out a full deploy before the first test even started -
+# for a run that touches none of the same resources.
+#
+# Deploys still serialise against each other, and are never cancelled: half a
+# deploy is worse than a late one. PR runs are per-branch and *are* cancelled,
+# because a superseded commit's results are not worth the runner.
 concurrency:
-  group: production-deployment
-  cancel-in-progress: false
+  group: >-
+    ${{ github.event_name == 'push' && 'production-deployment'
+        || format('validate-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   validate:
