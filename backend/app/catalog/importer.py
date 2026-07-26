@@ -46,6 +46,7 @@ from app.common.models import (
     Supplier,
 )
 from app.common.ranking import deterministic_embedding
+from app.content.enqueue import enqueue_experience_translations
 
 logger = logging.getLogger(__name__)
 
@@ -390,6 +391,14 @@ async def upsert_catalog(
             # change that touched only `en` would leave seven documents
             # describing the previous version.
             await enqueue_experience_reindex(session, experience.id)
+
+            # Same transaction, same reason. A commit that changes a title must
+            # not be able to land without the work to retranslate it, or the
+            # seven other locales keep serving text describing a listing that
+            # no longer exists - and nothing in the system would ever notice,
+            # because staleness is derived from fingerprints that only this
+            # call updates.
+            await enqueue_experience_translations(session, experience.id)
 
             # The embedding above was computed from the *supplier's* text. The
             # catalogue does not always agree with that text: `_apply` skips

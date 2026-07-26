@@ -25,7 +25,7 @@ from app.api.schemas import (
     SearchRequest,
 )
 from app.assistant.service import AssistantService
-from app.common.persistence import catalog_products
+from app.common.persistence import catalog_products, database_mode
 from app.common.store import store
 from app.evals.checks import Violation, run_checks
 from app.search.service import SearchService
@@ -204,6 +204,54 @@ async def run_assistant_suite(
                 )
             )
     return SuiteReport("assistant", results)
+
+
+def _multilingual_request(case: dict[str, Any]) -> SearchRequest:
+    request = _build_request(case)
+    request.locale = case.get("locale", "en")
+    return request
+
+
+async def run_multilingual_suite(
+    cases: dict[str, Any], service: SearchService | None = None
+) -> SuiteReport:
+    """The same search suite, asked in eight languages against PostgreSQL.
+
+    Deliberately refuses to run without a database rather than falling back to
+    the demo store. Locale selection, the per-locale text-search configuration
+    and the fallback chain exist only in the PostgreSQL path, so a demo-store
+    run would answer every case from the English corpus and report a pass rate
+    that means nothing at all — the precise failure the tokenizer work already
+    taught us to distrust.
+    """
+    if not database_mode():
+        raise RuntimeError(
+            "The multilingual suite requires DATABASE_URL: without it every case"
+            " would be answered from the English demo store and pass vacuously."
+        )
+    engine = service or SearchService(store)
+    results: list[CaseResult] = []
+    for case in cases["cases"]:
+        started = time.perf_counter()
+        try:
+            response = await engine.search(_multilingual_request(case))
+            products = [_card_dict(item) for item in response.items]
+            violations = run_checks(products, case.get("expect", {}))
+            error = None
+        except Exception as exc:  # noqa: BLE001 - a crash is a result, not a stop
+            products, violations, error = [], [], f"{type(exc).__name__}: {exc}"
+        results.append(
+            CaseResult(
+                case_id=case["id"],
+                suite="multilingual",
+                violations=violations,
+                result_count=len(products),
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error=error,
+                why=case.get("why", ""),
+            )
+        )
+    return SuiteReport("multilingual", results)
 
 
 def format_report(report: SuiteReport, verbose: bool = True) -> str:

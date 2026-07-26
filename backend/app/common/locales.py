@@ -38,6 +38,20 @@ FALLBACK_CHAINS: dict[str, tuple[str, ...]] = {
 
 SUPPORTED_LOCALES: tuple[str, ...] = tuple(FALLBACK_CHAINS)
 
+# What a translation model should be told to produce. "zh" alone is ambiguous
+# between scripts, and a tourism listing rendered in the wrong one is unreadable
+# to the reader it was meant for, so the target names the script explicitly.
+LOCALE_NAMES: dict[str, str] = {
+    "en": "English",
+    "vi": "Vietnamese",
+    "zh": "Simplified Chinese (zh-Hans)",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish (European)",
+}
+
 
 def text_search_config(locale: str) -> str:
     """The regconfig to use for `locale`, matching the indexing trigger."""

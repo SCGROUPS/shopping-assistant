@@ -871,6 +871,51 @@ for want of a translation.
 
 ---
 
+### 6.7 What was built, and what breaking it costs
+
+The design in §6.1–§6.6 is implemented in `app/content/`. Three of its decisions
+looked like over-engineering until each was removed and measured, so the cost of
+reverting them is recorded here rather than left to be rediscovered.
+
+**The commit is one transaction with four guards.** A conditional
+`UPDATE translation_fields` names the `generation`, the `desired_fingerprint`,
+`status = 'pending'`, `provenance <> 'manual'`, and — joined in — a lease token
+bound to *this* target. Zero rows matched means the world moved while the model
+was thinking, and the whole transaction is abandoned. Each guard is
+independently sufficient for the ordinary case, which is the point: they fail
+independently too. Removing all four lets a slow machine translation land on
+top of a human's fresh correction, which the test then reports as
+`assert True is False`. No retry recovers from that, because the human's text
+is gone.
+
+**The wide-table write is column-specific.** `ON CONFLICT DO UPDATE` names one
+column. An ORM whole-row flush passes every sequential test and fails the
+concurrent one with `assert '' == 'Ein geführter Abendspaziergang.'`: two
+workers finishing `title` and `description` for the same locale each write the
+other's column back to the value they loaded. Nothing logs an error, and the
+lost field simply reads as untranslated.
+
+**`generation` is in the job uniqueness key.** This is the least obvious of the
+three and the most expensive to get wrong. A title edited away and back — F0 →
+F1 → F0 — produces a `desired_fingerprint` that equals one a completed job
+already carries. Without `generation` in the key the insert is swallowed by
+`ON CONFLICT DO NOTHING`, and the third enqueue returns zero: measured as
+`assert 0 == 7`, seven locales left permanently stale with no work item, no
+error and nothing in the system able to notice. Staleness here is derived from
+fingerprints rather than from a queue depth, so an empty queue is not evidence
+of anything.
+
+Enqueueing runs inside the importer's own transaction, alongside the indexing
+outbox and for the same reason: a commit that changes a title must not be able
+to land without the work to retranslate it.
+
+A field held for review is deliberately stale — `published_fingerprint` stays
+untouched — and deliberately *not* re-enqueued, because `desired_fingerprint`
+has not moved. A queue that refilled every import with work a human had already
+been asked to look at would train operators to ignore it.
+
+---
+
 ## 7. Review and publication states
 
 Revision 1 conflated four independent lifecycles into one boolean, and
@@ -1624,6 +1669,44 @@ rates. Without this the next multilingual regression is silent too.
 
 ---
 
+### 10.1 The multilingual gate, and why it is failing on purpose
+
+`evals/multilingual_cases.json` holds eleven cases, one or two per added
+language, and nine of them fail today. That is the deliverable. A gate written
+after the feature only ever certifies the feature's own assumptions — the
+tokenizer taught that lesson when cases added afterwards passed vacuously
+against an index that contained nothing at all.
+
+Three properties make the cases mean something.
+
+**They assert on slugs, not text.** Every other content check reads what a
+shopper sees, which is exactly what a multilingual case cannot use: the
+Vietnamese title is not the English one, and writing the expected translation
+into the case would test the translator's word choice rather than whether
+search found the right listing. A slug is derived once from the source and is
+identical in all eight locales.
+
+**They run against the whole catalogue.** Asking for a cooking class among
+fifteen fixtures proves nothing about ranking, because the right answer has
+nothing to beat. The suite seeds all 379 experiences and mirrors the English
+document into every locale — which is not a shortcut around the outbox but a
+statement of what the outbox currently produces, since an untranslated locale
+resolves through the source language.
+
+**They contain no words English can answer.** The first run exposed the trap:
+the French and Spanish cases passed with no translated content whatsoever. See
+§13. Latin-script queries must be written from content words with no English
+form, and must not name the destination.
+
+The gate is green while the expected failures fail, and turns red the moment
+one of them passes — which forces a deliberate decision about whether the
+translation pipeline has landed or the case was never testing what it claimed.
+The two cases that must pass today are the English control and the guarantee
+that a locale never returns less supply than English for a query needing no
+translation.
+
+---
+
 ## 11. Migration
 
 379 live records, live carts and bookings, and existing embeddings.
@@ -1756,8 +1839,9 @@ Each numbered step below is a deployable release:
    primary-key swap, explicit-`en` readers, non-destructive writers and the
    indexing outbox (§9.4). Schema and readers ship as one release because the
    swap is single-step (§11); the old release stays compatible throughout.
-2. **Multilingual eval suite** (§10) — failing, and it should
+2. **Multilingual eval suite** (§10) — *done*; failing, and it should
 3. **Translation pipeline**: fingerprints, leases, glossary, review split (§6)
+   — *done* (§6.7)
 4. **Locale-aware resolution** behind `enabled_locales = ['en']` (§4.3, §9)
 5. **Backfill** translations and search documents for existing inventory
 6. **Switcher, UI strings, locale formatting**; enable locales as gates pass
@@ -1854,7 +1938,13 @@ first, then revision 2's.
 | **`replicaRetryLimit: 1` is harmless caution** | It lets one execution outlive the deployment script's wait by a whole replica timeout while still looking like it might succeed, so the deployment fails for a job that is running perfectly well (§9.4) |
 | **The slow part of a deployment is the work it does** | The availability refresh did almost no work and took eleven of thirty-four minutes, because it spent them on 22,680 sequential round trips to a database in another datacentre. Latency, not computation, is what a deployment pays for (§9.5) |
 | **A table lock is too blunt for a maintenance job** | It is priced in the duration of the transaction that holds it, and that is a number you control. Eleven minutes of blocked checkout is intolerable; two seconds is cheaper than the oversell it prevents (§9.5) |
+| **A case written in the target language tests that language** | Not in Latin script. 'cours de cuisine à Hanoï' and 'tour gastronómico en Hoi An' both passed against a purely English corpus: 'cuisine' and 'tour' are English words and the place names fold to the same tokens. Cognates and proper nouns can carry a case entirely, so it certifies nothing. Content words must have no English form, and the destination must not be named (§10.1) |
 | **`SHARE ROW EXCLUSIVE` excludes writers** | It does not exclude `SELECT ... FOR UPDATE`, which takes only `ROW SHARE`. A writer can take the row lock, then block on the table lock, while the holder of the table lock blocks on the row - a deadlock that reads like mutual exclusion (§9.5) |
+| **A completed job proves the work was done** | Only for the fingerprint it carries. A title edited away and back produces a `desired_fingerprint` a finished job already holds, so `ON CONFLICT DO NOTHING` swallows the re-enqueue and the field stays stale with no work item, no error and nothing able to notice. `generation` in the uniqueness key is what makes the third enqueue return 7 instead of 0 (§6.7) |
+| **An upsert that writes the whole row is safe because it is one statement** | Atomicity is not isolation. Two workers publishing different fields of the same locale each name all four columns, and each writes the other's back to what it loaded. The lost field reads as untranslated and nothing logs (§6.7) |
+| **One guard on a compare-and-swap is enough** | It is, until the case you did not model. Generation, fingerprint, status and provenance each catch the ordinary race alone - and they fail independently, which is the reason to keep all four rather than the reason to drop three (§6.7) |
+| **Two sequential `async with` blocks test concurrency** | The second writer blocks on the first writer's uncommitted row, so a single coroutine awaiting them in order deadlocks against itself and the test hangs rather than fails. Concurrent writers have to be concurrent tasks with a barrier (§6.7) |
+| **A stale review item should be re-queued on the next import** | It should not. `desired_fingerprint` has not moved, so nothing has changed about what the field needs; refilling the queue with work a human was already asked to look at teaches operators the queue is noise (§6.7) |
 
 Earlier revisions also under-specified: translation coverage beyond four fields,
 migration entirely, the `language`/`locale` collision, audit attribution for

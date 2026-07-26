@@ -8,6 +8,8 @@ from app.catalog.importer import import_trippass
 from app.catalog.indexing import run_reindex
 from app.catalog.seed import build_seed_catalog
 from app.common.store import store
+from app.content.jobs import backlog as translation_backlog
+from app.content.jobs import drain_translations, enqueue_all
 
 
 def main() -> None:
@@ -20,6 +22,8 @@ def main() -> None:
             "refresh-availability",
             "import-trippass",
             "reindex",
+            "enqueue-translations",
+            "translate",
             "summary",
             "create-operator",
             "list-operators",
@@ -38,6 +42,26 @@ def main() -> None:
         help="Issue a new key for an existing operator, invalidating the old one.",
     )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--locale",
+        action="append",
+        help="Restrict translation work to this locale; repeatable.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Translate at most this many fields, then stop. Omit to drain the queue.",
+    )
+    parser.add_argument(
+        "--revive",
+        action="store_true",
+        help="Give up-to-date failed jobs their attempts back before draining.",
+    )
+    parser.add_argument(
+        "--hold-for-review",
+        action="store_true",
+        help="Hold every field for review, not just the policy-bearing ones.",
+    )
     parser.add_argument(
         "--days",
         type=int,
@@ -82,6 +106,36 @@ def main() -> None:
         if backlog:
             summary = ", ".join(f"{n} {status}" for status, n in sorted(backlog.items()))
             print(f"Index backlog not empty: {summary}")
+            raise SystemExit(1)
+        return
+    if args.command == "enqueue-translations":
+        totals = asyncio.run(enqueue_all(locales=args.locale))
+        print(
+            f"Translation queue: {totals['enqueued']} fields enqueued "
+            f"across {totals['experiences']} experiences"
+        )
+        return
+    if args.command == "translate":
+        totals = asyncio.run(
+            drain_translations(
+                limit=args.limit,
+                hold_all=args.hold_for_review,
+                revive=args.revive,
+            )
+        )
+        print(
+            f"Translated {totals['published']} fields "
+            f"({totals['superseded']} superseded, {totals['retrying']} retrying, "
+            f"{totals['failed']} failed, {totals['revived']} revived)"
+        )
+        remaining = asyncio.run(translation_backlog())
+        if remaining:
+            summary = ", ".join(f"{n} {status}" for status, n in sorted(remaining.items()))
+            print(f"Translation backlog not empty: {summary}")
+        # Only *terminal* failures are an error. A job that failed once and will
+        # be retried is the queue working, and exiting non-zero for it would
+        # make a transient provider blip fail the deployment.
+        if totals["failed"]:
             raise SystemExit(1)
         return
     if args.command == "seed-db":

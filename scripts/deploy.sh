@@ -18,11 +18,13 @@ if [[ -z "${POSTGRES_ADMIN_PASSWORD:-}" ]]; then
   exit 1
 fi
 
+registry_exists=false
 if az acr show \
   --resource-group "$resource_group" \
   --name "$registry_name" \
   --output none 2>/dev/null; then
   bootstrap_image="${registry_name}.azurecr.io/vietra:latest"
+  registry_exists=true
 fi
 
 bootstrap_revision="bootstrap-$(date -u +%Y%m%d%H%M%S)"
@@ -88,21 +90,58 @@ deploy_stack() {
   done
 }
 
-deploy_stack "$bootstrap_image" "$bootstrap_revision"
+# The stack deployment runs twice: once before the image is built, once after.
+# On a first deploy the first run is what creates the registry. On every deploy
+# after that it exists only to apply infrastructure changes *before* the
+# migration runs — and when there are none it is three minutes of a deployment
+# spent asking Azure to confirm that nothing changed.
+#
+# So skip it, but only on proof that nothing changed. The fingerprint covers the
+# templates and every parameter value, and is recorded on the resource group
+# only after a deployment has succeeded end to end. Anything else — a template
+# edit, a rotated password, a missing or unreadable tag, a half-finished
+# previous run — misses and the deployment happens. The second run is
+# unconditional either way, so infrastructure is still fully reconciled on every
+# deploy; skipping only moves that reconciliation after the migration, which is
+# safe precisely because the fingerprint proves there is nothing to reconcile.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum | cut -d' ' -f1; }
+else
+  sha256() { shasum -a 256 | cut -d' ' -f1; }
+fi
+stack_fingerprint="$(
+  {
+    cat infra/bicep/*.bicep
+    printf '%s\n' "${deployment_parameters[@]}"
+  } | sha256
+)"
 
-registry="$(az deployment sub show \
-  --name "$deployment" \
-  --query properties.outputs.registryName.value \
-  --output tsv)"
-resource_group="$(az deployment sub show \
-  --name "$deployment" \
-  --query properties.outputs.resourceGroupName.value \
-  --output tsv)"
-app_name="$(az deployment sub show \
-  --name "$deployment" \
-  --query properties.outputs.containerAppName.value \
-  --output tsv)"
+read_stack_outputs() {
+  registry="$(az deployment sub show --name "$deployment" \
+    --query properties.outputs.registryName.value --output tsv 2>/dev/null || true)"
+  resource_group="$(az deployment sub show --name "$deployment" \
+    --query properties.outputs.resourceGroupName.value --output tsv 2>/dev/null || true)"
+  app_name="$(az deployment sub show --name "$deployment" \
+    --query properties.outputs.containerAppName.value --output tsv 2>/dev/null || true)"
+  [[ -n "$registry" && -n "$resource_group" && -n "$app_name" ]]
+}
 
+applied_fingerprint=""
+if [[ "$registry_exists" == true ]]; then
+  applied_fingerprint="$(az group show --name "$resource_group" \
+    --query "tags.stackFingerprint" --output tsv 2>/dev/null || true)"
+fi
+
+if [[ "$registry_exists" == true && -n "$applied_fingerprint" &&
+      "$applied_fingerprint" == "$stack_fingerprint" ]] && read_stack_outputs; then
+  echo "Infrastructure is unchanged since the last successful deployment; building directly." >&2
+else
+  deploy_stack "$bootstrap_image" "$bootstrap_revision"
+  read_stack_outputs || {
+    echo "The stack deployment produced no outputs." >&2
+    exit 1
+  }
+fi
 az acr build \
   --resource-group "$resource_group" \
   --registry "$registry" \
@@ -209,6 +248,14 @@ done
 
 curl --fail --silent "${app_url}/health/ready" >/dev/null
 curl --fail --silent "${app_url}/api/v1/experiences?limit=1" >/dev/null
+
+# Only now, with the stack deployed, migrated, seeded and answering. A
+# fingerprint recorded any earlier would let the next deployment skip the
+# infrastructure step on the strength of a run that never finished.
+az group update \
+  --name "$resource_group" \
+  --set "tags.stackFingerprint=${stack_fingerprint}" \
+  --output none
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "app_url=${app_url}" >> "$GITHUB_OUTPUT"

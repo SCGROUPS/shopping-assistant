@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.common.locales import DEFAULT_LOCALE
+
 ParticipantType = Literal["adult", "child", "infant", "senior", "student"]
 
 
@@ -41,6 +43,11 @@ class SearchRequest(BaseModel):
     cursor: str | None = None
     # Presentation only. Never used for any amount that is charged.
     display_currency: str | None = None
+    # Which language's documents to search. Distinct from `display_currency`
+    # because it selects the corpus, not the formatting: a Vietnamese query has
+    # to be parsed with the configuration its documents were indexed with, or it
+    # stems differently on each side and simply stops matching.
+    locale: str = DEFAULT_LOCALE
 
 
 class IntentValue(BaseModel):

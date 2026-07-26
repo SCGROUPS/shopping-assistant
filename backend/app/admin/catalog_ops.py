@@ -42,6 +42,7 @@ from app.common.models import (
     OptionPrice,
     Supplier,
 )
+from app.content.enqueue import enqueue_experience_translations
 
 # Statuses an operator may set. DRAFT and PENDING_REVIEW are invisible to the
 # storefront; ARCHIVED is how inventory retires without being deleted, because
@@ -414,6 +415,12 @@ async def update_experience(
         # touch. Enqueued in this transaction so the intent cannot outlive a
         # rollback, nor be lost if the process dies before a follow-up call.
         await enqueue_experience_reindex(session, experience.id)
+        # And the translations, for the same reason and in the same
+        # transaction. Reindexing alone rebuilds the *English* document from
+        # the new title while seven locales keep serving translations that
+        # still describe the old one - and go on describing it forever, because
+        # staleness is derived from a fingerprint only this call updates.
+        await enqueue_experience_translations(session, experience.id)
     return await get_experience(experience_id)
 
 
@@ -454,6 +461,9 @@ async def clear_override(
             changes={field: {"from": "operator-managed", "to": "supplier-managed"}},
         )
         await enqueue_experience_reindex(session, experience.id)
+        # Releasing an override hands the field back to the supplier's text,
+        # which is a source change like any other.
+        await enqueue_experience_translations(session, experience.id)
     return await get_experience(experience_id)
 
 

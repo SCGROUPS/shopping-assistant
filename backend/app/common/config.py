@@ -32,6 +32,26 @@ class Settings(BaseSettings):
     openai_max_output_tokens: int = 500
     openai_daily_budget: float = 10.0
 
+    # Part of the translation recipe fingerprint. Bumping it is a deliberate
+    # decision to invalidate every machine translation, so it is a setting an
+    # operator changes rather than a hash of the prompt text - which would
+    # invalidate on a whitespace edit.
+    translation_prompt_version: str = "1"
+    translation_deployment: str = "gpt-5.4-mini"
+    # A worker holds a lease while the model thinks; this must stay well under
+    # TRANSLATION_LEASE_SECONDS or a slow call outlives the lease it holds.
+    translation_timeout_seconds: float = 90.0
+    translation_batch: int = 24
+    # The batch is latency bound, so this is what decides whether a backfill
+    # finishes overnight. Bounded because the provider rate limits, and each
+    # lane holds a database session for the length of a model call.
+    translation_concurrency: int = 8
+    # Translation runs in its own container, so this ceiling is its own and
+    # cannot starve the storefront. Hitting it defers work to the next run
+    # rather than failing it: a backfill that stops early is resumable, and a
+    # backfill that burns its attempts against a spending limit is not.
+    translation_daily_budget: float = 25.0
+
     assistant_max_tool_rounds: int = 3
     assistant_max_session_turns: int = 12
     # Control group for the core thesis that guided selling beats manual search.
